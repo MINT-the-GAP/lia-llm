@@ -1,0 +1,42 @@
+{
+  "name": "lia-llm",
+  "version": "0.3.1",
+  "private": true,
+  "description": "Local semantic assessment for open-ended LiaScript questions",
+  "license": "MIT",
+  "app": "dist/index.js",
+  "scripts": {
+    "build": "parcel build src/index.ts --target app --no-scope-hoist",
+    "dev": "parcel watch src/index.ts --target app --no-scope-hoist",
+    "typecheck": "tsc --noEmit",
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test test/scoring.test.mts",
+    "test:browser-model": "node test/run-browser-calibration.mjs",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "4.2.0"
+  },
+  "devDependencies": {
+    "@webgpu/types": "0.1.64",
+    "parcel": "2.16.4",
+    "typescript": "5.9.3"
+  },
+  "alias": {
+    "@huggingface/transformers": "./node_modules/@huggingface/transformers/dist/transformers.web.js",
+    "onnxruntime-web/webgpu": "./node_modules/onnxruntime-web/dist/ort.webgpu.min.js",
+    "process": false
+  },
+  "targets": {
+    "app": {
+      "context": "browser",
+      "outputFormat": "global",
+      "includeNodeModules": true,
+      "isLibrary": false,
+      "optimize": true,
+      "sourceMap": false
+    }
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}

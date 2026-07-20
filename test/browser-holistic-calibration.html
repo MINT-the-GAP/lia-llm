@@ -1,0 +1,53 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>lia-llm holistic calibration</title>
+<script src="../dist/index.js"></script>
+<pre id="output">starting</pre>
+<script>
+const answers = [
+  "Wasser gefriert, indem es hexagonale Molekülmuster ausbildet. Dies wird die Anomalie des Wasser genannt und entspringt seinem Dipolcharakter. Aus diesem Grund nimmt die Dichte von Wasser im festen Zustand ab und schwimmt auf noch flüssigem Wasser.",
+  "Wasser hat eine größere Dichte als Eis, da Eis durch die Wasserstoffbrückenbindung sich beim Gefrieren besonders anordnet und somit mehr Volumen pro Molekül braucht. Durch die geringere Dichte von Eis schwimmt es auf dem Wasser.",
+  "Eis hat eine höhere Dichte als Wasser, was daran liegt, dass es fest ist und bei festen Stoffen ist die Temperatur niedriger.",
+  "Wasser dehnt sich beim gefrieren aus, deswegen sinkt die Dichte.",
+  "Eis ist zwar leichter als Wasser aber Wasser stößt Eis ab, so dass Eis immer auf dem Wasser sein muss.",
+  "Wasser ist paramagnetisch und durch die Wirbelströme im Eis kommt es durch die Lenz’sche Regel zu einer Ursachenentgegenwirkenden Kraft, sodass dadurch ein Auftrieb entsteht.",
+  "Weil es gefriert und deswegen halt oben schwimmt.",
+  "Weil die Luft über dem Wasser halt so kalt ist, muss das Eis ja auch oben sein."
+]
+const expected = [true, true, false, false, false, false, false, false]
+const reference = "Beim Gefrieren entsteht eine besondere Molekülstruktur, durch die Eis eine geringere Dichte als flüssiges Wasser hat. Deshalb schwimmt Eis auf Wasser."
+window.__liaCalibrationDone = false
+window.__liaCalibration = []
+;(async () => {
+  try {
+    for (let index = 0; index < answers.length; index += 1) {
+      const result = await window.LiaLLM.evaluate({
+        question: "Erkläre, warum Eis auf flüssigem Wasser schwimmt.",
+        answer: answers[index],
+        reference,
+        criterionThreshold: 0.66,
+        contradictionThreshold: 0.65,
+      })
+      const compactFeedback = window.LiaLLM.formatResult(result, "de-DE")
+      window.__liaCalibration.push({
+        answer: index + 1,
+        status: result.status,
+        passed: result.passed,
+        expected: expected[index],
+        matches: result.passed === expected[index],
+        entailment: result.criteria[0]?.entailment,
+        neutral: result.criteria[0]?.neutral,
+        contradiction: result.criteria[0]?.contradiction,
+        compactFeedbackHasCriteria:
+          /Gesamtantwort|Bestätigung:|Sicher bestätigte Abdeckung/.test(compactFeedback),
+        model: result.model,
+      })
+      document.querySelector("#output").textContent = JSON.stringify(window.__liaCalibration, null, 2)
+    }
+  } catch (error) {
+    window.__liaCalibrationError = error instanceof Error ? error.stack : String(error)
+  } finally {
+    window.__liaCalibrationDone = true
+  }
+})()
+</script>
