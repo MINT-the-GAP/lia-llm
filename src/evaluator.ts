@@ -30,9 +30,11 @@ import {
 } from "./scoring.ts"
 import type {
   CriterionResult,
+  EvaluationDiagnostic,
   EvaluationRequest,
   EvaluationResult,
   ModelCacheInfo,
+  ModelLoadSource,
   ModelProgress,
   NliEvidence,
   RuntimeConfig,
@@ -40,6 +42,7 @@ import type {
 } from "./types.ts"
 
 export const DEFAULT_RUNTIME_CONFIG: RuntimeConfig = {
+  assessmentEngine: "compact",
   modelId: DEFAULT_MODEL_ID,
   revision: DEFAULT_MODEL_REVISION,
   device: "wasm",
@@ -102,6 +105,26 @@ function progressFromUnknown(value: unknown): ModelProgress {
     total: typeof item.total === "number" ? item.total : undefined,
     file: typeof item.file === "string" ? item.file : undefined,
     message: typeof item.message === "string" ? item.message : undefined,
+  }
+}
+
+function compactDiagnostic(
+  status: EvaluationResult["status"],
+  passed: boolean,
+  criteria: readonly CriterionResult[],
+): EvaluationDiagnostic | undefined {
+  if (passed) return undefined
+  if (criteria.some((criterion) => criterion.status === "contradicted")) {
+    return {
+      code: "content-error",
+      source: "compact",
+      severity: "blocking",
+    }
+  }
+  return {
+    code: status === "uncertain" ? "unclear" : "incomplete",
+    source: "compact",
+    severity: "blocking",
   }
 }
 
@@ -271,6 +294,7 @@ async function deleteTokenizerMetadataAlias(
 export class SemanticEvaluator {
   private config: RuntimeConfig = { ...DEFAULT_RUNTIME_CONFIG }
   private phase: RuntimeStatus["phase"] = "idle"
+  private loadSource: ModelLoadSource | undefined
   private lastError: string | undefined
   private runtime: NliRuntime | null = null
   private loadPromise: Promise<NliRuntime> | null = null
@@ -285,6 +309,7 @@ export class SemanticEvaluator {
 
   configure(next: Partial<RuntimeConfig>): RuntimeStatus {
     const supported = { ...next }
+    delete supported.assessmentEngine
     delete supported.maxCachedEmbeddings
 
     const changesLoadedModel = (
@@ -321,6 +346,8 @@ export class SemanticEvaluator {
   getStatus(): RuntimeStatus {
     return {
       phase: this.phase,
+      loadSource: this.loadSource,
+      assessmentEngine: "compact",
       modelId: this.config.modelId,
       revision: this.config.revision,
       device: this.config.device,
@@ -394,11 +421,15 @@ export class SemanticEvaluator {
     }
   }
 
-  async preload(): Promise<RuntimeStatus> {
+  async preload(cacheInfo?: ModelCacheInfo): Promise<RuntimeStatus> {
     if (this.runtime) return this.getStatus()
     if (!this.loadPromise) {
-      this.setPhase("loading")
-      this.loadPromise = this.createRuntime()
+      this.loadPromise = (async () => {
+        const cache = cacheInfo ?? (await this.getCacheInfo())
+        this.loadSource = cache.cached ? "cache" : "network"
+        this.setPhase("loading")
+        return this.createRuntime()
+      })()
         .then((runtime) => {
           this.runtime = runtime
           this.setPhase("ready")
@@ -551,11 +582,18 @@ export class SemanticEvaluator {
       }
 
       const aggregated = aggregateCriteria(results, normalized.passThreshold)
+      const diagnostic = compactDiagnostic(
+        aggregated.status,
+        aggregated.passed,
+        results,
+      )
       return {
         ...aggregated,
         mode: normalized.mode,
         criteria: results,
         answer: normalized.answer,
+        operator: normalized.operator,
+        diagnostic,
         durationMs: Number((now() - started).toFixed(1)),
         model: {
           id: this.config.modelId,
@@ -587,6 +625,7 @@ export class SemanticEvaluator {
       return {
         supported: false,
         cached: false,
+        downloadCached: false,
         filesCached: 0,
         filesTotal: 0,
         estimatedBytes: DEFAULT_MODEL_ESTIMATED_BYTES,
@@ -603,6 +642,7 @@ export class SemanticEvaluator {
       return {
         supported: true,
         cached: result.allCached,
+        downloadCached: result.allCached,
         filesCached: files.filter((file) => file.cached).length,
         filesTotal: files.length,
         estimatedBytes: DEFAULT_MODEL_ESTIMATED_BYTES,
@@ -611,12 +651,32 @@ export class SemanticEvaluator {
       return {
         supported: true,
         cached: false,
+        downloadCached: false,
         filesCached: 0,
         filesTotal: 0,
         estimatedBytes: DEFAULT_MODEL_ESTIMATED_BYTES,
         error: errorMessage(error),
       }
     }
+  }
+
+  async unloadRuntime(): Promise<void> {
+    return this.enqueue(async () => {
+      if (this.loadPromise) {
+        try {
+          await this.loadPromise
+        } catch {
+          // A failed load has no usable runtime to release.
+        }
+      }
+
+      const runtime = this.runtime
+      this.runtime = null
+      this.loadPromise = null
+      if (runtime) await runtime.model.dispose()
+      this.loadSource = undefined
+      this.setPhase("idle")
+    })
   }
 
   async clearCache(): Promise<number> {
@@ -689,6 +749,7 @@ export class SemanticEvaluator {
         LEGACY_NLI_CACHE.modelId,
         LEGACY_NLI_CACHE.revision,
       )
+      this.loadSource = undefined
       this.setPhase("idle")
 
       if (errors.length > 0) {

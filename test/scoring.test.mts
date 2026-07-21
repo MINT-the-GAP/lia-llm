@@ -12,18 +12,38 @@ import {
   parseCriteria,
   splitReference,
 } from "../src/scoring.ts"
+import { AutomaticEvaluator } from "../src/automatic-evaluator.ts"
 import { formatResult } from "../src/format.ts"
+import { decideModelDownload } from "../src/download-policy.ts"
+import {
+  EvaluationInputError,
+  feedbackForError,
+  feedbackForResult,
+} from "../src/learner-feedback.ts"
 import {
   fromQuizInputValue,
+  isQuizTextareaNavigationKey,
   parseTextareaRows,
   toQuizInputValue,
 } from "../src/quiz-textarea.ts"
+import { parseMacroOptions } from "../src/macro-options.ts"
+import { supportedOperatorRubrics } from "../src/operator-rubrics.ts"
 import { progressPercent } from "../src/load-overlay.ts"
+import {
+  classifyQualityDecision,
+  parseQualityJudgeOutput,
+  qualityDiagnosticForCriteria,
+  QUALITY_SYSTEM_PROMPT,
+} from "../src/quality-evaluator.ts"
 import type {
   Criterion,
   CriterionResult,
+  EvaluationProgressPhase,
+  EvaluationRequest,
   EvaluationResult,
+  ModelCacheInfo,
   NliEvidence,
+  RuntimeStatus,
 } from "../src/types.ts"
 
 test("parseCriteria accepts a compact separator syntax", () => {
@@ -104,6 +124,52 @@ test("normalizeRequest rejects cosine-style negative thresholds", () => {
   )
 })
 
+test("normalizeRequest reports a structured too-short answer before inference", () => {
+  let caught: unknown
+  try {
+    normalizeRequest({
+      question: "Warum schwimmt Eis?",
+      answer: "Kurz",
+      reference: "Eis ist weniger dicht als flüssiges Wasser.",
+      minAnswerCharacters: 12,
+    })
+  } catch (error) {
+    caught = error
+  }
+
+  assert.ok(caught instanceof EvaluationInputError)
+  assert.equal(caught.code, "answer-too-short")
+  assert.equal(caught.actualCharacters, 4)
+  assert.equal(caught.minimumCharacters, 12)
+  assert.deepEqual(feedbackForError(caught, "de-DE"), {
+    code: "answer-too-short",
+    message: "Die Antwort ist deutlich zu kurz, um die Aufgabe ausreichend zu bearbeiten.",
+  })
+  assert.equal(feedbackForError(new Error("Technischer Fehler")), null)
+})
+
+test("operator profile sets its own minimum length and feedback", () => {
+  let caught: unknown
+  try {
+    normalizeRequest({
+      question: "Erkläre den Zusammenhang.",
+      answer: "Zu kurz",
+      reference: "Eine vollständige Erklärung des Zusammenhangs.",
+      operator: "erklären",
+    })
+  } catch (error) {
+    caught = error
+  }
+
+  assert.ok(caught instanceof EvaluationInputError)
+  assert.equal(caught.minimumCharacters, 24)
+  assert.equal(caught.operator?.id, "erklaeren")
+  assert.deepEqual(feedbackForError(caught, "de-DE"), {
+    code: "answer-too-short",
+    message: "Die Antwort ist deutlich zu kurz, um etwas zu erklären.",
+  })
+})
+
 test("normalizeAnswerText preserves paragraph breaks", () => {
   assert.equal(
     normalizeAnswerText("  Erster Absatz.\r\n\r\n Zweiter   Absatz.  "),
@@ -160,6 +226,148 @@ const criterion: Criterion = {
   misconceptions: ["Eis hat eine höhere Dichte als Wasser."],
   feedback: "Vergleiche die Dichten.",
 }
+
+test("quality judge accepts strict structured decisions only", () => {
+  assert.deepEqual(
+    parseQualityJudgeOutput(
+      '{"decision":"pass","confidence":0.82,"feedback_code":"none"}',
+    ),
+    { decision: "pass", confidence: 0.82, feedbackCode: "none" },
+  )
+  assert.deepEqual(
+    parseQualityJudgeOutput(
+      '{"decision":"fail_incomplete","confidence":0.82,"feedback_code":"answer-too-short"}',
+    ),
+    {
+      decision: "fail_incomplete",
+      confidence: 0.82,
+      feedbackCode: "answer-too-short",
+    },
+  )
+  assert.equal(
+    parseQualityJudgeOutput(
+      '{"decision":"fail_contradiction","confidence":0.9,"feedback_code":"none"}',
+    ).feedbackCode,
+    "content-error",
+  )
+  assert.equal(
+    parseQualityJudgeOutput(
+      '{"decision":"pass","confidence":0.9,"feedback_code":"content-error"}',
+    ).feedbackCode,
+    "none",
+  )
+  assert.equal(
+    parseQualityJudgeOutput(
+      '{"decision":"fail_off_topic","confidence":0.9,"feedback_code":"off-topic"}',
+    ).feedbackCode,
+    "off-topic",
+  )
+  assert.equal(
+    parseQualityJudgeOutput(
+      '{"decision":"uncertain","confidence":0.7,"feedback_code":"unclear"}',
+    ).feedbackCode,
+    "unclear",
+  )
+  assert.equal(
+    parseQualityJudgeOutput(
+      '{"decision":"fail_incomplete","confidence":0.8,"feedback_code":"operator-not-met"}',
+    ).feedbackCode,
+    "operator-not-met",
+  )
+  assert.equal(
+    parseQualityJudgeOutput('{"decision":"fail_incomplete","confidence":0.8}')
+      .feedbackCode,
+    "incomplete",
+  )
+  assert.throws(
+    () => parseQualityJudgeOutput('{"decision":"correct","confidence":0.82}'),
+    /Entscheidungscode/u,
+  )
+  assert.throws(
+    () => parseQualityJudgeOutput('{"decision":"pass","confidence":1.2}'),
+    /Konfidenz/u,
+  )
+  assert.throws(() => parseQualityJudgeOutput("not-json"), /JSON/u)
+})
+
+test("quality judge tolerates WebLLM thinking prefixes and JSON fences", () => {
+  assert.deepEqual(
+    parseQualityJudgeOutput(
+      '\uFEFF \n\t<think>\n\n</think>\n\n{"decision":"pass","confidence":0.91,"feedback_code":"none"}',
+    ),
+    { decision: "pass", confidence: 0.91, feedbackCode: "none" },
+  )
+  assert.deepEqual(
+    parseQualityJudgeOutput(
+      '<think>verdeckte Begründung</think>{"decision":"pass","confidence":0.91,"feedback_code":"too-colloquial"}',
+    ),
+    {
+      decision: "pass",
+      confidence: 0.91,
+      feedbackCode: "too-colloquial",
+    },
+  )
+  assert.deepEqual(
+    parseQualityJudgeOutput(
+      '```json\n{"decision":"pass","confidence":0.91,"feedback_code":"none"}\n```',
+    ),
+    { decision: "pass", confidence: 0.91, feedbackCode: "none" },
+  )
+})
+
+test("quality judge keeps uncertainty and contradictions out of passing", () => {
+  assert.equal(
+    classifyQualityDecision(
+      { decision: "pass", confidence: 0.8, feedbackCode: "none" },
+      criterion,
+      0.1,
+    ),
+    "met",
+  )
+  assert.equal(
+    classifyQualityDecision(
+      { decision: "pass", confidence: 0.65, feedbackCode: "none" },
+      criterion,
+      0.1,
+    ),
+    "uncertain",
+  )
+  assert.equal(
+    classifyQualityDecision(
+      {
+        decision: "fail_contradiction",
+        confidence: 0.9,
+        feedbackCode: "content-error",
+      },
+      criterion,
+      0.1,
+    ),
+    "contradicted",
+  )
+  assert.equal(
+    classifyQualityDecision(
+      {
+        decision: "fail_incomplete",
+        confidence: 0.9,
+        feedbackCode: "incomplete",
+      },
+      criterion,
+      0.1,
+    ),
+    "missed",
+  )
+})
+
+test("quality prompt requires contextual synonym and negation handling", () => {
+  assert.match(QUALITY_SYSTEM_PROMPT, /Gesamtzusammenhang/u)
+  assert.match(QUALITY_SYSTEM_PROMPT, /Synonyme/u)
+  assert.match(QUALITY_SYSTEM_PROMPT, /Verneinungen/u)
+  assert.match(QUALITY_SYSTEM_PROMPT, /Ursache-Wirkungs-Beziehungen/u)
+  assert.match(QUALITY_SYSTEM_PROMPT, /Weltwissen/u)
+  assert.match(QUALITY_SYSTEM_PROMPT, /feedback_code/u)
+  assert.match(QUALITY_SYSTEM_PROMPT, /Operatorprofil/u)
+  assert.match(QUALITY_SYSTEM_PROMPT, /too-colloquial/u)
+})
 
 function evidence(
   text: string,
@@ -420,6 +628,531 @@ function result(
   }
 }
 
+function evaluation(
+  status: EvaluationResult["status"],
+  criteria: CriterionResult[],
+): EvaluationResult {
+  return {
+    status,
+    passed: status === "passed",
+    mode: "holistic",
+    coverage: status === "passed" ? 1 : 0,
+    potentialCoverage: status === "uncertain" ? 1 : 0,
+    criteria,
+    answer: "Testantwort",
+    durationMs: 12,
+    model: {
+      id: "test/model",
+      revision: "test",
+      device: "wasm",
+      dtype: "q8",
+      task: "natural-language-inference",
+    },
+    notice: "Interner Hinweis, der nicht im Kurzfeedback stehen darf.",
+  }
+}
+
+test("quality diagnostics use a stable priority and keep style advisory", () => {
+  const style = result("style", "met")
+  style.judgeFeedbackCode = "too-colloquial"
+  style.judgeConfidence = 0.9
+  assert.deepEqual(qualityDiagnosticForCriteria([style]), {
+    code: "too-colloquial",
+    confidence: 0.9,
+    source: "quality",
+    severity: "advisory",
+  })
+
+  const offTopic = result("topic", "missed")
+  offTopic.judgeFeedbackCode = "off-topic"
+  offTopic.judgeConfidence = 0.8
+  const contentError = result("content", "contradicted")
+  contentError.judgeFeedbackCode = "content-error"
+  contentError.judgeConfidence = 0.7
+  assert.equal(
+    qualityDiagnosticForCriteria([style, offTopic, contentError])?.code,
+    "content-error",
+  )
+})
+
+test("automatic evaluator prefers cached quality, keeps uncached quality in the background, and falls back", async () => {
+  class MockEvaluator {
+    readonly status
+    readonly modelId
+    readonly cacheAvailable
+    evaluateCalls = 0
+    preloadCalls = 0
+    preloadCaches: ModelCacheInfo[] = []
+    preloadBarrier: Promise<void> | null = null
+    unloadCalls = 0
+    failEvaluation = false
+
+    constructor(
+      modelId: string,
+      engine: "compact" | "quality",
+      cacheAvailable = true,
+    ) {
+      this.modelId = modelId
+      this.cacheAvailable = cacheAvailable
+      this.status = {
+        phase: "idle" as "idle" | "ready",
+        assessmentEngine: engine,
+        modelId,
+        revision: "test",
+        device: engine === "quality" ? ("webgpu" as const) : ("wasm" as const),
+        dtype: engine === "quality" ? ("q4f16" as const) : ("q8" as const),
+      }
+    }
+
+    configure() {
+      return this.status
+    }
+
+    getStatus() {
+      return this.status
+    }
+
+    async getCacheInfo() {
+      return {
+        supported: true,
+        cached: this.cacheAvailable,
+        downloadCached: this.cacheAvailable,
+        filesCached: this.cacheAvailable ? 1 : 0,
+        filesTotal: 1,
+        estimatedBytes: 1,
+      }
+    }
+
+    async preload(cacheInfo?: ModelCacheInfo) {
+      this.preloadCalls += 1
+      if (cacheInfo) this.preloadCaches.push(cacheInfo)
+      if (this.preloadBarrier) await this.preloadBarrier
+      this.status.phase = "ready"
+      return this.status
+    }
+
+    async evaluate() {
+      this.evaluateCalls += 1
+      if (this.failEvaluation) throw new Error("invalid quality JSON")
+      const value = evaluation("passed", [result("overall", "met", true)])
+      value.model.id = this.modelId
+      value.model.device = this.status.device
+      value.model.dtype = this.status.dtype
+      value.model.task =
+        this.status.assessmentEngine === "quality"
+          ? "generative-assessment"
+          : "natural-language-inference"
+      return value
+    }
+
+    async unloadRuntime() {
+      this.unloadCalls += 1
+    }
+
+    async clearCache() {
+      return 1
+    }
+  }
+
+  const compact = new MockEvaluator("compact-test", "compact")
+  const quality = new MockEvaluator("quality-test", "quality")
+  let releaseQuality!: () => void
+  quality.preloadBarrier = new Promise<void>((resolve) => {
+    releaseQuality = resolve
+  })
+  const navigatorObject = globalThis.navigator
+  const gpuDescriptor = Object.getOwnPropertyDescriptor(navigatorObject, "gpu")
+  const storageDescriptor = Object.getOwnPropertyDescriptor(
+    navigatorObject,
+    "storage",
+  )
+  const connectionDescriptor = Object.getOwnPropertyDescriptor(
+    navigatorObject,
+    "connection",
+  )
+  let persistCalls = 0
+  Object.defineProperty(navigatorObject, "gpu", {
+    configurable: true,
+    value: {},
+  })
+  Object.defineProperty(navigatorObject, "storage", {
+    configurable: true,
+    value: {
+      persisted: async () => false,
+      persist: async () => {
+        persistCalls += 1
+        return true
+      },
+    },
+  })
+  Object.defineProperty(navigatorObject, "connection", {
+    configurable: true,
+    value: { type: "wifi", saveData: false },
+  })
+
+  try {
+    const automatic = new AutomaticEvaluator(compact as never, quality as never)
+    const request = {
+      question: "Warum schwimmt Eis?",
+      answer: "Eis hat eine geringere Dichte als flüssiges Wasser.",
+      reference: "Eis hat eine geringere Dichte als flüssiges Wasser.",
+    }
+
+    const preparation = automatic.preload()
+    let firstSettled = false
+    const firstPromise = automatic.evaluate(request).then((value) => {
+      firstSettled = true
+      return value
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(firstSettled, false)
+    assert.equal(compact.preloadCalls, 0)
+    assert.equal(compact.evaluateCalls, 0)
+    assert.equal(quality.preloadCalls, 1)
+    assert.equal(quality.preloadCaches[0]?.cached, true)
+    assert.equal(quality.preloadCaches[0]?.downloadCached, true)
+    assert.equal(persistCalls, 0)
+    releaseQuality()
+    await preparation
+    const first = await firstPromise
+    assert.equal(first.model.id, "quality-test")
+
+    const second = await automatic.evaluate(request)
+    assert.equal(second.model.id, "quality-test")
+
+    quality.failEvaluation = true
+    const fallback = await automatic.evaluate(request)
+    assert.equal(fallback.model.id, "compact-test")
+    const compactCallsAfterFallback = compact.evaluateCalls
+
+    const afterDegrade = await automatic.evaluate(request)
+    assert.equal(afterDegrade.model.id, "compact-test")
+    assert.equal(quality.evaluateCalls, 3)
+    assert.equal(compact.evaluateCalls, compactCallsAfterFallback + 1)
+
+    const networkCompact = new MockEvaluator(
+      "compact-network-test",
+      "compact",
+      true,
+    )
+    const networkQuality = new MockEvaluator(
+      "quality-network-test",
+      "quality",
+      false,
+    )
+    let releaseNetworkQuality!: () => void
+    networkQuality.preloadBarrier = new Promise<void>((resolve) => {
+      releaseNetworkQuality = resolve
+    })
+    const networkAutomatic = new AutomaticEvaluator(
+      networkCompact as never,
+      networkQuality as never,
+    )
+    await networkAutomatic.preload()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(networkQuality.preloadCalls, 1)
+
+    let networkTimeout!: ReturnType<typeof setTimeout>
+    const networkFirst = await Promise.race([
+      networkAutomatic.evaluate(request),
+      new Promise<never>((_resolve, reject) => {
+        networkTimeout = setTimeout(
+          () => reject(new Error("compact pass waited for quality download")),
+          250,
+        )
+      }),
+    ])
+    clearTimeout(networkTimeout)
+    assert.equal(networkFirst.model.id, "compact-network-test")
+    assert.equal(networkCompact.evaluateCalls, 1)
+    assert.equal(networkQuality.evaluateCalls, 0)
+    assert.equal(persistCalls, 1)
+    releaseNetworkQuality()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  } finally {
+    if (gpuDescriptor) {
+      Object.defineProperty(navigatorObject, "gpu", gpuDescriptor)
+    } else {
+      delete (navigatorObject as Navigator & { gpu?: unknown }).gpu
+    }
+    if (storageDescriptor) {
+      Object.defineProperty(navigatorObject, "storage", storageDescriptor)
+    } else {
+      delete (navigatorObject as Navigator & { storage?: StorageManager }).storage
+    }
+    if (connectionDescriptor) {
+      Object.defineProperty(navigatorObject, "connection", connectionDescriptor)
+    } else {
+      delete (navigatorObject as Navigator & { connection?: unknown }).connection
+    }
+  }
+})
+
+test("automatic evaluator rechecks the same compact miss with quality before returning", async () => {
+  class StagedMockEvaluator {
+    readonly status: RuntimeStatus
+    readonly resultStatus: EvaluationResult["status"]
+    readonly cacheAvailable: boolean
+    evaluateCalls = 0
+    preloadCalls = 0
+    preloadBarrier: Promise<void> | null = null
+    unloadCalls = 0
+    requests: EvaluationRequest[] = []
+
+    constructor(
+      modelId: string,
+      engine: "compact" | "quality",
+      resultStatus: EvaluationResult["status"],
+      cacheAvailable = true,
+    ) {
+      this.resultStatus = resultStatus
+      this.cacheAvailable = cacheAvailable
+      this.status = {
+        phase: "idle",
+        assessmentEngine: engine,
+        modelId,
+        revision: "test",
+        device: engine === "quality" ? "webgpu" : "wasm",
+        dtype: engine === "quality" ? "q4f16" : "q8",
+      }
+    }
+
+    configure() {
+      return this.status
+    }
+
+    getStatus() {
+      return this.status
+    }
+
+    async getCacheInfo(): Promise<ModelCacheInfo> {
+      return {
+        supported: true,
+        cached: this.cacheAvailable,
+        downloadCached: this.cacheAvailable,
+        filesCached: this.cacheAvailable ? 1 : 0,
+        filesTotal: 1,
+        estimatedBytes: 1,
+      }
+    }
+
+    async preload() {
+      this.preloadCalls += 1
+      if (this.preloadBarrier) await this.preloadBarrier
+      this.status.phase = "ready"
+      return this.status
+    }
+
+    async evaluate(request: EvaluationRequest) {
+      this.evaluateCalls += 1
+      this.requests.push({ ...request })
+      const criterionStatus =
+        this.resultStatus === "passed"
+          ? "met"
+          : this.resultStatus === "uncertain"
+            ? "uncertain"
+            : "missed"
+      const value = evaluation(this.resultStatus, [
+        result("overall", criterionStatus, true),
+      ])
+      value.answer = request.answer
+      value.model.id = this.status.modelId
+      value.model.device = this.status.device
+      value.model.dtype = this.status.dtype
+      value.model.task =
+        this.status.assessmentEngine === "quality"
+          ? "generative-assessment"
+          : "natural-language-inference"
+      return value
+    }
+
+    async unloadRuntime() {
+      this.unloadCalls += 1
+    }
+
+    async clearCache() {
+      return 1
+    }
+  }
+
+  const compact = new StagedMockEvaluator(
+    "compact-test",
+    "compact",
+    "failed",
+  )
+  const quality = new StagedMockEvaluator(
+    "quality-test",
+    "quality",
+    "passed",
+    false,
+  )
+  const navigatorObject = globalThis.navigator
+  const gpuDescriptor = Object.getOwnPropertyDescriptor(navigatorObject, "gpu")
+  const connectionDescriptor = Object.getOwnPropertyDescriptor(
+    navigatorObject,
+    "connection",
+  )
+  Object.defineProperty(navigatorObject, "gpu", {
+    configurable: true,
+    value: {},
+  })
+  Object.defineProperty(navigatorObject, "connection", {
+    configurable: true,
+    value: { type: "wifi", saveData: false },
+  })
+
+  const request: EvaluationRequest = {
+    question: "Erkläre, warum Eis auf flüssigem Wasser schwimmt.",
+    answer:
+      "Beim Gefrieren ordnen sich die Wassermoleküle durch Wasserstoffbrücken zu einer offenen Kristallstruktur an. Diese Struktur benötigt mehr Volumen. Deshalb besitzt Eis eine geringere Dichte als flüssiges Wasser und schwimmt an der Oberfläche.",
+    reference:
+      "Beim Gefrieren entsteht eine besondere Molekülstruktur, durch die Eis eine geringere Dichte als flüssiges Wasser hat. Deshalb schwimmt Eis auf Wasser.",
+    criterionThreshold: 0.66,
+  }
+  const phases: EvaluationProgressPhase[] = []
+
+  try {
+    const automatic = new AutomaticEvaluator(compact as never, quality as never)
+    const resultValue = await automatic.evaluate(request, {
+      onProgress: (progress) => phases.push(progress.phase),
+    })
+
+    assert.equal(resultValue.passed, true)
+    assert.equal(resultValue.model.id, "quality-test")
+    assert.equal(compact.evaluateCalls, 1)
+    assert.equal(quality.evaluateCalls, 1)
+    assert.equal(compact.requests[0]?.answer, request.answer)
+    assert.equal(quality.requests[0]?.answer, request.answer)
+    assert.equal(compact.requests[0]?.reference, request.reference)
+    assert.equal(quality.requests[0]?.reference, request.reference)
+    assert.deepEqual(phases, [
+      "selecting-model",
+      "preparing-compact",
+      "evaluating-compact",
+      "preparing-quality",
+      "evaluating-quality",
+    ])
+
+    const abortCompact = new StagedMockEvaluator(
+      "compact-abort-test",
+      "compact",
+      "failed",
+    )
+    const abortQuality = new StagedMockEvaluator(
+      "quality-abort-test",
+      "quality",
+      "passed",
+      false,
+    )
+    let releaseAbortedUpgrade!: () => void
+    abortQuality.preloadBarrier = new Promise<void>((resolve) => {
+      releaseAbortedUpgrade = resolve
+    })
+    const aborting = new AutomaticEvaluator(
+      abortCompact as never,
+      abortQuality as never,
+    )
+    const controller = new AbortController()
+    const pending = aborting.evaluate(request, { signal: controller.signal })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    controller.abort()
+    await assert.rejects(pending, { name: "AbortError" })
+    releaseAbortedUpgrade()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  } finally {
+    if (gpuDescriptor) {
+      Object.defineProperty(navigatorObject, "gpu", gpuDescriptor)
+    } else {
+      delete (navigatorObject as Navigator & { gpu?: unknown }).gpu
+    }
+    if (connectionDescriptor) {
+      Object.defineProperty(navigatorObject, "connection", connectionDescriptor)
+    } else {
+      delete (navigatorObject as Navigator & { connection?: unknown }).connection
+    }
+  }
+})
+
+test("learner feedback stays short and never exposes criteria or scores", () => {
+  assert.equal(feedbackForResult(evaluation("passed", [result("secret", "met")])), null)
+
+  const contradiction = feedbackForResult(
+    evaluation("failed", [result("geheimes-kriterium", "contradicted")]),
+  )
+  assert.equal(contradiction?.code, "content-error")
+  assert.equal(contradiction?.message, "Die Antwort enthält inhaltliche Fehler.")
+  assert.doesNotMatch(
+    contradiction?.message ?? "",
+    /geheimes-kriterium|Bestätigung|Konfidenz|Interner Hinweis|Musterlösung/u,
+  )
+
+  assert.equal(
+    feedbackForResult(evaluation("uncertain", [result("secret", "uncertain")]))?.code,
+    "unclear",
+  )
+  assert.equal(
+    feedbackForResult(evaluation("uncertain", [result("secret", "uncertain")]))
+      ?.message,
+    "Die Antwort ist noch nicht eindeutig genug. Formuliere den Zusammenhang klarer.",
+  )
+  assert.equal(
+    feedbackForResult(evaluation("failed", [result("secret", "missed")]))?.code,
+    "incomplete",
+  )
+  assert.equal(
+    feedbackForResult(evaluation("failed", [result("secret", "missed")]))
+      ?.message,
+    "Die Antwort erklärt den gefragten Zusammenhang noch nicht vollständig.",
+  )
+
+  const offTopicCriterion = result("secret", "missed")
+  offTopicCriterion.judgeDecision = "fail_off_topic"
+  assert.equal(
+    feedbackForResult(evaluation("failed", [offTopicCriterion]))?.code,
+    "off-topic",
+  )
+  assert.equal(
+    feedbackForResult(evaluation("failed", [offTopicCriterion]))?.message,
+    "Die Antwort geht noch nicht auf die gestellte Frage ein.",
+  )
+
+  const colloquial = evaluation("passed", [result("secret", "met")])
+  colloquial.diagnostic = {
+    code: "too-colloquial",
+    source: "quality",
+    severity: "advisory",
+  }
+  assert.deepEqual(feedbackForResult(colloquial), {
+    code: "too-colloquial",
+    message: "Die Antwort ist zu umgangssprachlich verfasst.",
+  })
+
+  const failedWithStyle = evaluation("failed", [result("secret", "missed")])
+  failedWithStyle.diagnostic = {
+    code: "too-colloquial",
+    source: "quality",
+    severity: "advisory",
+  }
+  assert.equal(feedbackForResult(failedWithStyle)?.code, "incomplete")
+
+  const operatorNotMet = evaluation("failed", [result("secret", "missed")])
+  operatorNotMet.operator = normalizeRequest({
+    question: "Erkläre den Zusammenhang.",
+    answer: "Das ist eine ausreichend lange Testantwort.",
+    reference: "Eine vollständige Erklärung des Zusammenhangs.",
+    operator: "erklaeren",
+  }).operator
+  operatorNotMet.diagnostic = {
+    code: "operator-not-met",
+    source: "quality",
+    severity: "blocking",
+  }
+  assert.equal(
+    feedbackForResult(operatorNotMet)?.message,
+    "Die Antwort entspricht noch nicht den Kriterien einer Erklärung.",
+  )
+})
+
 test("formatResult hides criterion details by default but keeps them available", () => {
   const evaluation: EvaluationResult = {
     status: "failed",
@@ -450,12 +1183,88 @@ test("formatResult hides criterion details by default but keeps them available",
   assert.match(detailed, /Bestätigung:/u)
 })
 
-test("LLMQuiz uses only LiaScript's native quiz feedback", () => {
+test("LLMQuiz has one public macro with named and positional options", () => {
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8")
-  assert.doesNotMatch(readme, /window\.LiaLLM(?:\?\.)?\.showFeedback/u)
-  assert.doesNotMatch(readme, /<lia-llm-feedback\b/u)
-  assert.doesNotMatch(readme, /@LLMQuiz\.withId/u)
-  assert.match(readme, /\.then\(result => send\.lia\(String\(result\.passed\)\)\)/u)
+  const publicDefinitions = readme.match(/^@LLMQuiz[^_\n]*:/gmu) ?? []
+  assert.deepEqual(publicDefinitions, ["@LLMQuiz:"])
+  assert.match(readme, /^@LLMQuiz: @LLMQuiz_\(@uid,@0,```@1```\)$/mu)
+  assert.match(readme, /@LLMQuiz\(0\.66;solution=1;feedback=1\)/u)
+  assert.match(readme, /@LLMQuiz\(0\.66;1;1\)/u)
+  assert.match(readme, /@LLMQuiz\(0\.66;1;1;erklaeren\)/u)
+  assert.doesNotMatch(readme, /@LLMQuiz\.(?:compact|withFeedback|noSolution)/u)
+
+  assert.match(readme, /\.feedbackForResult\?\.\(result, "de-DE"\)/u)
+  assert.match(readme, /\.feedbackForError\?\.\(error, "de-DE"\)/u)
+  assert.match(readme, /\.showFeedback\?\.\(feedbackId,/u)
+  assert.match(readme, /\.showSolution\?\.\(solutionId,/u)
+  assert.match(readme, /\.showActivity\?\.\(activityId, runId,/u)
+  assert.match(
+    readme,
+    /\.showActivity\?\.\(activityId, runId, "selecting-model"\)/u,
+  )
+  assert.match(readme, /parseMacroOptions\(optionSource\)/u)
+  assert.match(readme, /finishQuiz\(result\.passed \? "true" : "false"\)/u)
+  assert.match(readme, /send\.handle\("stop",/u)
+  assert.match(readme, /evaluationController\.abort\(\)/u)
+  assert.match(readme, /signal: evaluationController\.signal/u)
+  assert.match(readme, /onProgress: progress =>/u)
+  assert.match(readme, /if \(!active \|\| finished\) return/u)
+  assert.match(readme, /criterionThreshold: options\.passThreshold/u)
+  assert.match(readme, /operator: options\.operator \?\? undefined/u)
+  assert.doesNotMatch(readme, /feedbackEnabled && !result\.passed/u)
+  assert.doesNotMatch(readme, /assessmentEngine,/u)
+  assert.doesNotMatch(readme, /send\.lia\(feedback\.message, \[\], false\)/u)
+
+  const macro = readme.match(
+    /\n@LLMQuiz_\n([\s\S]*?)\n@end/u,
+  )?.[1]
+  assert.ok(macro)
+  assert.match(
+    macro,
+    /<lia-llm-feedback id="lia-llm-feedback-@0"><\/lia-llm-feedback>/u,
+  )
+  assert.match(
+    macro,
+    /<lia-llm-solution id="lia-llm-solution-@0" hidden><\/lia-llm-solution>/u,
+  )
+  assert.match(
+    macro,
+    /<lia-llm-activity id="lia-llm-activity-@0" hidden><\/lia-llm-activity>/u,
+  )
+  assert.match(
+    macro,
+    /<lia-llm-quiz-use hidden><\/lia-llm-quiz-use>/u,
+  )
+  assert.doesNotMatch(macro, /^\*{16,}$/mu)
+  assert.match(macro, /let solutionEnabled = false/u)
+  assert.match(macro, /solutionEnabled = options\.solution/u)
+  assert.match(
+    macro,
+    /solutionEnabled && result\.passed \? reference : ""/u,
+  )
+  assert.doesNotMatch(
+    macro,
+    /showSolution\(solutionId, options\.solution \? reference : ""\)/u,
+  )
+  assert.match(readme, /data-solution-button="off"/u)
+
+  const script = macro.match(/<script>\n([\s\S]*?)\n<\/script>/u)?.[1]
+  assert.ok(script)
+  assert.doesNotThrow(() => new Function(script))
+})
+
+test("operator documentation lists every active runtime profile", () => {
+  const documentation = readFileSync(
+    new URL("../docs/operatoren.md", import.meta.url),
+    "utf8",
+  )
+  assert.match(documentation, /schema: lia-llm-operator-profiles\/v1/u)
+  for (const rubric of supportedOperatorRubrics()) {
+    assert.ok(
+      documentation.includes("| `" + rubric.id + "` | aktiv |"),
+      "Fehlendes aktives Dokumentationsprofil: " + rubric.id,
+    )
+  }
 })
 
 test("aggregateCriteria keeps uncertain cases out of automatic passing", () => {
@@ -506,6 +1315,155 @@ test("parseTextareaRows applies defaults and safe limits", () => {
   assert.equal(parseTextareaRows("1"), 2)
   assert.equal(parseTextareaRows("7"), 7)
   assert.equal(parseTextareaRows("99"), 12)
+})
+
+test("parseMacroOptions supports named and positional quiz options", () => {
+  assert.deepEqual(parseMacroOptions("0.66;solution=1;feedback=true"), {
+    passThreshold: 0.66,
+    solution: true,
+    feedback: true,
+    operator: null,
+  })
+  assert.deepEqual(parseMacroOptions("0.66;0;1"), {
+    passThreshold: 0.66,
+    solution: false,
+    feedback: true,
+    operator: null,
+  })
+  assert.deepEqual(
+    parseMacroOptions("0.66;feedback=1;operator=erklären;solution=0"),
+    {
+      passThreshold: 0.66,
+      solution: false,
+      feedback: true,
+      operator: "erklaeren",
+    },
+  )
+  assert.deepEqual(parseMacroOptions("0.66;1;1;erklaeren"), {
+    passThreshold: 0.66,
+    solution: true,
+    feedback: true,
+    operator: "erklaeren",
+  })
+})
+
+test("parseMacroOptions applies backward-compatible defaults", () => {
+  assert.deepEqual(parseMacroOptions("0.66"), {
+    passThreshold: 0.66,
+    solution: true,
+    feedback: false,
+    operator: null,
+  })
+  assert.deepEqual(parseMacroOptions("1;feedback=1"), {
+    passThreshold: 1,
+    solution: true,
+    feedback: true,
+    operator: null,
+  })
+})
+
+test("parseMacroOptions rejects ambiguous or invalid input", () => {
+  assert.throws(() => parseMacroOptions("0.66;1;feedback=1"), /nicht gemischt/u)
+  assert.throws(() => parseMacroOptions("0.66;solution=1;solution=0"), /mehrfach/u)
+  assert.throws(() => parseMacroOptions("0.66;unknown=1"), /Unbekannte/u)
+  assert.throws(
+    () => parseMacroOptions("0.66;operator=erläutern"),
+    /noch nicht unterstützt/u,
+  )
+  assert.throws(() => parseMacroOptions("0.66;solution=on"), /0, 1, true oder false/u)
+  assert.throws(() => parseMacroOptions("1.01"), /zwischen 0 und 1/u)
+  assert.throws(() => parseMacroOptions("0.66;"), /Leere Makrooptionen/u)
+})
+
+test("download policy asks before mobile or uncertain large downloads", () => {
+  const baseNetwork = {
+    online: true,
+    saveData: false,
+    connectionType: null,
+    mobile: false,
+  }
+
+  assert.equal(
+    decideModelDownload({
+      engine: "compact",
+      cached: false,
+      network: { ...baseNetwork, connectionType: "cellular", mobile: true },
+    }),
+    "consent",
+  )
+  assert.equal(
+    decideModelDownload({
+      engine: "compact",
+      cached: false,
+      network: { ...baseNetwork, saveData: true },
+    }),
+    "consent",
+  )
+  assert.equal(
+    decideModelDownload({
+      engine: "quality",
+      cached: false,
+      network: baseNetwork,
+    }),
+    "consent",
+  )
+  assert.equal(
+    decideModelDownload({
+      engine: "compact",
+      cached: false,
+      network: { ...baseNetwork, mobile: true },
+    }),
+    "consent",
+  )
+})
+
+test("download policy reuses cache offline and auto-loads only safe cases", () => {
+  const offline = {
+    online: false,
+    saveData: false,
+    connectionType: null,
+    mobile: true,
+  }
+  assert.equal(
+    decideModelDownload({
+      engine: "quality",
+      cached: true,
+      network: offline,
+    }),
+    "auto",
+  )
+  assert.equal(
+    decideModelDownload({
+      engine: "compact",
+      cached: false,
+      network: offline,
+    }),
+    "skip",
+  )
+  assert.equal(
+    decideModelDownload({
+      engine: "quality",
+      cached: false,
+      network: { ...offline, online: true, connectionType: "wifi" },
+    }),
+    "auto",
+  )
+  assert.equal(
+    decideModelDownload({
+      engine: "compact",
+      cached: false,
+      network: { ...offline, online: true, mobile: false },
+    }),
+    "auto",
+  )
+})
+
+test("quiz textarea keeps all arrow keys inside the answer field", () => {
+  assert.equal(isQuizTextareaNavigationKey("ArrowLeft"), true)
+  assert.equal(isQuizTextareaNavigationKey("ArrowRight"), true)
+  assert.equal(isQuizTextareaNavigationKey("ArrowUp"), true)
+  assert.equal(isQuizTextareaNavigationKey("ArrowDown"), true)
+  assert.equal(isQuizTextareaNavigationKey("a"), false)
 })
 
 test("progressPercent follows Transformers.js percentages and byte progress", () => {

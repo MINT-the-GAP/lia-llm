@@ -1,0 +1,316 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>lia-llm browser API smoke test</title>
+<body>
+  <div id="textarea-owner" data-llm-textarea="5">
+    <input class="lia-quiz__input" aria-label="Testantwort">
+  </div>
+  <lia-llm-solution id="solution-probe"></lia-llm-solution>
+  <lia-llm-activity id="activity-probe" hidden></lia-llm-activity>
+  <lia-llm-activity id="activity-probe-two" hidden></lia-llm-activity>
+  <script src="../dist/index.js"></script>
+  <script>
+  const initial = window.LiaLLM?.getStatus()
+  window.__liaCalibration = []
+  window.__liaCalibrationExpected = 1
+  window.__liaCalibrationDone = false
+
+  ;(async () => {
+    try {
+      if (document.readyState === "loading") {
+        await new Promise(resolve =>
+          document.addEventListener("DOMContentLoaded", resolve, { once: true })
+        )
+      }
+      await Promise.resolve()
+
+      const named = window.LiaLLM?.parseMacroOptions(
+        "0.66;solution=1;feedback=1;operator=erklaeren"
+      )
+      const positional = window.LiaLLM?.parseMacroOptions("0.66;1;1;erklaeren")
+      const solution = document.getElementById("solution-probe")
+      const solutionStartedHidden =
+        solution?.hidden === true && solution?.style.display === "none"
+      window.LiaLLM?.showSolution(
+        "solution-probe",
+        "Erster Absatz.\n\nZweiter Absatz."
+      )
+      const solutionBecameVisible =
+        solution?.hidden === false && solution?.style.display === "block"
+      window.LiaLLM?.showSolution("solution-probe", "")
+      const solutionHidesWhenCleared =
+        solution?.hidden === true &&
+        solution?.style.display === "none" &&
+        solution?.textContent === ""
+      window.LiaLLM?.showSolution(
+        "solution-probe",
+        "Erster Absatz.\n\nZweiter Absatz."
+      )
+
+      const originalPreload = window.LiaLLM?.preload
+      let quizPresencePreloadCalls = 0
+      if (window.LiaLLM && originalPreload) {
+        window.LiaLLM.preload = async () => {
+          quizPresencePreloadCalls += 1
+          return initial
+        }
+      }
+      const quizUseOne = document.createElement("lia-llm-quiz-use")
+      const quizUseTwo = document.createElement("lia-llm-quiz-use")
+      document.body.append(quizUseOne, quizUseTwo)
+      await Promise.resolve()
+      const quizPresenceStartsOnce =
+        quizPresencePreloadCalls === 1 &&
+        quizUseOne.hidden === true &&
+        quizUseOne.style.display === "none" &&
+        quizUseOne.getAttribute("aria-hidden") === "true" &&
+        quizUseTwo.hidden === true
+      quizUseOne.remove()
+      quizUseTwo.remove()
+      if (window.LiaLLM && originalPreload) {
+        window.LiaLLM.preload = originalPreload
+      }
+
+      const activity = document.getElementById("activity-probe")
+      const secondActivity = document.getElementById("activity-probe-two")
+      window.LiaLLM?.showActivity(
+        "activity-probe",
+        "run-one",
+        "preparing-compact"
+      )
+      const activityStarted =
+        activity?.hidden === false &&
+        activity?.style.display === "grid" &&
+        activity?.getAttribute("aria-busy") === "true" &&
+        activity?.querySelector(".lia-llm-activity-label")?.textContent ===
+          "Kompaktmodell wird vorbereitet …" &&
+        activity?.querySelector(".lia-llm-activity-track")
+          ?.getAttribute("role") === "progressbar" &&
+        !activity?.querySelector(".lia-llm-activity-track")
+          ?.hasAttribute("aria-valuenow")
+      window.LiaLLM?.showActivity(
+        "activity-probe",
+        "run-two",
+        "evaluating-quality"
+      )
+      window.LiaLLM?.showActivity("activity-probe", "run-one", "")
+      const staleRunCannotHideCurrent =
+        activity?.hidden === false &&
+        activity?.querySelector(".lia-llm-activity-label")?.textContent ===
+          "Antwort wird gründlich geprüft …"
+      window.LiaLLM?.showActivity(
+        "activity-probe-two",
+        "second-run",
+        "evaluating-compact"
+      )
+      window.LiaLLM?.showActivity("activity-probe", "run-two", "")
+      const activitiesStayIsolated =
+        activity?.hidden === true &&
+        activity?.style.display === "none" &&
+        activity?.getAttribute("aria-busy") === "false" &&
+        secondActivity?.hidden === false &&
+        secondActivity?.querySelector(".lia-llm-activity-label")?.textContent ===
+          "Antwort wird schnell geprüft …"
+      window.LiaLLM?.showActivity("activity-probe-two", "second-run", "")
+      const activityClears = secondActivity?.hidden === true
+
+      const area = document.querySelector(
+        "#textarea-owner textarea[data-lia-llm-textarea]"
+      )
+      let bubbledKeys = []
+      document.body.addEventListener("keydown", event => {
+        bubbledKeys.push(event.key)
+      })
+
+      const arrow = new KeyboardEvent("keydown", {
+        key: "ArrowLeft",
+        bubbles: true,
+        cancelable: true
+      })
+      area?.dispatchEvent(arrow)
+      const arrowUp = new KeyboardEvent("keydown", {
+        key: "ArrowUp",
+        bubbles: true,
+        cancelable: true
+      })
+      area?.dispatchEvent(arrowUp)
+      const letter = new KeyboardEvent("keydown", {
+        key: "a",
+        bubbles: true,
+        cancelable: true
+      })
+      area?.dispatchEvent(letter)
+
+      const cacheInfo = await window.LiaLLM?.getCacheInfo()
+      const overlay = document.getElementById("lia-llm-load-overlay")
+      window.dispatchEvent(
+        new CustomEvent("lia-llm:status", {
+          detail: {
+            phase: "loading",
+            loadSource: "cache",
+            assessmentEngine: "quality",
+            modelId: "quality-test",
+            revision: "test",
+            device: "webgpu",
+            dtype: "q4f16"
+          }
+        })
+      )
+      window.dispatchEvent(
+        new CustomEvent("lia-llm:progress", {
+          detail: {
+            status: "loading",
+            progress: 42,
+            message: "Loading model from cache[31/74]"
+          }
+        })
+      )
+      const cachedActivationIsHidden =
+        overlay?.dataset.on === "0" &&
+        overlay?.getAttribute("aria-hidden") === "true"
+      window.dispatchEvent(
+        new CustomEvent("lia-llm:status", {
+          detail: {
+            phase: "ready",
+            loadSource: "cache",
+            assessmentEngine: "quality",
+            modelId: "quality-test",
+            revision: "test",
+            device: "webgpu",
+            dtype: "q4f16"
+          }
+        })
+      )
+      const cachedReadyIsHidden =
+        overlay?.dataset.on === "0" &&
+        overlay?.getAttribute("aria-hidden") === "true" &&
+        overlay?.getAttribute("aria-busy") === "false"
+      window.dispatchEvent(
+        new CustomEvent("lia-llm:status", {
+          detail: {
+            phase: "loading",
+            loadSource: "network",
+            assessmentEngine: "quality",
+            modelId: "quality-test",
+            revision: "test",
+            device: "webgpu",
+            dtype: "q4f16"
+          }
+        })
+      )
+      window.dispatchEvent(
+        new CustomEvent("lia-llm:progress", {
+          detail: {
+            status: "loading",
+            progress: 26,
+            message: "Loading model weights"
+          }
+        })
+      )
+      const realDownloadIsVisible =
+        overlay?.dataset.on === "1" &&
+        overlay?.dataset.background === "1" &&
+        overlay?.getAttribute("aria-hidden") === "false" &&
+        overlay?.getAttribute("aria-busy") === "true" &&
+        overlay?.querySelector(".lia-llm-load-track")
+          ?.getAttribute("aria-valuenow") === "26"
+      let consentResponse = null
+      const consentDetail = {
+        id: "browser-consent-probe",
+        engine: "quality",
+        modelName: "Qwen3-4B Test",
+        estimatedBytes: 2280000000,
+        handled: false,
+        respond: value => {
+          consentResponse = value
+        }
+      }
+      window.dispatchEvent(
+        new CustomEvent("lia-llm:download-consent", {
+          detail: consentDetail
+        })
+      )
+      const consentWasVisible =
+        overlay?.dataset.consent === "1" &&
+        overlay?.dataset.background === "0" &&
+        overlay?.getAttribute("role") === "alertdialog" &&
+        overlay?.querySelector(".lia-llm-consent-cancel")?.textContent ===
+          "Beim kleinen Modell bleiben"
+      overlay?.querySelector(".lia-llm-consent-cancel")?.click()
+
+      const matches = Boolean(
+        window.LiaLLM &&
+        window.LiaLLM.version === "0.4.0" &&
+        typeof window.LiaLLM.evaluate === "function" &&
+        typeof window.LiaLLM.feedbackForResult === "function" &&
+        typeof window.LiaLLM.showFeedback === "function" &&
+        typeof window.LiaLLM.showSolution === "function" &&
+        typeof window.LiaLLM.showActivity === "function" &&
+        initial?.assessmentEngine === "compact" &&
+        initial?.phase === "idle" &&
+        named?.passThreshold === 0.66 &&
+        named?.solution === true &&
+        named?.feedback === true &&
+        named?.operator === "erklaeren" &&
+        JSON.stringify(named) === JSON.stringify(positional) &&
+        area instanceof HTMLTextAreaElement &&
+        !arrow.defaultPrevented &&
+        !arrowUp.defaultPrevented &&
+        !bubbledKeys.includes("ArrowLeft") &&
+        !bubbledKeys.includes("ArrowUp") &&
+        bubbledKeys.includes("a") &&
+        solutionStartedHidden &&
+        solutionBecameVisible &&
+        solutionHidesWhenCleared &&
+        solution?.textContent === "Erster Absatz.\n\nZweiter Absatz." &&
+        solution?.hidden === false &&
+        solution?.style.whiteSpace === "pre-wrap" &&
+        quizPresenceStartsOnce &&
+        activityStarted &&
+        staleRunCannotHideCurrent &&
+        activitiesStayIsolated &&
+        activityClears &&
+        cachedActivationIsHidden &&
+        cachedReadyIsHidden &&
+        realDownloadIsVisible &&
+        consentDetail.handled === true &&
+        consentWasVisible &&
+        consentResponse === false &&
+        overlay?.dataset.consent === "0" &&
+        cacheInfo?.estimatedBytes === 2635000000 &&
+        cacheInfo?.engines?.compact?.estimatedBytes === 355000000 &&
+        cacheInfo?.engines?.quality?.estimatedBytes === 2280000000
+      )
+      window.__liaCalibration.push({
+        matches,
+        compactFeedbackHasCriteria: false,
+        version: window.LiaLLM?.version,
+        initial,
+        named,
+        positional,
+        solutionStartedHidden,
+        solutionBecameVisible,
+        solutionHidesWhenCleared,
+        quizPresenceStartsOnce,
+        activityStarted,
+        staleRunCannotHideCurrent,
+        activitiesStayIsolated,
+        activityClears,
+        arrowDefaultPrevented: arrow.defaultPrevented,
+        bubbledKeys,
+        cachedActivationIsHidden,
+        cachedReadyIsHidden,
+        realDownloadIsVisible,
+        consentWasVisible,
+        consentResponse,
+        cacheInfo
+      })
+    } catch (error) {
+      window.__liaCalibrationError =
+        error instanceof Error ? error.stack : String(error)
+    } finally {
+      window.__liaCalibrationDone = true
+    }
+  })()
+  </script>
+</body>

@@ -5,6 +5,7 @@
 <pre id="output">starting</pre>
 <script>
 const answers = [
+  "Beim Gefrieren ordnen sich die Wassermoleküle durch Wasserstoffbrücken zu einer offenen Kristallstruktur an. Diese Struktur benötigt mehr Volumen. Deshalb besitzt Eis eine geringere Dichte als flüssiges Wasser und schwimmt an der Oberfläche.",
   "Wasser gefriert, indem es hexagonale Molekülmuster ausbildet. Dies wird die Anomalie des Wasser genannt und entspringt seinem Dipolcharakter. Aus diesem Grund nimmt die Dichte von Wasser im festen Zustand ab und schwimmt auf noch flüssigem Wasser.",
   "Wasser hat eine größere Dichte als Eis, da Eis durch die Wasserstoffbrückenbindung sich beim Gefrieren besonders anordnet und somit mehr Volumen pro Molekül braucht. Durch die geringere Dichte von Eis schwimmt es auf dem Wasser.",
   "Eis hat eine höhere Dichte als Wasser, was daran liegt, dass es fest ist und bei festen Stoffen ist die Temperatur niedriger.",
@@ -14,10 +15,11 @@ const answers = [
   "Weil es gefriert und deswegen halt oben schwimmt.",
   "Weil die Luft über dem Wasser halt so kalt ist, muss das Eis ja auch oben sein."
 ]
-const expected = [true, true, false, false, false, false, false, false]
+const expected = [true, true, true, false, false, false, false, false, false]
 const reference = "Beim Gefrieren entsteht eine besondere Molekülstruktur, durch die Eis eine geringere Dichte als flüssiges Wasser hat. Deshalb schwimmt Eis auf Wasser."
 window.__liaCalibrationDone = false
 window.__liaCalibration = []
+window.__liaCalibrationExpected = expected.length
 ;(async () => {
   try {
     for (let index = 0; index < answers.length; index += 1) {

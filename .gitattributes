@@ -1,0 +1,3 @@
+# Parcel contains upstream multiline strings whose intentional trailing spaces
+# must not turn the generated bundle into a source-style whitespace failure.
+dist/index.js -whitespace

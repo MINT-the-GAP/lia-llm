@@ -7,7 +7,20 @@ import { fileURLToPath } from "node:url"
 
 const root = fileURLToPath(new URL("..", import.meta.url))
 const chromePath = "C:/Program Files/Google/Chrome/Application/chrome.exe"
-const profilePath = "C:/tmp/lia-llm-browser-profile-20260720-v3"
+const calibrationPage =
+  process.argv[2] ??
+  process.env.LIA_LLM_CALIBRATION_PAGE ??
+  "test/browser-holistic-calibration.html"
+const executionMode = process.argv[3]
+const useWebGpu =
+  executionMode === "cpu"
+    ? false
+    : executionMode === "webgpu"
+      ? true
+      : process.env.LIA_LLM_WEBGPU !== "0"
+const profilePath = useWebGpu
+  ? "C:/tmp/lia-llm-webgpu-profile-20260721-v1"
+  : "C:/tmp/lia-llm-browser-profile-20260720-v3"
 let pageUrl = ""
 
 const contentTypes = {
@@ -43,7 +56,7 @@ const serverAddress = server.address()
 if (!serverAddress || typeof serverAddress === "string") {
   throw new Error("Could not determine the calibration server port")
 }
-pageUrl = `http://127.0.0.1:${serverAddress.port}/test/browser-holistic-calibration.html`
+pageUrl = `http://127.0.0.1:${serverAddress.port}/${calibrationPage.replace(/^\/+/, "")}`
 
 const debuggingProbe = createServer()
 await new Promise((resolve, reject) => {
@@ -57,18 +70,24 @@ if (!debuggingAddress || typeof debuggingAddress === "string") {
 const debuggingPort = debuggingAddress.port
 await new Promise((resolve) => debuggingProbe.close(resolve))
 
+const chromeArguments = [
+  "--headless=new",
+  "--no-first-run",
+  "--no-default-browser-check",
+  "--disable-dev-shm-usage",
+  `--user-data-dir=${profilePath}`,
+  `--remote-debugging-port=${debuggingPort}`,
+  pageUrl,
+]
+if (useWebGpu) {
+  chromeArguments.unshift("--enable-unsafe-webgpu", "--enable-features=Vulkan")
+} else {
+  chromeArguments.unshift("--disable-gpu")
+}
+
 const chrome = spawn(
   chromePath,
-  [
-    "--headless=new",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--disable-gpu",
-    "--disable-dev-shm-usage",
-    `--user-data-dir=${profilePath}`,
-    `--remote-debugging-port=${debuggingPort}`,
-    pageUrl,
-  ],
+  chromeArguments,
   { stdio: ["ignore", "ignore", "pipe"] },
 )
 
@@ -153,24 +172,25 @@ try {
     })
 
   await command("Runtime.enable")
-  const deadline = Date.now() + 15 * 60_000
+  const deadline = Date.now() + (useWebGpu ? 30 : 15) * 60_000
   let lastCount = -1
   while (Date.now() < deadline) {
     const result = await command("Runtime.evaluate", {
       expression:
-        "JSON.stringify({done:Boolean(window.__liaCalibrationDone),results:window.__liaCalibration||[],error:window.__liaCalibrationError||null})",
+        "JSON.stringify({done:Boolean(window.__liaCalibrationDone),results:window.__liaCalibration||[],total:window.__liaCalibrationExpected||0,error:window.__liaCalibrationError||null})",
       returnByValue: true,
     })
     const state = JSON.parse(result.result.value)
     if (state.results.length !== lastCount) {
       lastCount = state.results.length
-      process.stdout.write(`completed ${lastCount}/8\n`)
+      process.stdout.write(`completed ${lastCount}/${state.total || "?"}\n`)
     }
     if (state.done) {
       process.stdout.write(`${JSON.stringify(state, null, 2)}\n`)
       if (
         state.error ||
-        state.results.length !== 8 ||
+        state.total < 1 ||
+        state.results.length !== state.total ||
         state.results.some(
           (result) => result.matches !== true || result.compactFeedbackHasCriteria,
         )

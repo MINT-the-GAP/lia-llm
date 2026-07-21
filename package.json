@@ -1,23 +1,28 @@
 {
   "name": "lia-llm",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "private": true,
   "description": "Local semantic assessment for open-ended LiaScript questions",
   "license": "MIT",
   "app": "dist/index.js",
   "scripts": {
-    "build": "parcel build src/index.ts --target app --no-scope-hoist",
-    "dev": "parcel watch src/index.ts --target app --no-scope-hoist",
-    "typecheck": "tsc --noEmit",
+    "prepare:webllm": "node scripts/prepare-webllm.mjs",
+    "build": "npm run prepare:webllm && parcel build src/index.ts --target app --no-scope-hoist",
+    "dev": "npm run prepare:webllm && parcel watch src/index.ts --target app --no-scope-hoist",
+    "typecheck": "npm run prepare:webllm && tsc --noEmit",
+    "pretest": "npm run prepare:webllm",
     "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test test/scoring.test.mts",
+    "test:browser-smoke": "node test/run-browser-calibration.mjs test/browser-api-smoke.html cpu",
     "test:browser-model": "node test/run-browser-calibration.mjs",
     "check": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {
-    "@huggingface/transformers": "4.2.0"
+    "@huggingface/transformers": "4.2.0",
+    "@mlc-ai/web-llm": "0.2.84"
   },
   "devDependencies": {
     "@webgpu/types": "0.1.64",
+    "buffer": "^6.0.3",
     "parcel": "2.16.4",
     "typescript": "5.9.3"
   },

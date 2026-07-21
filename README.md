@@ -1,73 +1,156 @@
 <!--
 author:      MINT-the-GAP, Martin Lommatzsch
-version:     0.0.1
+version:     0.4.0
 language:    de
 narrator:    Deutsch Female
-comment:     Lokale NLI-Auswertung normaler LiaScript-Freitextquizze anhand einer Musterlösung.
+comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
 repository:  https://github.com/MINT-the-GAP/lia-llm
 script:      ./dist/index.js
 
-attribute:   [Transformers.js](https://huggingface.co/docs/transformers.js/)
-             by Hugging Face is licensed under [Apache-2.0](https://github.com/huggingface/transformers.js/blob/main/LICENSE)
+attribute:   [WebLLM](https://webllm.mlc.ai/docs/) by MLC is licensed under
+             [Apache-2.0](https://github.com/mlc-ai/web-llm/blob/main/LICENSE), and
+             [Qwen3-4B](https://huggingface.co/mlc-ai/Qwen3-4B-q4f16_1-MLC) by the Qwen Team
+             is licensed under [Apache-2.0](https://huggingface.co/Qwen/Qwen3-4B/blob/main/LICENSE).
+             [Transformers.js](https://huggingface.co/docs/transformers.js/) by Hugging Face is
+             licensed under [Apache-2.0](https://github.com/huggingface/transformers.js/blob/main/LICENSE),
              and [multilingual mDeBERTa-v3 NLI](https://huggingface.co/Xenova/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7)
              by Moritz Laurer, converted for Transformers.js by Xenova, is licensed under
              [MIT](https://huggingface.co/MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7/blob/main/LICENSE).
 
-@LLMQuiz
+@LLMQuiz: @LLMQuiz_(@uid,@0,```@1```)
+
+@LLMQuiz_
 <script>
-const criterionThreshold = Number(`@'0`)
-const reference = `@'1`
+const feedbackId = "lia-llm-feedback-@0"
+const solutionId = "lia-llm-solution-@0"
+const activityId = "lia-llm-activity-@0"
+const runId = activityId + "-" + Date.now().toString(36) + "-" +
+  Math.random().toString(36).slice(2)
+const evaluationController = new AbortController()
+const optionSource = `@'1`
+const reference = `@'2`
 const answer = `@'input`.replace(/\u2028/gu, "\n")
+let active = true
+let finished = false
+let feedbackEnabled = false
+let solutionEnabled = false
+
+window.LiaLLM?.showFeedback?.(feedbackId, "")
+window.LiaLLM?.showSolution?.(solutionId, "")
+window.LiaLLM?.showActivity?.(activityId, runId, "selecting-model")
+
+function clearActivity() {
+  window.LiaLLM?.showActivity?.(activityId, runId, "")
+}
+
+function showLearnerFeedback(message) {
+  if (!active) return
+  window.LiaLLM?.showFeedback?.(feedbackId, feedbackEnabled ? message : "")
+}
+
+function finishQuiz(value) {
+  if (!active || finished) return
+  finished = true
+  clearActivity()
+  send.lia(value)
+}
+
+function finishTechnicalError(error) {
+  if (!active || finished) return
+  finished = true
+  clearActivity()
+  window.LiaLLM?.showFeedback?.(feedbackId, "")
+  const message = error instanceof Error ? error.message : String(error)
+  send.lia(message, [], false)
+}
+
+send.handle("stop", () => {
+  active = false
+  finished = true
+  evaluationController.abort()
+  clearActivity()
+  window.LiaLLM?.showFeedback?.(feedbackId, "")
+  window.LiaLLM?.showSolution?.(solutionId, "")
+})
 
 Promise.resolve()
   .then(() => {
     if (!window.LiaLLM) {
       throw new Error("lia-llm konnte nicht geladen werden.")
     }
-    if (window.LiaLLM.version !== "0.3.1") {
-      throw new Error(`lia-llm 0.3.1 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
+    if (window.LiaLLM.version !== "0.4.0") {
+      throw new Error(`lia-llm 0.4.0 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
     }
+
+    const options = window.LiaLLM.parseMacroOptions(optionSource)
+    feedbackEnabled = options.feedback
+    solutionEnabled = options.solution
 
     return window.LiaLLM.evaluate({
       question: "LiaScript-Freitextaufgabe",
       answer,
       reference,
-      criterionThreshold
+      operator: options.operator ?? undefined,
+      criterionThreshold: options.passThreshold
+    }, {
+      signal: evaluationController.signal,
+      onProgress: progress => {
+        if (!active) return
+        window.LiaLLM?.showActivity?.(activityId, runId, progress.phase)
+      }
     })
   })
-  .then(result => send.lia(String(result.passed)))
+  .then(result => {
+    if (!active) return
+    window.LiaLLM?.showSolution?.(
+      solutionId,
+      solutionEnabled && result.passed ? reference : ""
+    )
+    const feedback = feedbackEnabled
+      ? window.LiaLLM?.feedbackForResult?.(result, "de-DE") ?? null
+      : null
+    showLearnerFeedback(feedback?.message ?? "")
+    finishQuiz(result.passed ? "true" : "false")
+  })
   .catch(error => {
-    const message = error instanceof Error ? error.message : String(error)
-    send.lia(message, [], false)
+    if (!active) return
+    window.LiaLLM?.showSolution?.(solutionId, "")
+    const feedback = window.LiaLLM?.feedbackForError?.(error, "de-DE") ?? null
+    if (feedback) {
+      showLearnerFeedback(feedback.message)
+      finishQuiz("false")
+      return
+    }
+    finishTechnicalError(error)
   })
 
 "LIA: wait"
 </script>
-********************************************************************************
-@1
-********************************************************************************
+<lia-llm-quiz-use hidden></lia-llm-quiz-use>
+<lia-llm-activity id="lia-llm-activity-@0" hidden></lia-llm-activity>
+<lia-llm-feedback id="lia-llm-feedback-@0"></lia-llm-feedback>
+<lia-llm-solution id="lia-llm-solution-@0" hidden></lia-llm-solution>
 @end
 -->
 
 # lia-llm
 
     --{{0}}--
-`lia-llm` ergänzt ein **normales LiaScript-Freitextquiz** um eine lokale semantische
-Auswertung. Das Makro erzeugt weder die Frage noch das Quiz. Ein gekennzeichnetes
-LiaScript-Textquiz erhält automatisch ein mehrzeiliges Antwortfeld und wird über den
-angehängten Lösungsblock mit `@LLMQuiz` verbunden.
+`lia-llm` ergänzt ein normales LiaScript-Freitextquiz um eine lokale, semantische
+Auswertung anhand einer Musterlösung. Es gibt dafür genau ein öffentliches Makro:
+`@LLMQuiz(...)`.
 
-Das mehrsprachige NLI-Modell mDeBERTa-v3 vergleicht die vollständige Lernendenantwort mit der
-vollständigen Musterlösung als zusammenhängende Texte. Es prüft, ob die Musterlösung aus der
-Antwort **folgt**, offenbleibt oder ihr **widersprochen** wird. Sätze und Absätze sind in der
-Standardauswertung ausdrücklich keine eigenständigen Kriterien oder Punkte. Damit werden
-insbesondere Verneinungen und umgekehrte Aussagen gezielter behandelt als mit reiner
-Textähnlichkeit. Beim ersten Prüfen wird das Modell automatisch geladen. Das ist für formative
-Selbsttests gedacht und keine automatische Prüfungsnote.
+Die vollständige Antwort wird im Zusammenhang mit der vollständigen Musterlösung betrachtet.
+Synonyme, Umschreibungen und andere Satzstrukturen dürfen dieselbe Aussage ausdrücken. Das stärkere
+Modell achtet zugleich auf Verneinungen, fachliche Widersprüche und umgekehrte
+Ursache-Wirkungs-Beziehungen. Einzelne Sätze werden nicht automatisch zu einzelnen Kriterien.
+
+Die Auswertung ist ein formativer Selbstcheck. Sie ist keine Prüfungsnote und kann eine fachliche
+Bewertung durch eine Lehrkraft nicht ersetzen.
 
 ## Import
 
-Aktueller Entwicklungsstand:
+Entwicklungsstand auf `main`:
 
 ``` markdown
 <!--
@@ -75,147 +158,194 @@ import: https://raw.githubusercontent.com/MINT-the-GAP/lia-llm/main/README.md
 -->
 ```
 
-Nach Veröffentlichung des ersten Tags sollte ein Kurs für reproduzierbare Ergebnisse die
-Version fest angeben:
+Für reproduzierbare Kurse sollte nach Veröffentlichung eines Tags die Version fest angegeben werden:
 
 ``` markdown
 <!--
-import: https://raw.githubusercontent.com/MINT-the-GAP/lia-llm/0.0.1/README.md
+import: https://raw.githubusercontent.com/MINT-the-GAP/lia-llm/0.4.0/README.md
 -->
 ```
 
 ## Verwendung
 
-Zuerst wird ein gewöhnliches LiaScript-Textquiz geschrieben. Direkt danach folgt ein Textblock,
-dessen öffnende Zeile mit `@LLMQuiz(0.66)` markiert ist:
+Direkt nach dem normalen Textquiz folgt ein als `text` markierter Block. Sein Inhalt ist die
+vollständige Musterlösung für den lokalen Vergleich. Sie wird in der gerenderten Aufgabe zunächst
+nicht angezeigt. Mit `solution=1` erscheint sie erst, nachdem die Antwort als richtig bewertet wurde.
 
 ```` markdown
-<!-- data-solution-button="3" data-llm-textarea="5" -->
+Aufgabe 1: Erkläre, warum Eis auf flüssigem Wasser schwimmt.
+
+<!-- data-solution-button="off" data-llm-textarea="5" -->
 [[Antwort]]
-```text @LLMQuiz(0.66)
-Hier steht die vollständige Musterlösung.
+```text @LLMQuiz(0.66;solution=1;feedback=1;operator=erklaeren)
+Eis besitzt eine geringere Dichte als flüssiges Wasser. Beim Gefrieren bildet das
+Wasserstoffbrückennetzwerk eine offene Kristallstruktur, die mehr Volumen einnimmt.
+Deshalb schwimmt Eis an der Oberfläche.
 ```
 ````
 
-| Bestandteil | Bedeutung |
+Das Makro benötigt keine Backticks um seine Optionen. Die benannte und die kurze Schreibweise sind
+gleichwertig:
+
+``` text
+@LLMQuiz(0.66;solution=1;feedback=1)
+@LLMQuiz(0.66;1;1)
+@LLMQuiz(0.66;solution=1;feedback=1;operator=erklaeren)
+@LLMQuiz(0.66;1;1;erklaeren)
+```
+
+| Teil | Bedeutung |
 | --- | --- |
-| `data-llm-textarea="5"` | mehrzeiliges Antwortfeld mit zunächst fünf sichtbaren Zeilen |
-| `0.66` | ganzheitlicher NLI-Zustimmungsschwellwert zwischen `0` und `1` |
-| Inhalt des `text`-Blocks | fachlich erwartete Antwort und zugleich angezeigte LiaScript-Auflösung |
+| `0.66` | Mindestkonfidenz zwischen `0` und `1`; Dezimaltrennzeichen ist der Punkt |
+| `solution=1` / zweiter Wert `1` | Musterlösung ausschließlich nach einer richtigen Antwort anzeigen |
+| `solution=0` / zweiter Wert `0` | Musterlösung unabhängig vom Ergebnis nie anzeigen |
+| `feedback=1` / dritter Wert `1` | kurze priorisierte Rückmeldung einschalten; ein reiner Stilhinweis kann auch bei richtiger Antwort erscheinen |
+| `feedback=0` / dritter Wert `0` | zusätzliches Kurzfeedback ausschalten |
+| `operator=erklaeren` / vierter Wert `erklaeren` | zusätzlich prüfen, ob die Antwort einen Zusammenhang erklärt |
 
-Für den Zahlenwert werden keine Backticks benötigt. Als Dezimaltrennzeichen muss ein Punkt
-verwendet werden, beispielsweise `0.66`. Das Makro übergibt diesen Wert als
-`criterionThreshold`: Je höher er ist, desto deutlicher muss die vollständige Lernendenantwort die
-vollständige Musterlösung stützen.
+Ohne Optionen gelten `solution=1` und `feedback=0`:
 
-`[[Antwort]]` bleibt dabei das normale LiaScript-Textquiz. Die Angabe
-`data-llm-textarea="5"` ersetzt dessen einzeilige Darstellung durch ein vertikal
-vergrößerbares Textfeld. Eine Schreibweise wie `[[___ ___ ___]]` würde das native Feld nur
-breiter, aber nicht mehrzeilig machen. Die Zeilenzahl kann zwischen `2` und `12` gewählt werden.
-Manuelle Zeilenumbrüche und Leerzeilen bleiben dabei auch nach einem Folienwechsel erhalten.
+``` text
+@LLMQuiz(0.66)
+```
 
-> **Wichtig:** Der mit `@LLMQuiz(0.66)` markierte Textblock muss unmittelbar nach
-> `[[Antwort]]` stehen. Sein Inhalt wird automatisch an das Makro übergeben. Das Makro erzeugt
-> daraus das angehängte Prüfscript und den nativen LiaScript-Auflösungsblock. Die Musterlösung
-> wird deshalb nur einmal geschrieben; ein zusätzlicher Sternblock ist nicht nötig.
+Benannte Optionen dürfen in beliebiger Reihenfolge stehen. Benannte und positionale Angaben werden
+innerhalb eines Aufrufs nicht gemischt; Tippfehler und unbekannte Optionen führen zu einer klaren
+Fehlermeldung.
 
-Die Frage und alle üblichen LiaScript-Einstellungen bleiben außerhalb des Makros. Beispielsweise
-blendet `data-solution-button="3"` den Lösungsbutton erst nach drei Fehlversuchen ein.
+`operator` ist optional. Ohne diese Angabe bewertet das Makro fachliche Richtigkeit, Relevanz und
+Vollständigkeit allgemein. Mit `operator=erklaeren` erhält das Qualitätsmodell zusätzlich die
+Anforderungen an eine Erklärung und kann gezielt melden, dass zwar passende Inhalte vorkommen, der
+gefragte Zusammenhang aber noch nicht erklärt wurde. Weitere Operatoren werden auf Grundlage der
+fachspezifischen Ausgangstabelle [Operatoren.md](Operatoren.md) und der technischen
+[Operator- und Feedbackmatrix](docs/operatoren.md) ergänzt; Operatoren werden dabei nicht mit
+einzelnen Sätzen der Musterlösung oder mit Antwortsynonymen gleichgesetzt.
 
-Beim ersten Klick auf **Prüfen** lädt das Template das Modell automatisch. Die gepinnten
-Q8-Modellartefakte umfassen rund 355 MB; die ONNX/WASM-Laufzeit kommt hinzu. Anschließend verwendet
-der Browser nach Möglichkeit seinen Cache.
+Der native LiaScript-Lösungsbutton bleibt bei dieser Quizform ausgeschaltet; die sichtbare Ausgabe
+wird ausschließlich über `solution` gesteuert. Soll die Musterlösung nie erscheinen:
 
-Dabei erscheint oben im Kurs automatisch ein Ladebalken. Solange Transformers.js noch keinen
-messbaren Wert liefert, läuft er animiert; während eines Downloads zeigt er die aktuelle Datei,
-übertragene Daten und Prozent an. Die Prozentzahl bezieht sich auf die jeweils angezeigte Datei,
-nicht auf die Summe aller Artefakte. Nach erfolgreicher Initialisierung verschwindet die Anzeige
-selbstständig. Bei einem Ladefehler bleibt sie mit **Erneut versuchen** sichtbar.
+```` markdown
+<!-- data-solution-button="off" data-llm-textarea="5" -->
+[[Antwort]]
+```text @LLMQuiz(0.66;solution=0;feedback=1)
+Hier steht weiterhin die vollständige Musterlösung für den lokalen Vergleich.
+```
+````
+
+`solution=0` ist kein Zugriffsschutz: Die lokale Auswertung benötigt die Musterlösung, deshalb
+bleibt sie im Kursquelltext und im Browser auffindbar.
+
+### Mehrzeilige Antworten
+
+`data-llm-textarea="5"` erzeugt ein vergrößerbares Feld mit fünf sichtbaren Zeilen. Werte von 2 bis
+12 sind möglich. Absätze und Leerzeilen bleiben bei der Auswertung erhalten. Im Feld bleiben alle
+vier Pfeiltasten beim Cursor und lösen keinen Folienwechsel aus.
+
+### Kurzes Feedback
+
+Mit `feedback=1` zeigt das Makro höchstens eine kurze, priorisierte Rückmeldung. Je nach Ergebnis
+kann das beispielsweise sein:
+
+- „Die Antwort enthält inhaltliche Fehler.“
+- „Die Antwort erklärt den gefragten Zusammenhang noch nicht vollständig.“
+- „Die Antwort ist deutlich zu kurz, um etwas zu erklären.“
+- „Die Antwort entspricht noch nicht den Kriterien einer Erklärung.“
+- „Die Antwort ist zu umgangssprachlich verfasst.“
+
+Die fachliche Richtig/Falsch-Entscheidung bleibt von einem bloßen Stilhinweis getrennt: Eine
+inhaltlich richtige Antwort wird nicht allein wegen Umgangssprache falsch. Das Makro zeigt keine
+Kriterienliste, keine Konfidenzen und keinen Text aus der Musterlösung. Die detaillierten
+Diagnosedaten bleiben intern für Tests, Kalibrierung oder ein späteres Fine-Tuning erhalten.
+
+## Modelle, Laden und Cache
+
+Es gibt keine manuelle Schaltfläche „Modell vorbereiten“ und keine getrennten Kompakt-Makros.
+
+Das Kompaktmodell ist schnell, aber bewusst konservativ. Es schlägt keine Wörter in einer festen
+Synonymliste nach, sondern schätzt die inhaltliche Folgerung zwischen vollständiger Antwort und
+Musterlösung. Eine weiter entfernte, dennoch richtige Paraphrase kann deshalb zunächst unter der
+Schwelle liegen. Ein solcher Befund ist jetzt nur noch vorläufig:
+
+1. Sobald LiaScript die erste tatsächlich verwendete `@LLMQuiz`-Instanz rendert und deren
+   verborgene Markierung einliest, startet einmalig die gemeinsame Modellvorbereitung. Weitere
+   Quizze und spätere Folienbesuche starten keinen zweiten Ladevorgang. Ein nur importiertes, aber
+   nirgends gerendertes Makro lädt dagegen keine Modelle.
+2. Sind die großen Qwen-Modellgewichte bereits im Browsercache und ist WebGPU verfügbar, wird
+   Qwen3-4B zuerst für die Sitzung aktiviert. Auch eine sehr früh abgeschickte erste Antwort wartet
+   auf diese gemeinsame Cache-Aktivierung und wird dann direkt mit Qwen geprüft; das Kompaktmodell
+   wird dafür nicht zusätzlich geladen.
+3. Ist Qwen noch nicht lokal vorhanden, bereitet das Template zunächst das kompakte
+   mDeBERTa-v3-NLI-Modell vor und startet Qwen nach den Regeln für Netzverbindung und Zustimmung im
+   Hintergrund. Ist Qwen beim Prüfen bereits fertig, wird es sofort verwendet.
+4. Trifft eine Antwort noch auf das Kompaktmodell, wird ein positiver Befund sofort übernommen. Ein
+   falscher oder unsicherer Befund bleibt vorläufig: Genau dieselbe, zu Beginn erfasste Antwort
+   wartet im selben Prüfvorgang auf Qwen und wird nochmals im Gesamtzusammenhang bewertet.
+5. Liefert Qwen kein gültiges strukturiertes Ergebnis, ist WebGPU nicht verfügbar oder wurde ein
+   nötiger Download abgelehnt, verwendet die Auswertung still den bereits berechneten
+   Kompaktbefund.
+
+| Stufe | Modell und Laufzeit | Erster Download | Einordnung |
+| --- | --- | ---: | --- |
+| Qualität | Qwen3-4B über WebLLM | ca. 2,28 GB | wird bevorzugt, sobald es gecacht oder betriebsbereit ist; besser für Kontext, Synonyme, Paraphrasen und Negationen |
+| schneller Start/Fallback | mDeBERTa-v3 NLI über Transformers.js | ca. 355 MB | überbrückt ein noch fehlendes Qualitätsmodell und läuft bei Bedarf mit WASM |
+
+Es gibt zwei bewusst getrennte Anzeigen:
+
+- Direkt am Quiz erscheint während jedes Prüfvorgangs ein schmaler Arbeitsbalken. Sein Text zeigt,
+  ob gerade das Kompaktmodell vorbereitet, die Antwort schnell geprüft, die Qualitätsprüfung
+  vorbereitet oder die Antwort gründlich geprüft wird. Die eigentliche Inferenz liefert keine
+  verlässliche Prozentzahl; deshalb läuft dieser Balken ohne erfundenen Prozentwert.
+- Der große Fortschrittsbalken erscheint ausschließlich bei einem echten Netzwerkdownload und
+  zeigt dessen messbaren Fortschritt. Sind alle Artefakte bereits im Browsercache, werden sie ohne
+  diesen globalen Balken für die Sitzung in Arbeitsspeicher und WebGPU aktiviert. Eine gerade
+  wartende Aufgabe zeigt dabei weiterhin ihren kleinen lokalen Arbeitsbalken. Dasselbe Dialogfeld
+  bleibt für eine nötige Download-Zustimmung oder einen Ladefehler sichtbar.
+
+Die Hintergrundvorbereitung nach einem bereits positiven Kompaktbefund verzögert dessen Ergebnis
+nicht. Muss ein falscher oder unsicherer Kompaktbefund durch Qwen überprüft werden, bleibt dagegen
+genau dieser Prüfvorgang bis zum Qualitätsbefund oder zum stillen Rückfall offen.
+
+Vor dem ersten, noch nicht gecachten Download wird bei erkanntem Mobilfunk oder Datensparmodus
+gefragt. Weil nicht jeder Browser die Verbindungsart meldet, fragt das große Qualitätsmodell auch
+bei unbekannter Verbindung; auf mobilen Geräten gilt dies vorsichtshalber ebenfalls für das
+kompakte Modell. Sobald die vollständigen Modellartefakte im Cache liegen, erscheint die
+Downloadfrage nicht erneut; lediglich der kleine Arbeitsbalken des aktuell geprüften Quiz bleibt
+während Vorbereitung und Auswertung sichtbar.
+
+Modelldateien liegen in der Browser Cache API. Nur beim ersten ungecacheten Download bittet das
+Template den Browser zusätzlich um persistenten Website-Speicher; ein Cache-Treffer löst auch diese
+Anfrage nicht erneut aus. Die WebLLM-Laufzeit selbst ist im Template gebündelt und wird nicht erst
+von einem CDN nachgeladen. Damit können vollständig geladene Modelle im selben Browserprofil und
+unter derselben Herkunft auch offline wiederverwendet werden.
+
+Browser dürfen Persistenz ablehnen; ausdrücklich gelöschte Website-Daten, privater Modus,
+Speicherbereinigung oder eine andere Herkunft entfernen beziehungsweise trennen den Cache. Eine
+absolute, browserübergreifende Dauerhaftigkeit kann eine Webanwendung deshalb nicht garantieren.
 
 ## Probieraufgabe
 
-Der folgende Quelltext ist eine vollständige Aufgabe:
-
-```` markdown
-Aufgabe 1: Erkläre, warum Eis auf flüssigem Wasser schwimmt.
-
-<!-- data-solution-button="1" data-llm-textarea="5" -->
-[[Antwort]]
-```text @LLMQuiz(0.66)
-Beim Gefrieren entsteht eine besondere Molekülstruktur, durch die Eis eine
-geringere Dichte als flüssiges Wasser hat. Deshalb schwimmt Eis auf Wasser.
-```
-````
-
-Hier kann die Aufgabe direkt ausprobiert werden:
+Hier kann die Aufgabe direkt ausprobiert werden. Die Musterlösung bleibt zunächst verborgen und
+erscheint nur nach einer als richtig bewerteten Antwort; bei falschen Antworten wird lediglich das
+eingeschaltete Kurzfeedback angezeigt:
 
 Aufgabe 1: Erkläre, warum Eis auf flüssigem Wasser schwimmt.
 
-<!-- data-solution-button="1" data-llm-textarea="5" -->
+<!-- data-solution-button="off" data-llm-textarea="5" -->
 [[Antwort]]
-```text @LLMQuiz(0.66)
-Beim Gefrieren entsteht eine besondere Molekülstruktur, durch die Eis eine
-geringere Dichte als flüssiges Wasser hat. Deshalb schwimmt Eis auf Wasser.
+```text @LLMQuiz(0.66;solution=1;feedback=1;operator=erklaeren)
+Beim Gefrieren entsteht eine besondere Molekülstruktur, durch die Eis eine geringere
+Dichte als flüssiges Wasser hat. Deshalb schwimmt Eis auf Wasser.
 ```
 
-Eine erwartbar gute Testantwort wäre beispielsweise:
+Eine sinngleiche Antwort darf andere Wörter verwenden:
 
-> Eis hat eine offene Kristallstruktur, benötigt dadurch mehr Platz und ist weniger dicht als
-> flüssiges Wasser.
+> Wasser hat eine größere Dichte als Eis, da Eis durch die Wasserstoffbrückenbindung sich beim Gefrieren besonders anordnet und somit mehr Volumen pro Molekül braucht. Durch die geringere Dichte von Eis schwimmt es auf dem Wasser.
 
-Eine klar unzureichende Testantwort wäre:
-
-> Eis schwimmt ausschließlich deshalb, weil es kalt ist.
-
-Eine fachlich widersprüchliche Testantwort wäre:
+Eine umgekehrte Kernaussage muss falsch bleiben:
 
 > Eis schwimmt, weil es eine höhere Dichte als flüssiges Wasser besitzt.
 
-## Was geschieht beim Prüfen?
-
-1. Das mehrzeilige Feld spiegelt die Eingabe einschließlich ihrer Absatzgrenzen verlustfrei in
-   den Zustand des normalen LiaScript-Textquiz.
-2. LiaScript setzt die Antwort als `@input` in das angehängte Script ein; das Makro stellt die
-   Zeilenumbrüche vor der Auswertung wieder her.
-3. Falls nötig, wird das Modell einmalig geladen.
-4. In der Standardauswertung erhält mDeBERTa die vollständige Lernendenantwort als Prämisse und die
-   vollständige Musterlösung als Hypothese. Beide werden im Gesamtzusammenhang bewertet; Sätze,
-   Zeilen und Absätze bilden keine eigenen Kriterien.
-5. Das Modell berechnet für dieses Textpaar die drei Klassen `entailment`, `neutral` und
-   `contradiction`.
-6. Der Wert aus `@LLMQuiz(0.66)` ist die Mindestkonfidenz für die ganzheitliche Zustimmung. Eine
-   hinreichend sichere Gegenanzeige oder ein Widerspruch verhindert weiterhin das Bestehen.
-7. Nur wenn über die JavaScript-API ausdrücklich Kriterien übergeben werden, wertet der Evaluator
-   diese zusätzlich einzeln aus. Auch dann wird jedes Kriterium gegen die vollständige Antwort
-   geprüft; einzelne Sätze werden nicht als voneinander unabhängige Antworten herausgepickt. Diese
-   optionale Kriterienlogik gehört nicht zur Standardauswertung des Makros.
-8. `send.lia("true")` oder `send.lia("false")` meldet das Ergebnis als den von LiaScript
-   erwarteten String an das normale Quiz zurück.
-
-Die intern berechneten NLI-Werte sind Modellkonfidenzen und keine Garantie fachlicher Richtigkeit.
-`@LLMQuiz(0.66)` setzt den Zustimmungsschwellwert für diese Aufgabe auf `0.66`; ohne ausdrückliche
-Angabe über die JavaScript-API gilt der kalibrierte Startwert `0.55`. Für Widerspruch gilt weiterhin
-`0.65`; zusätzlich muss die entscheidende Klasse mindestens `0.15` vor den anderen Klassen liegen.
-Der Widerspruchsgrenzwert ist bewusst konservativ, weil ein erkannter Widerspruch ein Veto auslöst.
-
-Die Probieraufgabe wurde mit vollständigen Antworten im Gesamtzusammenhang kalibriert. Mit
-`@LLMQuiz(0.66)` bestehen die beiden korrekten Beispielparaphrasen aus dem Regressionstest;
-die sechs unvollständigen, irrelevanten oder fachlich falschen Antworten bestehen nicht. Eine nur
-teilweise richtige Aussage wie „Wasser dehnt sich beim Gefrieren aus, deswegen sinkt die Dichte“
-reicht dabei bewusst nicht aus, weil sie die gestellte Warum-Frage nicht vollständig beantwortet.
-
-Die Musterlösung darf mehrere Sätze und Absätze enthalten und sollte als zusammenhängende,
-fachlich vollständige Antwort formuliert sein. Zeilenumbrüche dienen nur der Formatierung und
-erzeugen weder Kriterien noch Teilpunkte. Antwort und jeweilige Musterlösung werden nicht
-abgeschnitten; zusammen dürfen sie höchstens 512 Modell-Token umfassen. Bei einer längeren Eingabe
-meldet das Template einen Fehler, statt unbemerkt Kontext wegzulassen. Bei ausdrücklich über die
-API gesetzten Kriterien sind zum Schutz vor extrem langen Auswertungen außerdem höchstens 512
-Antwort-Kriterium-Paare pro Prüfung zulässig; umfangreiche Kriterienkataloge sollten auf mehrere
-Quizze verteilt werden.
-
-Das Makro zeigt keine zusätzliche LLM-Ergebnisbox an. Lernende sehen ausschließlich LiaScripts
-native Richtig/Falsch-Rückmeldung und – abhängig von `data-solution-button` – die normale
-Auflösung. Kriterien, Evidenzpassagen und NLI-Einzelwerte bleiben im Auswertungsergebnis
-`result.criteria` erhalten, etwa für spätere Kalibrierung oder ein vorbereitetes Fine-Tuning.
-Bei direkter JavaScript-API-Nutzung kann eine Diagnose weiterhin bewusst mit
-`formatResult(result, locale, {showCriteria:true})` erzeugt werden.
+Beim Folienwechsel beendet der Makro-`stop`-Handler nur die Ausgabe der verlassenen Aufgabe.
+Ein bereits erlaubter Hintergrunddownload und der globale Modellcache bleiben erhalten. Dadurch
+erscheint kein verspätetes Quizresultat auf einer anderen Folie, das vorbereitete Modell steht aber
+für spätere Aufgaben weiter zur Verfügung.

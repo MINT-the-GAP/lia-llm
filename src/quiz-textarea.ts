@@ -12,6 +12,7 @@ interface TextareaProxy {
   syncing: boolean
   onAreaInput: () => void
   onAreaChange: () => void
+  onAreaKeyDown: (event: KeyboardEvent) => void
   onNativeInput: () => void
   onNativeFocus: () => void
 }
@@ -36,6 +37,15 @@ export function parseTextareaRows(value: string | null): number {
   const parsed = Number.parseInt(value ?? "", 10)
   if (!Number.isFinite(parsed)) return DEFAULT_ROWS
   return Math.min(MAX_ROWS, Math.max(MIN_ROWS, parsed))
+}
+
+export function isQuizTextareaNavigationKey(key: string): boolean {
+  return (
+    key === "ArrowLeft" ||
+    key === "ArrowRight" ||
+    key === "ArrowUp" ||
+    key === "ArrowDown"
+  )
 }
 
 function isEnabled(owner: HTMLElement): boolean {
@@ -144,6 +154,7 @@ function enhance(input: HTMLInputElement): void {
     syncing: false,
     onAreaInput: () => undefined,
     onAreaChange: () => undefined,
+    onAreaKeyDown: () => undefined,
     onNativeInput: () => undefined,
     onNativeFocus: () => undefined,
   }
@@ -163,6 +174,9 @@ function enhance(input: HTMLInputElement): void {
     syncToNative()
     input.dispatchEvent(new Event("change", { bubbles: true }))
   }
+  proxy.onAreaKeyDown = (event) => {
+    if (isQuizTextareaNavigationKey(event.key)) event.stopPropagation()
+  }
   proxy.onNativeInput = () => {
     if (!proxy.syncing) area.value = fromQuizInputValue(input.value)
   }
@@ -170,6 +184,7 @@ function enhance(input: HTMLInputElement): void {
 
   area.addEventListener("input", proxy.onAreaInput)
   area.addEventListener("change", proxy.onAreaChange)
+  area.addEventListener("keydown", proxy.onAreaKeyDown)
   input.addEventListener("input", proxy.onNativeInput)
   input.addEventListener("focus", proxy.onNativeFocus)
 
@@ -186,6 +201,7 @@ function enhance(input: HTMLInputElement): void {
 function removeProxy(input: HTMLInputElement, proxy: TextareaProxy): void {
   proxy.area.removeEventListener("input", proxy.onAreaInput)
   proxy.area.removeEventListener("change", proxy.onAreaChange)
+  proxy.area.removeEventListener("keydown", proxy.onAreaKeyDown)
   input.removeEventListener("input", proxy.onNativeInput)
   input.removeEventListener("focus", proxy.onNativeFocus)
   proxy.area.remove()

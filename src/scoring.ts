@@ -9,6 +9,8 @@ import type {
   NliEvidence,
   NormalizedEvaluationRequest,
 } from "./types.ts"
+import { EvaluationInputError } from "./learner-feedback.ts"
+import { resolveOperatorRubric } from "./operator-rubrics.ts"
 
 export const DEFAULT_CRITERION_THRESHOLD = 0.55
 export const DEFAULT_CONTRADICTION_THRESHOLD = 0.65
@@ -187,6 +189,7 @@ export function normalizeRequest(request: EvaluationRequest): NormalizedEvaluati
   const question = normalizeText(request.question)
   const answer = normalizeAnswerText(request.answer)
   const reference = normalizeAnswerText(request.reference)
+  const operator = resolveOperatorRubric(request.operator)
 
   if (!question) throw new Error("Die Fragestellung fehlt.")
   if (!reference) throw new Error("Die Musterlösung fehlt.")
@@ -196,10 +199,20 @@ export function normalizeRequest(request: EvaluationRequest): NormalizedEvaluati
 
   const minAnswerCharacters = Math.max(
     1,
-    Math.floor(request.minAnswerCharacters ?? DEFAULT_MIN_ANSWER_CHARACTERS),
+    Math.floor(
+      request.minAnswerCharacters ??
+        operator?.minAnswerCharacters ??
+        DEFAULT_MIN_ANSWER_CHARACTERS,
+    ),
   )
   if (answer.length < minAnswerCharacters) {
-    throw new Error(`Die Antwort ist zu kurz (mindestens ${minAnswerCharacters} Zeichen).`)
+    throw new EvaluationInputError(
+      "answer-too-short",
+      `Die Antwort ist zu kurz (mindestens ${minAnswerCharacters} Zeichen).`,
+      answer.length,
+      minAnswerCharacters,
+      operator,
+    )
   }
 
   const defaultThreshold = assertUnitInterval(
@@ -239,6 +252,7 @@ export function normalizeRequest(request: EvaluationRequest): NormalizedEvaluati
     question,
     answer,
     reference,
+    operator,
     mode,
     criteria,
     contradictionThreshold,

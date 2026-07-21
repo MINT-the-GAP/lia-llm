@@ -1,16 +1,21 @@
 const feedbackById = new Map<string, string>()
 
-export function showFeedback(id: string, html: string): void {
+function renderFeedback(element: HTMLElement, message: string): void {
+  element.textContent = message
+  element.hidden = !message
+}
+
+export function showFeedback(id: string, message: string): void {
   const normalizedId = id.trim()
   if (!normalizedId) throw new Error("Die Feedback-ID darf nicht leer sein.")
 
-  if (html) feedbackById.set(normalizedId, html)
+  if (message) feedbackById.set(normalizedId, message)
   else feedbackById.delete(normalizedId)
 
   if (typeof document === "undefined") return
   const element = document.getElementById(normalizedId)
   if (element?.tagName.toLowerCase() === "lia-llm-feedback") {
-    element.innerHTML = html
+    renderFeedback(element, message)
   }
 }
 
@@ -25,9 +30,12 @@ export function registerFeedbackElement(): void {
 
   class LiaLLMFeedbackElement extends HTMLElement {
     connectedCallback(): void {
+      this.setAttribute("role", "status")
+      this.setAttribute("aria-live", "polite")
       this.style.display = "block"
-      const html = feedbackById.get(this.id)
-      if (html !== undefined) this.innerHTML = html
+      this.style.marginTop = ".55rem"
+      this.style.fontWeight = "600"
+      renderFeedback(this, feedbackById.get(this.id) ?? "")
     }
   }
 
