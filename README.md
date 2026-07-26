@@ -158,11 +158,11 @@ import: https://raw.githubusercontent.com/MINT-the-GAP/lia-llm/main/README.md
 -->
 ```
 
-Für reproduzierbare Kurse sollte nach Veröffentlichung eines Tags die Version fest angegeben werden:
+Für reproduzierbare Kurse kann der aktuell geprüfte Stand über den Commit fest angegeben werden:
 
 ``` markdown
 <!--
-import: https://raw.githubusercontent.com/MINT-the-GAP/lia-llm/0.4.0/README.md
+import: https://raw.githubusercontent.com/MINT-the-GAP/lia-llm/d9cd5f2a8c0ef22c73407a01e7f87a8110fc4d7e/README.md
 -->
 ```
 
@@ -183,6 +183,9 @@ Wasserstoffbrückennetzwerk eine offene Kristallstruktur, die mehr Volumen einni
 Deshalb schwimmt Eis an der Oberfläche.
 ```
 ````
+
+`@LLMQuiz(...)` muss in derselben Zeile wie die öffnenden drei Backticks stehen. In der nächsten
+Zeile wäre der Aufruf nur Teil der Musterlösung und würde nicht ausgeführt.
 
 Das Makro benötigt keine Backticks um seine Optionen. Die benannte und die kurze Schreibweise sind
 gleichwertig:
@@ -332,6 +335,7 @@ Aufgabe 1: Erkläre, warum Eis auf flüssigem Wasser schwimmt.
 
 <!-- data-solution-button="off" data-llm-textarea="5" -->
 [[Antwort]]
+[[?]] Hinweis
 ```text @LLMQuiz(0.66;solution=1;feedback=1;operator=erklaeren)
 Beim Gefrieren entsteht eine besondere Molekülstruktur, durch die Eis eine geringere
 Dichte als flüssiges Wasser hat. Deshalb schwimmt Eis auf Wasser.

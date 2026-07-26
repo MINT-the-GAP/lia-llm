@@ -1191,6 +1191,11 @@ test("LLMQuiz has one public macro with named and positional options", () => {
   assert.match(readme, /@LLMQuiz\(0\.66;solution=1;feedback=1\)/u)
   assert.match(readme, /@LLMQuiz\(0\.66;1;1\)/u)
   assert.match(readme, /@LLMQuiz\(0\.66;1;1;erklaeren\)/u)
+  assert.match(
+    readme,
+    /^```text @LLMQuiz\(0\.66;solution=1;feedback=1;operator=erklaeren\)$/mu,
+  )
+  assert.doesNotMatch(readme, /^```text\r?\n@LLMQuiz\(/mu)
   assert.doesNotMatch(readme, /@LLMQuiz\.(?:compact|withFeedback|noSolution)/u)
 
   assert.match(readme, /\.feedbackForResult\?\.\(result, "de-DE"\)/u)
