@@ -20,9 +20,8 @@ attribute:   [WebLLM](https://webllm.mlc.ai/docs/) by MLC is licensed under
 @LLMQuiz: @LLMQuiz_(@uid,@0,```@1```)
 
 @LLMQuiz_
-<script>
+<script output="lia-llm-result-@0">
 const feedbackId = "lia-llm-feedback-@0"
-const solutionId = "lia-llm-solution-@0"
 const activityId = "lia-llm-activity-@0"
 const runId = activityId + "-" + Date.now().toString(36) + "-" +
   Math.random().toString(36).slice(2)
@@ -33,10 +32,8 @@ const answer = `@'input`.replace(/\u2028/gu, "\n")
 let active = true
 let finished = false
 let feedbackEnabled = false
-let solutionEnabled = false
 
 window.LiaLLM?.showFeedback?.(feedbackId, "")
-window.LiaLLM?.showSolution?.(solutionId, "")
 window.LiaLLM?.showActivity?.(activityId, runId, "selecting-model")
 
 function clearActivity() {
@@ -70,7 +67,6 @@ send.handle("stop", () => {
   evaluationController.abort()
   clearActivity()
   window.LiaLLM?.showFeedback?.(feedbackId, "")
-  window.LiaLLM?.showSolution?.(solutionId, "")
 })
 
 Promise.resolve()
@@ -84,7 +80,6 @@ Promise.resolve()
 
     const options = window.LiaLLM.parseMacroOptions(optionSource)
     feedbackEnabled = options.feedback
-    solutionEnabled = options.solution
 
     return window.LiaLLM.evaluate({
       question: "LiaScript-Freitextaufgabe",
@@ -102,10 +97,6 @@ Promise.resolve()
   })
   .then(result => {
     if (!active) return
-    window.LiaLLM?.showSolution?.(
-      solutionId,
-      solutionEnabled && result.passed ? reference : ""
-    )
     const feedback = feedbackEnabled
       ? window.LiaLLM?.feedbackForResult?.(result, "de-DE") ?? null
       : null
@@ -114,7 +105,6 @@ Promise.resolve()
   })
   .catch(error => {
     if (!active) return
-    window.LiaLLM?.showSolution?.(solutionId, "")
     const feedback = window.LiaLLM?.feedbackForError?.(error, "de-DE") ?? null
     if (feedback) {
       showLearnerFeedback(feedback.message)
@@ -129,7 +119,17 @@ Promise.resolve()
 <lia-llm-quiz-use hidden></lia-llm-quiz-use>
 <lia-llm-activity id="lia-llm-activity-@0" hidden></lia-llm-activity>
 <lia-llm-feedback id="lia-llm-feedback-@0"></lia-llm-feedback>
-<lia-llm-solution id="lia-llm-solution-@0" hidden></lia-llm-solution>
+<script style="display:block" modify="false">
+const solutionResult = "@input(`lia-llm-result-@0`)"
+const solutionOptions = window.LiaLLM?.parseMacroOptions?.(`@'1`)
+const solutionReference = `@'2`
+
+if (solutionResult === "true" && solutionOptions?.solution) {
+  send.liascript(solutionReference)
+} else {
+  send.clear()
+}
+</script>
 @end
 -->
 
@@ -171,6 +171,8 @@ import: https://raw.githubusercontent.com/MINT-the-GAP/lia-llm/d9cd5f2a8c0ef22c7
 Direkt nach dem normalen Textquiz folgt ein als `text` markierter Block. Sein Inhalt ist die
 vollständige Musterlösung für den lokalen Vergleich. Sie wird in der gerenderten Aufgabe zunächst
 nicht angezeigt. Mit `solution=1` erscheint sie erst, nachdem die Antwort als richtig bewertet wurde.
+Bei der Anzeige wird ihr Inhalt vollständig als LiaScript neu geparst. Dadurch werden insbesondere
+Markdown-Strukturen sowie Inline- und Blockformeln in TeX gerendert und nicht als Quelltext gezeigt.
 
 ```` markdown
 Aufgabe 1: Erkläre, warum Eis auf flüssigem Wasser schwimmt.

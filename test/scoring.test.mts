@@ -1201,7 +1201,6 @@ test("LLMQuiz has one public macro with named and positional options", () => {
   assert.match(readme, /\.feedbackForResult\?\.\(result, "de-DE"\)/u)
   assert.match(readme, /\.feedbackForError\?\.\(error, "de-DE"\)/u)
   assert.match(readme, /\.showFeedback\?\.\(feedbackId,/u)
-  assert.match(readme, /\.showSolution\?\.\(solutionId,/u)
   assert.match(readme, /\.showActivity\?\.\(activityId, runId,/u)
   assert.match(
     readme,
@@ -1230,7 +1229,7 @@ test("LLMQuiz has one public macro with named and positional options", () => {
   )
   assert.match(
     macro,
-    /<lia-llm-solution id="lia-llm-solution-@0" hidden><\/lia-llm-solution>/u,
+    /<script output="lia-llm-result-@0">/u,
   )
   assert.match(
     macro,
@@ -1241,21 +1240,35 @@ test("LLMQuiz has one public macro with named and positional options", () => {
     /<lia-llm-quiz-use hidden><\/lia-llm-quiz-use>/u,
   )
   assert.doesNotMatch(macro, /^\*{16,}$/mu)
-  assert.match(macro, /let solutionEnabled = false/u)
-  assert.match(macro, /solutionEnabled = options\.solution/u)
+  assert.doesNotMatch(macro, /showSolution/u)
+  assert.doesNotMatch(macro, /<lia-llm-solution/u)
   assert.match(
     macro,
-    /solutionEnabled && result\.passed \? reference : ""/u,
+    /const solutionResult = "@input\(`lia-llm-result-@0`\)"/u,
   )
-  assert.doesNotMatch(
+  assert.match(
     macro,
-    /showSolution\(solutionId, options\.solution \? reference : ""\)/u,
+    /solutionResult === "true" && solutionOptions\?\.solution/u,
+  )
+  assert.match(macro, /send\.liascript\(solutionReference\)/u)
+  assert.match(macro, /send\.clear\(\)/u)
+  assert.match(
+    readme,
+    /vollständig als LiaScript neu geparst[\s\S]*Inline- und Blockformeln in TeX/u,
   )
   assert.match(readme, /data-solution-button="off"/u)
 
-  const script = macro.match(/<script>\n([\s\S]*?)\n<\/script>/u)?.[1]
-  assert.ok(script)
-  assert.doesNotThrow(() => new Function(script))
+  const validatorScript = macro.match(
+    /<script output="lia-llm-result-@0">\n([\s\S]*?)\n<\/script>/u,
+  )?.[1]
+  assert.ok(validatorScript)
+  assert.doesNotThrow(() => new Function(validatorScript))
+
+  const solutionScript = macro.match(
+    /<script style="display:block" modify="false">\n([\s\S]*?)\n<\/script>/u,
+  )?.[1]
+  assert.ok(solutionScript)
+  assert.doesNotThrow(() => new Function(solutionScript))
 })
 
 test("operator documentation lists every active runtime profile", () => {
