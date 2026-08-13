@@ -10,7 +10,6 @@ import {
   type PreTrainedTokenizer,
   type Tensor,
 } from "@huggingface/transformers"
-
 import {
   DEFAULT_MODEL_ESTIMATED_BYTES,
   DEFAULT_MODEL_ID,
@@ -28,6 +27,7 @@ import {
   evaluationAnswerContexts,
   normalizeRequest,
 } from "./scoring.ts"
+import { ResilientFetchSession } from "./resilient-fetch.ts"
 import type {
   CriterionResult,
   EvaluationDiagnostic,
@@ -86,6 +86,15 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+function isAbortError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "name" in error &&
+    error.name === "AbortError"
+  )
+}
+
 function now(): number {
   return typeof performance === "undefined" ? Date.now() : performance.now()
 }
@@ -93,6 +102,75 @@ function now(): number {
 function emit<T>(name: string, detail: T): void {
   if (typeof globalThis.dispatchEvent !== "function" || typeof CustomEvent === "undefined") return
   globalThis.dispatchEvent(new CustomEvent(name, { detail }))
+}
+
+const runtimeAssetBaseUrl = (() => {
+  if (typeof document === "undefined") return undefined
+  const currentSource = (document.currentScript as HTMLScriptElement | null)?.src
+  if (currentSource) return new URL(".", currentSource).href
+
+  const scripts = Array.from(document.scripts)
+  for (let index = scripts.length - 1; index >= 0; index -= 1) {
+    const source = scripts[index]?.src
+    if (source && /(?:^|\/)index(?:\.[\da-f]+)?\.js(?:[?#]|$)/iu.test(source)) {
+      return new URL(".", source).href
+    }
+  }
+  return undefined
+})()
+
+const ORT_FACTORY_FILENAME = "ort-wasm-simd-threaded.asyncify.mjs"
+const ORT_WASM_FILENAME = "ort-wasm-simd-threaded.asyncify.wasm"
+let localOnnxRuntimePromise: Promise<void> | null = null
+
+function runtimeAssetUrl(filename: string): string {
+  return runtimeAssetBaseUrl
+    ? new URL(filename, runtimeAssetBaseUrl).href
+    : filename
+}
+
+function configureLocalOnnxRuntime(): void {
+  if (!env.backends.onnx.wasm) return
+  env.backends.onnx.wasm.wasmPaths = {
+    mjs: runtimeAssetUrl(ORT_FACTORY_FILENAME),
+    wasm: runtimeAssetUrl(ORT_WASM_FILENAME),
+  }
+}
+
+async function prepareLocalOnnxRuntime(
+  session: ResilientFetchSession,
+): Promise<void> {
+  const wasmOptions = env.backends.onnx.wasm
+  if (!wasmOptions || wasmOptions.wasmBinary) return
+  if (!localOnnxRuntimePromise) {
+    localOnnxRuntimePromise = (async () => {
+      const [factoryResponse, wasmResponse] = await Promise.all([
+        session.fetch(runtimeAssetUrl(ORT_FACTORY_FILENAME)),
+        session.fetch(runtimeAssetUrl(ORT_WASM_FILENAME)),
+      ])
+      if (!factoryResponse.ok || !wasmResponse.ok) {
+        throw new Error(
+          `Die lokale ONNX-Laufzeit konnte nicht geladen werden (MJS ${factoryResponse.status}, WASM ${wasmResponse.status}).`,
+        )
+      }
+      const [factoryCode, wasmBinary] = await Promise.all([
+        factoryResponse.text(),
+        wasmResponse.arrayBuffer(),
+      ])
+      const factoryBlobUrl = URL.createObjectURL(
+        new Blob([factoryCode], { type: "text/javascript" }),
+      )
+      wasmOptions.wasmBinary = wasmBinary
+      wasmOptions.wasmPaths = {
+        mjs: factoryBlobUrl,
+        wasm: runtimeAssetUrl(ORT_WASM_FILENAME),
+      }
+    })().catch((error) => {
+      localOnnxRuntimePromise = null
+      throw error
+    })
+  }
+  await localOnnxRuntimePromise
 }
 
 function progressFromUnknown(value: unknown): ModelProgress {
@@ -298,13 +376,17 @@ export class SemanticEvaluator {
   private lastError: string | undefined
   private runtime: NliRuntime | null = null
   private loadPromise: Promise<NliRuntime> | null = null
+  private fetchSession: ResilientFetchSession | null = null
   private inferenceQueue: Promise<void> = Promise.resolve()
 
   constructor() {
     env.allowLocalModels = false
     env.allowRemoteModels = true
     env.useBrowserCache = true
-    env.useWasmCache = true
+    // ORT is shipped with this exact bundle. Avoid the fragile CDN
+    // fetch -> response.clone() -> Cache.put() preload seen in Edge.
+    configureLocalOnnxRuntime()
+    env.useWasmCache = false
   }
 
   configure(next: Partial<RuntimeConfig>): RuntimeStatus {
@@ -363,6 +445,30 @@ export class SemanticEvaluator {
   }
 
   private async createRuntime(): Promise<NliRuntime> {
+    if (typeof globalThis.fetch !== "function") {
+      throw new Error("Dieser Browser stellt keine Download-Schnittstelle bereit.")
+    }
+    const previousFetch = env.fetch
+    const session = new ResilientFetchSession(globalThis.fetch.bind(globalThis), {
+      onRetry: ({ attempt }) => {
+        emit<ModelProgress>("lia-llm:progress", {
+          status: "retry",
+          message: `Netzwerkunterbrechung – Teil-Download wird erneut versucht (${attempt}/4).`,
+        })
+      },
+    })
+    this.fetchSession = session
+    env.fetch = session.fetch
+    try {
+      await prepareLocalOnnxRuntime(session)
+      return await this.loadRuntime()
+    } finally {
+      if (this.fetchSession === session) this.fetchSession = null
+      if (env.fetch === session.fetch) env.fetch = previousFetch
+    }
+  }
+
+  private async loadRuntime(): Promise<NliRuntime> {
     let device = this.config.device
     let dtype = this.config.dtype
     const hasWebGpu =
@@ -428,7 +534,33 @@ export class SemanticEvaluator {
         const cache = cacheInfo ?? (await this.getCacheInfo())
         this.loadSource = cache.cached ? "cache" : "network"
         this.setPhase("loading")
-        return this.createRuntime()
+        try {
+          return await this.createRuntime()
+        } catch (error) {
+          if (
+            !cache.cached ||
+            isAbortError(error) ||
+            !env.backends.onnx.wasm?.wasmBinary
+          ) {
+            throw error
+          }
+          emit<ModelProgress>("lia-llm:progress", {
+            status: "retry",
+            message:
+              "Der vorhandene Modellcache ist nicht lesbar und wird einmal neu aufgebaut.",
+          })
+          await ModelRegistry.clear_pipeline_cache(
+            NLI_TASK,
+            this.config.modelId,
+            this.registryOptions(),
+          )
+          await deleteTokenizerMetadataAlias(
+            this.config.modelId,
+            this.config.revision,
+          )
+          this.loadSource = "network"
+          return this.createRuntime()
+        }
       })()
         .then((runtime) => {
           this.runtime = runtime
@@ -661,6 +793,7 @@ export class SemanticEvaluator {
   }
 
   async unloadRuntime(): Promise<void> {
+    this.fetchSession?.abort()
     return this.enqueue(async () => {
       if (this.loadPromise) {
         try {
@@ -680,6 +813,7 @@ export class SemanticEvaluator {
   }
 
   async clearCache(): Promise<number> {
+    this.fetchSession?.abort()
     return this.enqueue(async () => {
       if (this.loadPromise) {
         try {

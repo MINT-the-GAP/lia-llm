@@ -238,9 +238,27 @@
           "Beim kleinen Modell bleiben"
       overlay?.querySelector(".lia-llm-consent-cancel")?.click()
 
+      const [ortFactoryResponse, ortWasmResponse] = await Promise.all([
+        fetch("../dist/ort-wasm-simd-threaded.asyncify.mjs"),
+        fetch("../dist/ort-wasm-simd-threaded.asyncify.wasm")
+      ])
+      const [ortFactorySource, ortWasmBytes] = await Promise.all([
+        ortFactoryResponse.text(),
+        ortWasmResponse.arrayBuffer()
+      ])
+      const ortWasmMagic = new Uint8Array(ortWasmBytes, 0, 4)
+      const localOnnxRuntimeIsAvailable =
+        ortFactoryResponse.ok &&
+        ortWasmResponse.ok &&
+        ortFactorySource.includes("WebAssembly") &&
+        ortWasmMagic[0] === 0 &&
+        ortWasmMagic[1] === 97 &&
+        ortWasmMagic[2] === 115 &&
+        ortWasmMagic[3] === 109
+
       const matches = Boolean(
         window.LiaLLM &&
-        window.LiaLLM.version === "0.4.0" &&
+        window.LiaLLM.version === "0.4.1" &&
         typeof window.LiaLLM.evaluate === "function" &&
         typeof window.LiaLLM.feedbackForResult === "function" &&
         typeof window.LiaLLM.showFeedback === "function" &&
@@ -273,6 +291,7 @@
         cachedActivationIsHidden &&
         cachedReadyIsHidden &&
         realDownloadIsVisible &&
+        localOnnxRuntimeIsAvailable &&
         consentDetail.handled === true &&
         consentWasVisible &&
         consentResponse === false &&

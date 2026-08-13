@@ -342,11 +342,21 @@ export class AutomaticEvaluator {
 
     const generation = this.generation
     const upgrade = this.upgradeQuality(generation, knownCache).catch(() => {
-      this.markQualityDegraded(generation)
+      if (generation === this.generation) {
+        this.qualityReady = false
+        this.qualityCacheInfoPromise = null
+        emitStatus(this.compactEvaluator.getStatus())
+      }
       return false
     })
-    this.qualityUpgradePromise = upgrade
-    return upgrade
+    let tracked: Promise<boolean>
+    tracked = upgrade.finally(() => {
+      if (this.qualityUpgradePromise === tracked) {
+        this.qualityUpgradePromise = null
+      }
+    })
+    this.qualityUpgradePromise = tracked
+    return tracked
   }
 
   private async evaluateCompact(

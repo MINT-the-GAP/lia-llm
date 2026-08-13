@@ -8,6 +8,7 @@ import {
   QUALITY_MODEL_ID,
   QUALITY_MODEL_REVISION,
 } from "./quality-model-config.ts"
+import { ResilientFetchSession } from "./resilient-fetch.ts"
 import { aggregateCriteria, normalizeRequest } from "./scoring.ts"
 import type {
   Criterion,
@@ -325,6 +326,8 @@ export class QualityEvaluator {
   private loadSource: ModelLoadSource | undefined
   private lastError: string | undefined
   private engine: MLCEngine | null = null
+  private loadingEngine: MLCEngine | null = null
+  private fetchSession: ResilientFetchSession | null = null
   private loadPromise: Promise<MLCEngine> | null = null
   private inferenceQueue: Promise<void> = Promise.resolve()
 
@@ -354,8 +357,28 @@ export class QualityEvaluator {
       )
     }
 
+    if (typeof globalThis.fetch !== "function") {
+      throw new Error("Dieser Browser unterst\u00fctzt keine Modell-Downloads.")
+    }
+
+    const session = new ResilientFetchSession(globalThis.fetch.bind(globalThis), {
+      onRetry: ({ attempt }) => {
+        emit<ModelProgress>("lia-llm:progress", {
+          status: "loading",
+          message: `Unterbrochener Download wird fortgesetzt (Versuch ${attempt}).`,
+        })
+      },
+    })
+    this.fetchSession = session
+
+    const fetchGlobal = globalThis as typeof globalThis & {
+      __liaLlmArtifactFetch?: typeof fetch
+    }
+    const previousArtifactFetch = fetchGlobal.__liaLlmArtifactFetch
+    fetchGlobal.__liaLlmArtifactFetch = session.fetch
+
     const appConfig = createQualityAppConfig(webLlm.prebuiltAppConfig)
-    return webLlm.CreateMLCEngine(QUALITY_MODEL_ID, {
+    const engine = new webLlm.MLCEngine({
       appConfig,
       initProgressCallback: (report) => {
         const rawProgress = Number.isFinite(report.progress) ? report.progress : undefined
@@ -373,6 +396,21 @@ export class QualityEvaluator {
       },
       logLevel: "WARN",
     })
+    this.loadingEngine = engine
+
+    try {
+      await engine.reload(QUALITY_MODEL_ID)
+      return engine
+    } catch (error) {
+      await engine.unload().catch(() => undefined)
+      throw error
+    } finally {
+      if (this.loadingEngine === engine) this.loadingEngine = null
+      if (this.fetchSession === session) this.fetchSession = null
+      if (fetchGlobal.__liaLlmArtifactFetch === session.fetch) {
+        fetchGlobal.__liaLlmArtifactFetch = previousArtifactFetch
+      }
+    }
   }
 
   async preload(cacheInfo?: ModelCacheInfo): Promise<RuntimeStatus> {
@@ -617,6 +655,10 @@ export class QualityEvaluator {
   }
 
   async clearCache(): Promise<number> {
+    this.fetchSession?.abort()
+    const loadingEngine = this.loadingEngine
+    if (loadingEngine) void loadingEngine.unload().catch(() => undefined)
+
     return this.enqueue(async () => {
       try {
         if (this.loadPromise) {

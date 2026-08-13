@@ -20,7 +20,7 @@ import { parseCriteria } from "./scoring.ts"
 import { registerSolutionElement, showSolution } from "./solution-element.ts"
 import type { LiaLLMApi } from "./types.ts"
 
-const VERSION = "0.4.0"
+const VERSION = "0.4.1"
 
 interface LiaLLMGlobal {
   LiaLLM?: LiaLLMApi

@@ -29,6 +29,7 @@ import {
 import { parseMacroOptions } from "../src/macro-options.ts"
 import { supportedOperatorRubrics } from "../src/operator-rubrics.ts"
 import { progressPercent } from "../src/load-overlay.ts"
+import { ResilientFetchSession } from "../src/resilient-fetch.ts"
 import {
   classifyQualityDecision,
   parseQualityJudgeOutput,
@@ -888,6 +889,127 @@ test("automatic evaluator prefers cached quality, keeps uncached quality in the 
   }
 })
 
+test("automatic evaluator retries a transient quality preload in the same session", async () => {
+  const compactStatus: RuntimeStatus = {
+    phase: "idle",
+    assessmentEngine: "compact",
+    modelId: "compact-retry-test",
+    revision: "test",
+    device: "wasm",
+    dtype: "q8",
+  }
+  const qualityStatus: RuntimeStatus = {
+    phase: "idle",
+    assessmentEngine: "quality",
+    modelId: "quality-retry-test",
+    revision: "test",
+    device: "webgpu",
+    dtype: "q4f16",
+  }
+  const cacheInfo = (cached: boolean): ModelCacheInfo => ({
+    supported: true,
+    cached,
+    downloadCached: cached,
+    filesCached: cached ? 1 : 0,
+    filesTotal: 1,
+    estimatedBytes: 1,
+  })
+  const compact = {
+    getStatus: () => compactStatus,
+    getCacheInfo: async () => cacheInfo(true),
+    preload: async () => {
+      compactStatus.phase = "ready"
+      return compactStatus
+    },
+    unloadRuntime: async () => {
+      compactStatus.phase = "idle"
+    },
+  }
+  let qualityPreloadCalls = 0
+  let reportFirstAttempt!: () => void
+  let reportSecondAttempt!: () => void
+  const firstAttempt = new Promise<void>((resolve) => {
+    reportFirstAttempt = resolve
+  })
+  const secondAttempt = new Promise<void>((resolve) => {
+    reportSecondAttempt = resolve
+  })
+  const quality = {
+    getStatus: () => qualityStatus,
+    getCacheInfo: async () => cacheInfo(false),
+    preload: async () => {
+      qualityPreloadCalls += 1
+      if (qualityPreloadCalls === 1) {
+        qualityStatus.phase = "error"
+        reportFirstAttempt()
+        throw new Error("transient quality preload failure")
+      }
+      qualityStatus.phase = "ready"
+      reportSecondAttempt()
+      return qualityStatus
+    },
+  }
+  const navigatorObject = globalThis.navigator
+  const gpuDescriptor = Object.getOwnPropertyDescriptor(navigatorObject, "gpu")
+  const storageDescriptor = Object.getOwnPropertyDescriptor(
+    navigatorObject,
+    "storage",
+  )
+  const connectionDescriptor = Object.getOwnPropertyDescriptor(
+    navigatorObject,
+    "connection",
+  )
+  Object.defineProperty(navigatorObject, "gpu", {
+    configurable: true,
+    value: {},
+  })
+  Object.defineProperty(navigatorObject, "storage", {
+    configurable: true,
+    value: {
+      persisted: async () => false,
+      persist: async () => true,
+    },
+  })
+  Object.defineProperty(navigatorObject, "connection", {
+    configurable: true,
+    value: { type: "wifi", saveData: false },
+  })
+
+  try {
+    const automatic = new AutomaticEvaluator(compact as never, quality as never)
+
+    const first = await automatic.preload()
+    assert.equal(first.assessmentEngine, "compact")
+    await firstAttempt
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(qualityPreloadCalls, 1)
+    assert.equal(automatic.getStatus().assessmentEngine, "compact")
+
+    await automatic.preload()
+    await secondAttempt
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(qualityPreloadCalls, 2)
+    assert.equal(automatic.getStatus().assessmentEngine, "quality")
+    assert.equal(automatic.getStatus().phase, "ready")
+  } finally {
+    if (gpuDescriptor) {
+      Object.defineProperty(navigatorObject, "gpu", gpuDescriptor)
+    } else {
+      delete (navigatorObject as Navigator & { gpu?: unknown }).gpu
+    }
+    if (storageDescriptor) {
+      Object.defineProperty(navigatorObject, "storage", storageDescriptor)
+    } else {
+      delete (navigatorObject as Navigator & { storage?: StorageManager }).storage
+    }
+    if (connectionDescriptor) {
+      Object.defineProperty(navigatorObject, "connection", connectionDescriptor)
+    } else {
+      delete (navigatorObject as Navigator & { connection?: unknown }).connection
+    }
+  }
+})
+
 test("automatic evaluator rechecks the same compact miss with quality before returning", async () => {
   class StagedMockEvaluator {
     readonly status: RuntimeStatus
@@ -1474,6 +1596,153 @@ test("download policy reuses cache offline and auto-loads only safe cases", () =
     }),
     "auto",
   )
+})
+
+test("resilient fetch retries only a truncated range and reconstructs all bytes", async () => {
+  const payload = Uint8Array.from({ length: 10 }, (_value, index) => index)
+  const requestedRanges: string[] = []
+  let truncatedMiddleRange = false
+
+  const baseFetch = async (input: RequestInfo | URL): Promise<Response> => {
+    const request = input instanceof Request ? input : new Request(input)
+    const rangeHeader = request.headers.get("range")
+    assert.ok(rangeHeader)
+    requestedRanges.push(rangeHeader)
+
+    const match = rangeHeader.match(/^bytes=(\d+)-(\d+)$/u)
+    assert.ok(match)
+    const start = Number.parseInt(match[1], 10)
+    const end = Math.min(Number.parseInt(match[2], 10), payload.byteLength - 1)
+    let body = payload.slice(start, end + 1)
+    if (rangeHeader === "bytes=4-7" && !truncatedMiddleRange) {
+      truncatedMiddleRange = true
+      body = body.slice(0, 2)
+    }
+
+    return new Response(body, {
+      status: 206,
+      headers: {
+        "accept-ranges": "bytes",
+        "content-length": String(end - start + 1),
+        "content-range": `bytes ${start}-${end}/${payload.byteLength}`,
+      },
+    })
+  }
+  const session = new ResilientFetchSession(baseFetch, {
+    chunkSizeBytes: 4,
+    retryDelaysMs: [0, 0],
+    stallTimeoutMs: 1_000,
+  })
+
+  const response = await session.fetch("https://example.test/model.onnx")
+  const received = new Uint8Array(await response.arrayBuffer())
+
+  assert.deepEqual(received, payload)
+  assert.deepEqual(requestedRanges, [
+    "bytes=0-3",
+    "bytes=4-7",
+    "bytes=4-7",
+    "bytes=8-9",
+  ])
+})
+
+test("resilient fetch retries a truncated 200 response when a proxy ignores ranges", async () => {
+  const payload = Uint8Array.from({ length: 10 }, (_value, index) => index + 10)
+  const requestedRanges: Array<string | null> = []
+
+  const baseFetch = async (input: RequestInfo | URL): Promise<Response> => {
+    const request = input instanceof Request ? input : new Request(input)
+    requestedRanges.push(request.headers.get("range"))
+    const body =
+      requestedRanges.length === 1 ? payload.slice(0, 3) : payload
+    return new Response(body, {
+      status: 200,
+      headers: { "content-length": String(payload.byteLength) },
+    })
+  }
+  const session = new ResilientFetchSession(baseFetch, {
+    chunkSizeBytes: 4,
+    retryDelaysMs: [0, 0],
+    stallTimeoutMs: 1_000,
+  })
+
+  const response = await session.fetch("https://example.test/model.onnx")
+  assert.deepEqual(new Uint8Array(await response.arrayBuffer()), payload)
+  assert.deepEqual(requestedRanges, ["bytes=0-3", "bytes=0-3"])
+})
+
+test("resilient fetch retries a truncated direct runtime file", async () => {
+  const payload = new TextEncoder().encode("export default 42")
+  let calls = 0
+
+  const baseFetch = async (input: RequestInfo | URL): Promise<Response> => {
+    const request = input instanceof Request ? input : new Request(input)
+    assert.equal(request.headers.get("range"), null)
+    calls += 1
+    return new Response(calls === 1 ? payload.slice(0, 4) : payload, {
+      status: 200,
+      headers: { "content-length": String(payload.byteLength) },
+    })
+  }
+  const session = new ResilientFetchSession(baseFetch, {
+    retryDelaysMs: [0, 0],
+    stallTimeoutMs: 1_000,
+  })
+
+  const response = await session.fetch("https://example.test/runtime.mjs")
+  assert.equal(await response.text(), "export default 42")
+  assert.equal(calls, 2)
+})
+
+test("resilient fetch preserves a terminal 404 without repeated requests", async () => {
+  let calls = 0
+  const baseFetch = async (): Promise<Response> => {
+    calls += 1
+    return new Response("missing", {
+      status: 404,
+      headers: { "content-length": "7" },
+    })
+  }
+  const session = new ResilientFetchSession(baseFetch, {
+    retryDelaysMs: [0, 0, 0, 0],
+    stallTimeoutMs: 1_000,
+  })
+
+  const response = await session.fetch("https://example.test/missing.onnx")
+  assert.equal(response.status, 404)
+  assert.equal(await response.text(), "missing")
+  assert.equal(calls, 1)
+})
+
+test("resilient fetch does not retry a terminal 404 for a later range", async () => {
+  const payload = Uint8Array.from([0, 1, 2, 3, 4, 5])
+  let calls = 0
+  const baseFetch = async (input: RequestInfo | URL): Promise<Response> => {
+    const request = input instanceof Request ? input : new Request(input)
+    calls += 1
+    if (calls > 1) {
+      return new Response("missing", {
+        status: 404,
+        headers: { "content-length": "7" },
+      })
+    }
+    return new Response(payload.slice(0, 4), {
+      status: 206,
+      headers: {
+        "content-length": "4",
+        "content-range": "bytes 0-3/6",
+      },
+    })
+  }
+  const session = new ResilientFetchSession(baseFetch, {
+    chunkSizeBytes: 4,
+    retryDelaysMs: [0, 0, 0, 0],
+    stallTimeoutMs: 1_000,
+  })
+
+  const response = await session.fetch("https://example.test/model.onnx")
+  await assert.rejects(response.arrayBuffer(), /HTTP 404/u)
+  assert.equal(calls, 2)
 })
 
 test("quiz textarea keeps all arrow keys inside the answer field", () => {

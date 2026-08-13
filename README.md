@@ -1,6 +1,6 @@
 <!--
 author:      MINT-the-GAP, Martin Lommatzsch
-version:     0.4.0
+version:     0.4.1
 language:    de
 narrator:    Deutsch Female
 comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
@@ -74,8 +74,8 @@ Promise.resolve()
     if (!window.LiaLLM) {
       throw new Error("lia-llm konnte nicht geladen werden.")
     }
-    if (window.LiaLLM.version !== "0.4.0") {
-      throw new Error(`lia-llm 0.4.0 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
+    if (window.LiaLLM.version !== "0.4.1") {
+      throw new Error(`lia-llm 0.4.1 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
     }
 
     const options = window.LiaLLM.parseMacroOptions(optionSource)
@@ -158,13 +158,9 @@ import: https://raw.githubusercontent.com/MINT-the-GAP/lia-llm/main/README.md
 -->
 ```
 
-Für reproduzierbare Kurse kann der aktuell geprüfte Stand über den Commit fest angegeben werden:
-
-``` markdown
-<!--
-import: https://raw.githubusercontent.com/MINT-the-GAP/lia-llm/d9cd5f2a8c0ef22c73407a01e7f87a8110fc4d7e/README.md
--->
-```
+Nach Veröffentlichung dieses Fixes kann die `main`-URL für reproduzierbare Kurse durch die
+vollständige Commit-ID des veröffentlichten Stands ersetzt werden. Ein älterer Commit-Pin enthält
+weder die Bereichswiederholung noch die lokal ausgelieferte ONNX-Laufzeit.
 
 ## Verwendung
 
@@ -322,6 +318,20 @@ Template den Browser zusätzlich um persistenten Website-Speicher; ein Cache-Tre
 Anfrage nicht erneut aus. Die WebLLM-Laufzeit selbst ist im Template gebündelt und wird nicht erst
 von einem CDN nachgeladen. Damit können vollständig geladene Modelle im selben Browserprofil und
 unter derselben Herkunft auch offline wiederverwendet werden.
+
+Große Modell- und Laufzeitdateien werden in begrenzten Byte-Bereichen geladen. Bleibt ein Bereich
+45 Sekunden ohne neue Daten oder endet er vorzeitig, bricht das Template nur diesen Bereich ab und
+wiederholt ihn mit kurzen Wartezeiten bis zu viermal. Bereits vollständige Bereiche beziehungsweise
+WebLLM-Shards müssen dabei nicht erneut übertragen werden. Ein vorübergehender Fehler des
+Qualitätsmodells sperrt außerdem keine weiteren Versuche in derselben Sitzung mehr.
+
+Die exakt zum Bundle passende ONNX-Web-Laufzeit (`.mjs` und `.wasm`) liegt neben
+`dist/index.js`. Dadurch muss Edge sie nicht mehr von einem zusätzlichen CDN in den anfälligen
+WASM-Cache kopieren. Die eigentlichen Modellgewichte kommen weiterhin von Hugging Face; das
+WebLLM-Model-Library-WASM des Qualitätsmodells kommt aus dessen konfigurierter GitHub-Quelle.
+Schulfilter müssen diese Quellen zulassen. Nach ausgeschöpften Wiederholungen wechselt die
+Ladeanzeige in einen Fehlerzustand mit erneuter Versuchsmöglichkeit, statt unbegrenzt im
+Ladezustand zu bleiben.
 
 Browser dürfen Persistenz ablehnen; ausdrücklich gelöschte Website-Daten, privater Modus,
 Speicherbereinigung oder eine andere Herkunft entfernen beziehungsweise trennen den Cache. Eine

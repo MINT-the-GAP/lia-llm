@@ -1,6 +1,6 @@
 {
   "name": "lia-llm",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "description": "Local semantic assessment for open-ended LiaScript questions",
   "license": "MIT",
@@ -8,7 +8,8 @@
   "scripts": {
     "prepare:webllm": "node scripts/prepare-webllm.mjs",
     "build": "npm run prepare:webllm && parcel build src/index.ts --target app --no-scope-hoist",
-    "dev": "npm run prepare:webllm && parcel watch src/index.ts --target app --no-scope-hoist",
+    "postbuild": "node scripts/copy-ort-assets.mjs",
+    "dev": "npm run prepare:webllm && node scripts/copy-ort-assets.mjs && parcel watch src/index.ts --target app --no-scope-hoist",
     "typecheck": "npm run prepare:webllm && tsc --noEmit",
     "pretest": "npm run prepare:webllm",
     "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test test/scoring.test.mts",
@@ -18,7 +19,8 @@
   },
   "dependencies": {
     "@huggingface/transformers": "4.2.0",
-    "@mlc-ai/web-llm": "0.2.84"
+    "@mlc-ai/web-llm": "0.2.84",
+    "onnxruntime-web": "1.26.0-dev.20260416-b7804b056c"
   },
   "devDependencies": {
     "@webgpu/types": "0.1.64",
