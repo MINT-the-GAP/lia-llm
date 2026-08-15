@@ -13,6 +13,12 @@ import {
   splitReference,
 } from "../src/scoring.ts"
 import { AutomaticEvaluator } from "../src/automatic-evaluator.ts"
+import { countWords } from "../src/language-analysis.ts"
+import {
+  finalizeCompactAssessment,
+  resolveRuntimeAssetBaseUrl,
+  SemanticEvaluator,
+} from "../src/evaluator.ts"
 import { formatResult } from "../src/format.ts"
 import { decideModelDownload } from "../src/download-policy.ts"
 import {
@@ -27,14 +33,23 @@ import {
   toQuizInputValue,
 } from "../src/quiz-textarea.ts"
 import { parseMacroOptions } from "../src/macro-options.ts"
-import { supportedOperatorRubrics } from "../src/operator-rubrics.ts"
+import {
+  resolveOperatorRubric,
+  supportedOperatorRubrics,
+} from "../src/operator-rubrics.ts"
 import { progressPercent } from "../src/load-overlay.ts"
 import { ResilientFetchSession } from "../src/resilient-fetch.ts"
 import {
   classifyQualityDecision,
+  completeLanguageAnalysis,
+  finalizeQualityAssessment,
+  LANGUAGE_ANALYSIS_SYSTEM_PROMPT,
+  parseLanguageJudgeOutput,
   parseQualityJudgeOutput,
+  QualityEvaluator,
   qualityDiagnosticForCriteria,
   QUALITY_SYSTEM_PROMPT,
+  validateOperatorJudgeOutput,
 } from "../src/quality-evaluator.ts"
 import type {
   Criterion,
@@ -112,6 +127,37 @@ test("normalizeRequest only creates multiple criteria when authors provide them"
   )
 })
 
+test("normalizeRequest keeps language modes explicit and optional", () => {
+  const base = {
+    question: "Warum schwimmt Eis?",
+    answer: "Eis besitzt eine geringere Dichte als Wasser.",
+    reference: "Eis besitzt eine geringere Dichte als Wasser.",
+  }
+
+  assert.deepEqual(
+    normalizeRequest({
+      ...base,
+      languageAnalysis: { spelling: true, syntax: false },
+    }).languageAnalysis,
+    { spelling: true, syntax: false },
+  )
+  assert.equal(
+    normalizeRequest({
+      ...base,
+      languageAnalysis: { spelling: false, syntax: false },
+    }).languageAnalysis,
+    undefined,
+  )
+  assert.throws(
+    () =>
+      normalizeRequest({
+        ...base,
+        languageAnalysis: { spelling: true, syntax: 1 as never },
+      }),
+    /languageAnalysis\.syntax/u,
+  )
+})
+
 test("normalizeRequest rejects cosine-style negative thresholds", () => {
   assert.throws(
     () =>
@@ -146,6 +192,32 @@ test("normalizeRequest reports a structured too-short answer before inference", 
     code: "answer-too-short",
     message: "Die Antwort ist deutlich zu kurz, um die Aufgabe ausreichend zu bearbeiten.",
   })
+
+  let languageCaught: unknown
+  try {
+    normalizeRequest({
+      question: "Warum schwimmt Eis?",
+      answer: "Kurz",
+      reference: "Eis ist weniger dicht als flüssiges Wasser.",
+      minAnswerCharacters: 12,
+      languageAnalysis: { spelling: true, syntax: true },
+    })
+  } catch (error) {
+    languageCaught = error
+  }
+  assert.ok(languageCaught instanceof EvaluationInputError)
+  assert.deepEqual(languageCaught.languageAnalysis, {
+    spelling: true,
+    syntax: true,
+    status: "unavailable",
+    wordCount: 1,
+  })
+  assert.deepEqual(feedbackForError(languageCaught, "de-DE"), {
+    code: "answer-too-short",
+    message:
+      "Die Antwort ist deutlich zu kurz, um die Aufgabe ausreichend zu bearbeiten. " +
+      "Sprachstatistik: Wörter insgesamt: 1 · die angeforderte Fehlerzählung ist derzeit nicht verfügbar.",
+  })
   assert.equal(feedbackForError(new Error("Technischer Fehler")), null)
 })
 
@@ -157,13 +229,14 @@ test("operator profile sets its own minimum length and feedback", () => {
       answer: "Zu kurz",
       reference: "Eine vollständige Erklärung des Zusammenhangs.",
       operator: "erklären",
+      minAnswerCharacters: 1,
     })
   } catch (error) {
     caught = error
   }
 
   assert.ok(caught instanceof EvaluationInputError)
-  assert.equal(caught.minimumCharacters, 24)
+  assert.equal(caught.minimumCharacters, 12)
   assert.equal(caught.operator?.id, "erklaeren")
   assert.deepEqual(feedbackForError(caught, "de-DE"), {
     code: "answer-too-short",
@@ -171,11 +244,107 @@ test("operator profile sets its own minimum length and feedback", () => {
   })
 })
 
+test("all supported operators expose stable structured response contracts", () => {
+  const rubrics = supportedOperatorRubrics()
+  assert.deepEqual(
+    rubrics.map((rubric) => ({
+      id: rubric.id,
+      aliases: [...rubric.aliases],
+      criteria: rubric.criteria.map((criterion) => criterion.id),
+    })),
+    [
+      {
+        id: "erklaeren",
+        aliases: ["erklaeren", "erklären", "erklaere", "erkläre"],
+        criteria: ["explanatory-link", "beyond-assertion"],
+      },
+      {
+        id: "erlaeutern",
+        aliases: ["erlaeutern", "erläutern", "erlaeutere", "erläutere"],
+        criteria: ["core-and-context", "illustrative-link"],
+      },
+      {
+        id: "beschreiben",
+        aliases: ["beschreiben", "beschreibe"],
+        criteria: ["relevant-features", "ordered-presentation"],
+      },
+      {
+        id: "begruenden",
+        aliases: ["begruenden", "begründen", "begruende", "begründe"],
+        criteria: ["reason-or-evidence", "reasoning-link"],
+      },
+      {
+        id: "vergleichen",
+        aliases: ["vergleichen", "vergleiche"],
+        criteria: ["comparison-dimensions", "direct-contrast"],
+      },
+      {
+        id: "beurteilen",
+        aliases: ["beurteilen", "beurteile"],
+        criteria: ["criteria-and-evidence", "reasoned-judgement"],
+      },
+    ],
+  )
+
+  const criterionIds = new Set<string>()
+  for (const rubric of rubrics) {
+    assert.equal(rubric.minAnswerCharacters, 12)
+    assert.ok(rubric.responseContract.product)
+    assert.ok(rubric.responseContract.organization.length >= 2)
+    assert.ok(rubric.responseContract.constraints.length >= 1)
+    assert.equal(rubric.criteria.length, 2)
+    assert.deepEqual(
+      rubric.requirements,
+      rubric.criteria.map((criterion) => criterion.requirement),
+    )
+    for (const criterion of rubric.criteria) {
+      assert.equal(criterion.required, true)
+      assert.ok(criterion.priority > 0)
+      assert.ok(criterion.feedback.de)
+      assert.ok(criterion.feedback.en)
+      assert.equal(criterionIds.has(criterion.id), false)
+      criterionIds.add(criterion.id)
+    }
+    for (const alias of rubric.aliases) {
+      assert.equal(resolveOperatorRubric(alias)?.id, rubric.id)
+    }
+  }
+})
+
+test("operators require the real task wording in the public API", () => {
+  assert.throws(
+    () =>
+      normalizeRequest({
+        question: "LiaScript-Freitextaufgabe",
+        answer: "Das ist eine ausreichend lange Antwort.",
+        reference: "Eine vollständige Erklärung.",
+        operator: "erklaeren",
+      }),
+    /echten Aufgabenwortlaut/u,
+  )
+  assert.doesNotThrow(() =>
+    normalizeRequest({
+      question: "LiaScript-Freitextaufgabe",
+      answer: "Das ist eine ausreichend lange Antwort.",
+      reference: "Eine vollständige Erklärung.",
+      operator: "   ",
+    }),
+  )
+})
+
 test("normalizeAnswerText preserves paragraph breaks", () => {
   assert.equal(
     normalizeAnswerText("  Erster Absatz.\r\n\r\n Zweiter   Absatz.  "),
     "Erster Absatz.\n\nZweiter Absatz.",
   )
+})
+
+test("countWords deterministically counts words, compounds, and decimals", () => {
+  assert.equal(countWords(""), 0)
+  assert.equal(countWords("Eis schwimmt, weil es weniger dicht ist."), 7)
+  assert.equal(countWords("E-Mail, H2O und 3,14."), 4)
+  assert.equal(countWords("eins\n\nzwei\tdrei"), 3)
+  assert.equal(countWords("eins:zwei Eis—Wasser Halb–Zeit"), 6)
 })
 
 test("chunkAnswer keeps the whole short answer and useful sentences", () => {
@@ -269,11 +438,16 @@ test("quality judge accepts strict structured decisions only", () => {
     ).feedbackCode,
     "unclear",
   )
-  assert.equal(
+  assert.deepEqual(
     parseQualityJudgeOutput(
-      '{"decision":"fail_incomplete","confidence":0.8,"feedback_code":"operator-not-met"}',
-    ).feedbackCode,
-    "operator-not-met",
+      '{"decision":"fail_incomplete","confidence":0.8,"feedback_code":"operator-not-met","operator_criterion_id":"explanatory-link"}',
+    ),
+    {
+      decision: "fail_incomplete",
+      confidence: 0.8,
+      feedbackCode: "operator-not-met",
+      operatorCriterionId: "explanatory-link",
+    },
   )
   assert.equal(
     parseQualityJudgeOutput('{"decision":"fail_incomplete","confidence":0.8}')
@@ -313,6 +487,310 @@ test("quality judge tolerates WebLLM thinking prefixes and JSON fences", () => {
       '```json\n{"decision":"pass","confidence":0.91,"feedback_code":"none"}\n```',
     ),
     { decision: "pass", confidence: 0.91, feedbackCode: "none" },
+  )
+})
+
+test("language judge accepts only complete non-negative integer counts", () => {
+  assert.deepEqual(
+    parseLanguageJudgeOutput(
+      '{"spelling_errors":2,"punctuation_errors":1,"syntax_errors":3}',
+    ),
+    {
+      spellingErrors: 2,
+      punctuationErrors: 1,
+      syntaxErrors: 3,
+    },
+  )
+  assert.deepEqual(
+    parseLanguageJudgeOutput(
+      '<think>intern</think>{"spelling_errors":0,"punctuation_errors":0,"syntax_errors":0}',
+    ),
+    {
+      spellingErrors: 0,
+      punctuationErrors: 0,
+      syntaxErrors: 0,
+    },
+  )
+
+  assert.throws(
+    () =>
+      parseLanguageJudgeOutput(
+        '{"spelling_errors":2,"punctuation_errors":1}',
+      ),
+    /Fehlerzahl/u,
+  )
+  assert.throws(
+    () =>
+      parseLanguageJudgeOutput(
+        '{"spelling_errors":1.5,"punctuation_errors":0,"syntax_errors":0}',
+      ),
+    /Fehlerzahl/u,
+  )
+  assert.throws(
+    () =>
+      parseLanguageJudgeOutput(
+        '{"spelling_errors":-1,"punctuation_errors":0,"syntax_errors":0}',
+      ),
+    /Fehlerzahl/u,
+  )
+  assert.throws(
+    () =>
+      parseLanguageJudgeOutput(
+        '{"spelling_errors":8001,"punctuation_errors":0,"syntax_errors":0}',
+      ),
+    /Fehlerzahl/u,
+  )
+  assert.throws(
+    () =>
+      parseLanguageJudgeOutput(
+        '{"spelling_errors":0,"punctuation_errors":0,"syntax_errors":0,"comment":"frei"}',
+      ),
+    /zusätzliche/u,
+  )
+  assert.throws(
+    () => parseLanguageJudgeOutput("not-json"),
+    /Sprachstatistik/u,
+  )
+})
+
+test("completeLanguageAnalysis returns only requested advisory categories", () => {
+  assert.deepEqual(
+    completeLanguageAnalysis(
+      "Eis schwimt, weil es kaltt ist.",
+      { spelling: true, syntax: true },
+      {
+        spellingErrors: 2,
+        punctuationErrors: 1,
+        syntaxErrors: 1,
+      },
+    ),
+    {
+      spelling: true,
+      syntax: true,
+      status: "completed",
+      wordCount: 6,
+      spellingErrors: 2,
+      punctuationErrors: 1,
+      syntaxErrors: 1,
+    },
+  )
+
+  const spellingOnly = completeLanguageAnalysis(
+    "Eis schwimt.",
+    { spelling: true, syntax: false },
+    {
+      spellingErrors: 1,
+      punctuationErrors: 0,
+      syntaxErrors: 0,
+    },
+  )
+  assert.deepEqual(spellingOnly, {
+    spelling: true,
+    syntax: false,
+    status: "completed",
+    wordCount: 2,
+    spellingErrors: 1,
+    punctuationErrors: 0,
+  })
+  assert.equal("syntaxErrors" in spellingOnly, false)
+
+  const syntaxOnly = completeLanguageAnalysis(
+    "Weil Eis schwimmt.",
+    { spelling: false, syntax: true },
+    {
+      spellingErrors: 0,
+      punctuationErrors: 0,
+      syntaxErrors: 1,
+    },
+  )
+  assert.deepEqual(syntaxOnly, {
+    spelling: false,
+    syntax: true,
+    status: "completed",
+    wordCount: 3,
+    syntaxErrors: 1,
+  })
+  assert.equal("spellingErrors" in syntaxOnly, false)
+  assert.equal("punctuationErrors" in syntaxOnly, false)
+
+  assert.throws(
+    () =>
+      completeLanguageAnalysis(
+        "Kurze Antwort.",
+        { spelling: false, syntax: true },
+        {
+          spellingErrors: 1,
+          punctuationErrors: 0,
+          syntaxErrors: 0,
+        },
+      ),
+    /deaktivierte Sprachkategorie/u,
+  )
+})
+
+test("QualityEvaluator analyzes language exactly once after all content criteria", async () => {
+  const outputs = [
+    '{"decision":"pass","confidence":0.99,"feedback_code":"none","operator_criterion_id":""}',
+    '{"decision":"pass","confidence":0.98,"feedback_code":"none","operator_criterion_id":""}',
+    '{"spelling_errors":2,"punctuation_errors":1,"syntax_errors":1}',
+  ]
+  const systemPrompts: string[] = []
+  const engine = {
+    chat: {
+      completions: {
+        create: async (request: {
+          messages: Array<{ role: string; content: string }>
+        }) => {
+          systemPrompts.push(request.messages[0]?.content ?? "")
+          const content = outputs.shift()
+          assert.ok(content)
+          return {
+            choices: [
+              {
+                finish_reason: "stop",
+                message: { content },
+              },
+            ],
+          }
+        },
+      },
+    },
+  }
+  const evaluator = new QualityEvaluator()
+  ;(evaluator as unknown as { engine: typeof engine | null }).engine = engine
+
+  const result = await evaluator.evaluate({
+    question: "Erkläre den Zusammenhang.",
+    answer: "Eis schwimt, weil seine Dichte geringer ist.",
+    reference: "Eis schwimmt aufgrund seiner geringeren Dichte.",
+    criteria: [
+      { id: "density", text: "Eis hat eine geringere Dichte.", required: true },
+      { id: "effect", text: "Die geringere Dichte lässt Eis schwimmen.", required: true },
+    ],
+    languageAnalysis: { spelling: true, syntax: true },
+  })
+
+  assert.equal(outputs.length, 0)
+  assert.equal(
+    systemPrompts.filter(
+      (prompt) => prompt === LANGUAGE_ANALYSIS_SYSTEM_PROMPT,
+    ).length,
+    1,
+  )
+  assert.equal(result.passed, true)
+  assert.deepEqual(result.languageAnalysis, {
+    spelling: true,
+    syntax: true,
+    status: "completed",
+    wordCount: 7,
+    spellingErrors: 2,
+    punctuationErrors: 1,
+    syntaxErrors: 1,
+  })
+})
+
+test("QualityEvaluator language-only analysis skips content judges", async () => {
+  let calls = 0
+  const engine = {
+    chat: {
+      completions: {
+        create: async (request: {
+          messages: Array<{ role: string; content: string }>
+        }) => {
+          calls += 1
+          assert.equal(
+            request.messages[0]?.content,
+            LANGUAGE_ANALYSIS_SYSTEM_PROMPT,
+          )
+          return {
+            choices: [
+              {
+                finish_reason: "stop",
+                message: {
+                  content:
+                    '{"spelling_errors":1,"punctuation_errors":0,"syntax_errors":0}',
+                },
+              },
+            ],
+          }
+        },
+      },
+    },
+  }
+  const evaluator = new QualityEvaluator()
+  ;(evaluator as unknown as { engine: typeof engine | null }).engine = engine
+
+  const analysis = await evaluator.evaluateLanguage({
+    question: "Erkläre den Zusammenhang.",
+    answer: "Eis schwimt, weil seine Dichte geringer ist.",
+    reference: "Eis schwimmt aufgrund seiner geringeren Dichte.",
+    criteria: [
+      { id: "density", text: "Eis hat eine geringere Dichte.", required: true },
+      { id: "effect", text: "Die geringere Dichte lässt Eis schwimmen.", required: true },
+    ],
+    languageAnalysis: { spelling: true, syntax: true },
+  })
+
+  assert.equal(calls, 1)
+  assert.deepEqual(analysis, {
+    spelling: true,
+    syntax: true,
+    status: "completed",
+    wordCount: 7,
+    spellingErrors: 1,
+    punctuationErrors: 0,
+    syntaxErrors: 0,
+  })
+})
+
+test("quality judge validates operator criterion ids against the active profile", () => {
+  const operator = resolveOperatorRubric("erklaeren")
+  assert.ok(operator)
+  const finding = {
+    decision: "fail_incomplete" as const,
+    confidence: 0.9,
+    feedbackCode: "operator-not-met" as const,
+    operatorCriterionId: "explanatory-link",
+  }
+
+  assert.deepEqual(validateOperatorJudgeOutput(finding, operator), finding)
+  assert.throws(
+    () =>
+      validateOperatorJudgeOutput(
+        { ...finding, operatorCriterionId: "direct-contrast" },
+        operator,
+      ),
+    /keine gültige Operator-Kriteriums-ID/u,
+  )
+  assert.throws(
+    () =>
+      validateOperatorJudgeOutput(
+        { ...finding, operatorCriterionId: undefined },
+        operator,
+      ),
+    /keine gültige Operator-Kriteriums-ID/u,
+  )
+  assert.deepEqual(validateOperatorJudgeOutput(finding), {
+    ...finding,
+    feedbackCode: "incomplete",
+    operatorCriterionId: undefined,
+  })
+  assert.deepEqual(
+    validateOperatorJudgeOutput(
+      {
+        decision: "pass",
+        confidence: 0.9,
+        feedbackCode: "none",
+        operatorCriterionId: "explanatory-link",
+      },
+      operator,
+    ),
+    {
+      decision: "pass",
+      confidence: 0.9,
+      feedbackCode: "none",
+      operatorCriterionId: undefined,
+    },
   )
 })
 
@@ -367,6 +845,7 @@ test("quality prompt requires contextual synonym and negation handling", () => {
   assert.match(QUALITY_SYSTEM_PROMPT, /Weltwissen/u)
   assert.match(QUALITY_SYSTEM_PROMPT, /feedback_code/u)
   assert.match(QUALITY_SYSTEM_PROMPT, /Operatorprofil/u)
+  assert.match(QUALITY_SYSTEM_PROMPT, /operator_criterion_id/u)
   assert.match(QUALITY_SYSTEM_PROMPT, /too-colloquial/u)
 })
 
@@ -676,12 +1155,140 @@ test("quality diagnostics use a stable priority and keep style advisory", () => 
   )
 })
 
+test("runtime asset base resolution survives LiaScript blob execution", () => {
+  assert.equal(
+    resolveRuntimeAssetBaseUrl(
+      "blob:http://localhost:8001/7f28b4b9-1cb7-46ea-b131-c2fc32f9012f",
+      [
+        "http://localhost:8001/liascript/index.51910d37.js",
+        "http://localhost:8001/dist/index.js",
+      ],
+      ["http://localhost:8001/liascript/index.51910d37.js"],
+    ),
+    "http://localhost:8001/dist/",
+  )
+  assert.equal(
+    resolveRuntimeAssetBaseUrl(
+      "https://example.org/templates/lia-llm/dist/index.js",
+      [],
+      [],
+    ),
+    "https://example.org/templates/lia-llm/dist/",
+  )
+  assert.equal(
+    resolveRuntimeAssetBaseUrl(
+      "blob:http://localhost:8001/unresolvable",
+      [],
+      ["http://localhost:8001/liascript/index.51910d37.js"],
+    ),
+    undefined,
+  )
+})
+
+test("compact content cannot finally pass an operator task", () => {
+  const criteria = [result("overall", "met", true)]
+  const passed = aggregateCriteria(criteria, 1)
+
+  const withoutOperator = finalizeCompactAssessment(passed, false, criteria)
+  assert.equal(withoutOperator.assessment.passed, true)
+  assert.equal(withoutOperator.diagnostic, undefined)
+
+  const withOperator = finalizeCompactAssessment(passed, true, criteria)
+  assert.equal(withOperator.assessment.status, "uncertain")
+  assert.equal(withOperator.assessment.passed, false)
+  assert.deepEqual(withOperator.diagnostic, {
+    code: "operator-check-unavailable",
+    source: "compact",
+    severity: "blocking",
+  })
+})
+
+test("SemanticEvaluator wires normalized operators into compact fail-safe", async () => {
+  const evaluator = new SemanticEvaluator()
+  const mocked = evaluator as unknown as {
+    preload(): Promise<RuntimeStatus>
+    classifyPairs(
+      pairs: readonly { premise: string; hypothesis: string }[],
+    ): Promise<NliEvidence[]>
+  }
+  mocked.preload = async () => evaluator.getStatus()
+  mocked.classifyPairs = async (pairs) =>
+    pairs.map((pair) => ({
+      text: pair.premise,
+      hypothesis: pair.hypothesis,
+      entailment: 0.98,
+      neutral: 0.01,
+      contradiction: 0.01,
+    }))
+
+  const request = {
+    question: "Erkläre, warum Eis schwimmt.",
+    answer: "Eis ist weniger dicht als Wasser und schwimmt deshalb.",
+    reference: "Eis ist weniger dicht als Wasser und schwimmt deshalb.",
+  }
+  assert.equal((await evaluator.evaluate(request)).passed, true)
+
+  const withOperator = await evaluator.evaluate({
+    ...request,
+    operator: "erklaeren",
+  })
+  assert.equal(withOperator.status, "uncertain")
+  assert.equal(withOperator.passed, false)
+  assert.equal(withOperator.operator?.id, "erklaeren")
+  assert.equal(withOperator.diagnostic?.code, "operator-check-unavailable")
+
+  const withLanguageAnalysis = await evaluator.evaluate({
+    ...request,
+    languageAnalysis: { spelling: true, syntax: true },
+  })
+  assert.equal(withLanguageAnalysis.passed, true)
+  assert.deepEqual(withLanguageAnalysis.languageAnalysis, {
+    spelling: true,
+    syntax: true,
+    status: "unavailable",
+    wordCount: 9,
+  })
+})
+
+test("operator-not-met blocks fractional quality passing but keeps low confidence uncertain", () => {
+  const met = result("content", "met", false)
+  const missedOperator = result("form", "missed", false)
+  missedOperator.judgeFeedbackCode = "operator-not-met"
+  missedOperator.operatorCriterionId = "explanatory-link"
+  const fractionalPass = aggregateCriteria([met, missedOperator], 0.5)
+  assert.equal(fractionalPass.passed, true)
+
+  const failed = finalizeQualityAssessment(
+    fractionalPass,
+    [met, missedOperator],
+    true,
+  )
+  assert.equal(failed.status, "failed")
+  assert.equal(failed.passed, false)
+
+  const uncertainOperator = result("form", "uncertain", false)
+  uncertainOperator.judgeFeedbackCode = "operator-not-met"
+  uncertainOperator.judgeConfidence = 0.4
+  const uncertain = finalizeQualityAssessment(
+    aggregateCriteria([met, uncertainOperator], 0.5),
+    [met, uncertainOperator],
+    true,
+  )
+  assert.equal(uncertain.status, "uncertain")
+  assert.equal(uncertain.passed, false)
+  assert.equal(
+    qualityDiagnosticForCriteria([uncertainOperator])?.code,
+    "unclear",
+  )
+})
+
 test("automatic evaluator prefers cached quality, keeps uncached quality in the background, and falls back", async () => {
   class MockEvaluator {
     readonly status
     readonly modelId
     readonly cacheAvailable
     evaluateCalls = 0
+    languageEvaluateCalls = 0
     preloadCalls = 0
     preloadCaches: ModelCacheInfo[] = []
     preloadBarrier: Promise<void> | null = null
@@ -732,10 +1339,11 @@ test("automatic evaluator prefers cached quality, keeps uncached quality in the 
       return this.status
     }
 
-    async evaluate() {
+    async evaluate(request?: EvaluationRequest) {
       this.evaluateCalls += 1
       if (this.failEvaluation) throw new Error("invalid quality JSON")
       const value = evaluation("passed", [result("overall", "met", true)])
+      if (request) value.answer = request.answer
       value.model.id = this.modelId
       value.model.device = this.status.device
       value.model.dtype = this.status.dtype
@@ -744,6 +1352,19 @@ test("automatic evaluator prefers cached quality, keeps uncached quality in the 
           ? "generative-assessment"
           : "natural-language-inference"
       return value
+    }
+
+    async evaluateLanguage(request: EvaluationRequest) {
+      this.languageEvaluateCalls += 1
+      if (this.failEvaluation) throw new Error("invalid language JSON")
+      const normalized = normalizeRequest(request)
+      return normalized.languageAnalysis
+        ? {
+            ...normalized.languageAnalysis,
+            status: "unavailable" as const,
+            wordCount: countWords(normalized.answer),
+          }
+        : undefined
     }
 
     async unloadRuntime() {
@@ -822,14 +1443,43 @@ test("automatic evaluator prefers cached quality, keeps uncached quality in the 
     assert.equal(second.model.id, "quality-test")
 
     quality.failEvaluation = true
-    const fallback = await automatic.evaluate(request)
+    const fallback = await automatic.evaluate({
+      ...request,
+      operator: "erklaeren",
+    })
     assert.equal(fallback.model.id, "compact-test")
+    assert.equal(fallback.passed, false)
+    assert.equal(fallback.diagnostic?.code, "operator-check-unavailable")
     const compactCallsAfterFallback = compact.evaluateCalls
 
     const afterDegrade = await automatic.evaluate(request)
     assert.equal(afterDegrade.model.id, "compact-test")
     assert.equal(quality.evaluateCalls, 3)
     assert.equal(compact.evaluateCalls, compactCallsAfterFallback + 1)
+
+    const languageFallback = await automatic.evaluate({
+      ...request,
+      languageAnalysis: { spelling: true, syntax: true },
+    })
+    assert.equal(languageFallback.model.id, "compact-test")
+    assert.equal(languageFallback.passed, true)
+    assert.deepEqual(languageFallback.languageAnalysis, {
+      spelling: true,
+      syntax: true,
+      status: "unavailable",
+      wordCount: 8,
+    })
+
+    const unavailableOperatorCheck = await automatic.evaluate({
+      ...request,
+      operator: "erklaeren",
+    })
+    assert.equal(unavailableOperatorCheck.passed, false)
+    assert.equal(unavailableOperatorCheck.status, "uncertain")
+    assert.equal(
+      unavailableOperatorCheck.diagnostic?.code,
+      "operator-check-unavailable",
+    )
 
     const networkCompact = new MockEvaluator(
       "compact-network-test",
@@ -859,7 +1509,7 @@ test("automatic evaluator prefers cached quality, keeps uncached quality in the 
       new Promise<never>((_resolve, reject) => {
         networkTimeout = setTimeout(
           () => reject(new Error("compact pass waited for quality download")),
-          250,
+          1_000,
         )
       }),
     ])
@@ -868,8 +1518,56 @@ test("automatic evaluator prefers cached quality, keeps uncached quality in the 
     assert.equal(networkCompact.evaluateCalls, 1)
     assert.equal(networkQuality.evaluateCalls, 0)
     assert.equal(persistCalls, 1)
-    releaseNetworkQuality()
+
+    const whitespaceOperator = await networkAutomatic.evaluate({
+      ...request,
+      operator: "   ",
+    })
+    assert.equal(whitespaceOperator.model.id, "compact-network-test")
+
+    let languageSettled = false
+    const languageEvaluation = networkAutomatic
+      .evaluate({
+        ...request,
+        languageAnalysis: { spelling: true, syntax: true },
+      })
+      .then((value) => {
+        languageSettled = true
+        return value
+      })
     await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(languageSettled, false)
+    assert.equal(networkQuality.evaluateCalls, 0)
+    assert.equal(networkQuality.languageEvaluateCalls, 0)
+
+    let operatorSettled = false
+    const operatorEvaluation = networkAutomatic
+      .evaluate({ ...request, operator: "erklaeren" })
+      .then((value) => {
+        operatorSettled = true
+        return value
+      })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(operatorSettled, false)
+    assert.equal(networkQuality.evaluateCalls, 0)
+
+    releaseNetworkQuality()
+    const [languageResult, operatorResult] = await Promise.all([
+      languageEvaluation,
+      operatorEvaluation,
+    ])
+    assert.equal(languageResult.model.id, "compact-network-test")
+    assert.equal(languageResult.passed, true)
+    assert.deepEqual(languageResult.languageAnalysis, {
+      spelling: true,
+      syntax: true,
+      status: "unavailable",
+      wordCount: 8,
+    })
+    assert.equal(operatorResult.model.id, "quality-network-test")
+    assert.equal(operatorResult.passed, true)
+    assert.equal(networkQuality.evaluateCalls, 1)
+    assert.equal(networkQuality.languageEvaluateCalls, 1)
   } finally {
     if (gpuDescriptor) {
       Object.defineProperty(navigatorObject, "gpu", gpuDescriptor)
@@ -1224,7 +1922,7 @@ test("learner feedback stays short and never exposes criteria or scores", () => 
   assert.equal(
     feedbackForResult(evaluation("failed", [result("secret", "missed")]))
       ?.message,
-    "Die Antwort erklärt den gefragten Zusammenhang noch nicht vollständig.",
+    "Die Antwort bearbeitet die gefragten Inhalte noch nicht vollständig.",
   )
 
   const offTopicCriterion = result("secret", "missed")
@@ -1271,8 +1969,115 @@ test("learner feedback stays short and never exposes criteria or scores", () => 
   }
   assert.equal(
     feedbackForResult(operatorNotMet)?.message,
-    "Die Antwort entspricht noch nicht den Kriterien einer Erklärung.",
+    "Die Antwort stellt den gefragten Erklärungszusammenhang noch nicht nachvollziehbar her.",
   )
+
+  operatorNotMet.criteria[0]!.judgeFeedbackCode = "operator-not-met"
+  operatorNotMet.criteria[0]!.operatorCriterionId = "explanatory-link"
+  assert.equal(
+    feedbackForResult(operatorNotMet)?.message,
+    "Stelle Ursache, Prinzip oder Bedingung und die daraus folgende Wirkung nachvollziehbar in Beziehung.",
+  )
+  assert.equal(
+    feedbackForResult(operatorNotMet, "en-US")?.message,
+    "Connect the cause, principle, or condition clearly to the resulting effect.",
+  )
+
+  const lowerPriority = result("lower", "missed")
+  lowerPriority.judgeFeedbackCode = "operator-not-met"
+  lowerPriority.operatorCriterionId = "beyond-assertion"
+  const higherPriority = result("higher", "missed")
+  higherPriority.judgeFeedbackCode = "operator-not-met"
+  higherPriority.operatorCriterionId = "explanatory-link"
+  const prioritized = evaluation("failed", [lowerPriority, higherPriority])
+  prioritized.operator = operatorNotMet.operator
+  prioritized.diagnostic = operatorNotMet.diagnostic
+  assert.equal(
+    feedbackForResult(prioritized)?.message,
+    "Stelle Ursache, Prinzip oder Bedingung und die daraus folgende Wirkung nachvollziehbar in Beziehung.",
+  )
+
+  const unavailable = evaluation("uncertain", [result("secret", "met")])
+  unavailable.diagnostic = {
+    code: "operator-check-unavailable",
+    source: "compact",
+    severity: "blocking",
+  }
+  assert.equal(
+    feedbackForResult(unavailable)?.message,
+    "Die verlangte Antwortform konnte gerade nicht zuverlässig geprüft werden. Versuche die Prüfung erneut, sobald die Qualitätsprüfung verfügbar ist.",
+  )
+})
+
+test("language feedback is ordered, visible on passing answers, and advisory", () => {
+  const passed = evaluation("passed", [result("secret", "met")])
+  passed.languageAnalysis = {
+    spelling: true,
+    syntax: true,
+    status: "completed",
+    wordCount: 42,
+    punctuationErrors: 2,
+    spellingErrors: 3,
+    syntaxErrors: 1,
+  }
+
+  assert.deepEqual(feedbackForResult(passed), {
+    code: "language-analysis",
+    message:
+      "Sprachstatistik (Fehlerzahlen als Modellschätzung):\nWörter insgesamt: 42 · Rechtschreibfehler: 3 · Zeichensetzungsfehler: 2 · Satzbaufehler: 1",
+  })
+  assert.equal(passed.passed, true)
+  assert.equal(passed.status, "passed")
+
+  const syntaxOnly = evaluation("passed", [result("secret", "met")])
+  syntaxOnly.languageAnalysis = {
+    spelling: false,
+    syntax: true,
+    status: "completed",
+    wordCount: 7,
+    syntaxErrors: 0,
+  }
+  assert.deepEqual(feedbackForResult(syntaxOnly), {
+    code: "language-analysis",
+    message:
+      "Sprachstatistik (Fehlerzahlen als Modellschätzung):\nWörter insgesamt: 7 · Satzbaufehler: 0",
+  })
+
+  const unavailable = evaluation("passed", [result("secret", "met")])
+  unavailable.languageAnalysis = {
+    spelling: true,
+    syntax: true,
+    status: "unavailable",
+    wordCount: 42,
+  }
+  assert.deepEqual(feedbackForResult(unavailable), {
+    code: "language-analysis-unavailable",
+    message:
+      "Sprachstatistik: Wörter insgesamt: 42 · die angeforderte Fehlerzählung ist derzeit nicht verfügbar.",
+  })
+  assert.equal(unavailable.passed, true)
+})
+
+test("language statistics append to content feedback without changing grading", () => {
+  const failed = evaluation("failed", [result("secret", "contradicted")])
+  failed.languageAnalysis = {
+    spelling: true,
+    syntax: true,
+    status: "completed",
+    wordCount: 6,
+    punctuationErrors: 2,
+    spellingErrors: 3,
+    syntaxErrors: 1,
+  }
+
+  const feedback = feedbackForResult(failed)
+  assert.equal(feedback?.code, "content-error")
+  assert.equal(
+    feedback?.message,
+    "Die Antwort enthält inhaltliche Fehler. Sprachstatistik (Fehlerzahlen als Modellschätzung):\nWörter insgesamt: 6 · Rechtschreibfehler: 3 · Zeichensetzungsfehler: 2 · Satzbaufehler: 1",
+  )
+  assert.equal(failed.passed, false)
+  assert.equal(failed.status, "failed")
 })
 
 test("formatResult hides criterion details by default but keeps them available", () => {
@@ -1305,19 +2110,43 @@ test("formatResult hides criterion details by default but keeps them available",
   assert.match(detailed, /Bestätigung:/u)
 })
 
-test("LLMQuiz has one public macro with named and positional options", () => {
+test("the public version remains pinned exactly to 0.5.0", () => {
+  const packageJson = JSON.parse(
+    readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+  ) as { version?: string }
+  const entry = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8")
+  const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8")
+
+  assert.equal(packageJson.version, "0.5.0")
+  assert.match(entry, /const VERSION = "0\.5\.0"/u)
+  assert.match(readme, /^version:\s+0\.5\.0$/mu)
+})
+
+test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper", () => {
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8")
   const publicDefinitions = readme.match(/^@LLMQuiz[^_\n]*:/gmu) ?? []
-  assert.deepEqual(publicDefinitions, ["@LLMQuiz:"])
-  assert.match(readme, /^@LLMQuiz: @LLMQuiz_\(@uid,@0,```@1```\)$/mu)
-  assert.match(readme, /@LLMQuiz\(0\.66;solution=1;feedback=1\)/u)
-  assert.match(readme, /@LLMQuiz\(0\.66;1;1\)/u)
-  assert.match(readme, /@LLMQuiz\(0\.66;1;1;erklaeren\)/u)
+  assert.deepEqual(publicDefinitions, ["@LLMQuiz:", "@LLMQuiz.question:"])
   assert.match(
     readme,
-    /^```text @LLMQuiz\(0\.66;solution=1;feedback=1;operator=erklaeren\)$/mu,
+    /^@LLMQuiz: @LLMQuiz_\(@uid,@0,```LiaScript-Freitextaufgabe```,```@1```\)$/mu,
   )
-  assert.doesNotMatch(readme, /^```text\r?\n@LLMQuiz\(/mu)
+  assert.match(
+    readme,
+    /^@LLMQuiz\.question: @LLMQuiz_\(@uid,@0,```@1```,```@2```\)$/mu,
+  )
+  assert.match(
+    readme,
+    /@LLMQuiz\.question\(0\.66;solution=1;feedback=1,`Beschreibe den Verlauf\.`\)/u,
+  )
+  assert.match(
+    readme,
+    /@LLMQuiz\.question\(0\.66;1;1;beschreiben,`Beschreibe den Verlauf\.`\)/u,
+  )
+  assert.match(
+    readme,
+    /^```text @LLMQuiz\.question\(0\.66;solution=1;feedback=1;operator=erklaeren,`Erkläre, warum Eis auf flüssigem Wasser schwimmt\.`\)$/mu,
+  )
+  assert.doesNotMatch(readme, /^```text\r?\n@LLMQuiz(?:\.question)?\(/mu)
   assert.doesNotMatch(readme, /@LLMQuiz\.(?:compact|withFeedback|noSolution)/u)
 
   assert.match(readme, /\.feedbackForResult\?\.\(result, "de-DE"\)/u)
@@ -1337,6 +2166,21 @@ test("LLMQuiz has one public macro with named and positional options", () => {
   assert.match(readme, /if \(!active \|\| finished\) return/u)
   assert.match(readme, /criterionThreshold: options\.passThreshold/u)
   assert.match(readme, /operator: options\.operator \?\? undefined/u)
+  assert.match(readme, /languageAnalysis:/u)
+  assert.match(readme, /spelling: options\.rechtschreibung/u)
+  assert.match(readme, /syntax: options\.satzbau/u)
+  assert.match(
+    readme,
+    /operator=erklaeren;Rechtschreibung=1;Satzbau=1,`Erkläre, warum/u,
+  )
+  assert.match(readme, /const question = `@'2`/u)
+  assert.match(readme, /const reference = `@'3`/u)
+  assert.match(readme, /return window\.LiaLLM\.evaluate\(\{\s*question,/u)
+  assert.doesNotMatch(readme, /question:\s*"LiaScript-Freitextaufgabe"/u)
+  assert.match(
+    readme,
+    /Operatoren benötigen den echten Aufgabenwortlaut\. Verwende @LLMQuiz\.question/u,
+  )
   assert.doesNotMatch(readme, /feedbackEnabled && !result\.passed/u)
   assert.doesNotMatch(readme, /assessmentEngine,/u)
   assert.doesNotMatch(readme, /send\.lia\(feedback\.message, \[\], false\)/u)
@@ -1372,7 +2216,19 @@ test("LLMQuiz has one public macro with named and positional options", () => {
     macro,
     /solutionResult === "true" && solutionOptions\?\.solution/u,
   )
-  assert.match(macro, /send\.liascript\(solutionReference\)/u)
+  assert.match(macro, /const solutionReference = `@'3`/u)
+  assert.match(
+    macro,
+    /<lia-llm-result-separator><\/lia-llm-result-separator>/u,
+  )
+  assert.match(
+    macro,
+    /send\.liascript\(solutionReference \+ resultSeparator\)/u,
+  )
+  assert.match(
+    macro,
+    /solutionResult === "true" \|\| solutionResult === "false"/u,
+  )
   assert.match(macro, /send\.clear\(\)/u)
   assert.match(
     readme,
@@ -1398,13 +2254,70 @@ test("operator documentation lists every active runtime profile", () => {
     new URL("../docs/operatoren.md", import.meta.url),
     "utf8",
   )
-  assert.match(documentation, /schema: lia-llm-operator-profiles\/v1/u)
+  assert.match(documentation, /schema: lia-llm-operator-profiles\/v2/u)
   for (const rubric of supportedOperatorRubrics()) {
     assert.ok(
       documentation.includes("| `" + rubric.id + "` | aktiv |"),
       "Fehlendes aktives Dokumentationsprofil: " + rubric.id,
     )
+    assert.ok(
+      documentation.includes(
+        "| `" +
+          rubric.id +
+          "` | " +
+          rubric.operatorFeedback.de +
+          " | " +
+          rubric.tooShortFeedback.de +
+          " |",
+      ),
+      "Abweichende profilweite Rückmeldung: " + rubric.id,
+    )
+    for (const criterion of rubric.criteria) {
+      const documentedCriterion =
+        "| `" +
+        rubric.id +
+        "` | `" +
+        criterion.id +
+        "` | " +
+        criterion.requirement +
+        " | immer | " +
+        criterion.priority +
+        " | `operator-not-met` | " +
+        criterion.feedback.de +
+        " |"
+      assert.ok(
+        documentation.includes(documentedCriterion),
+        "Abweichendes Dokumentationskriterium: " +
+          rubric.id +
+          "/" +
+          criterion.id,
+      )
+    }
   }
+})
+
+test("browser operator calibration covers positive and negative cases for every profile", () => {
+  const html = readFileSync(
+    new URL("../test/browser-operator-calibration.html", import.meta.url),
+    "utf8",
+  )
+  const calibrationScript = html.match(
+    /<script>\n([\s\S]*?)\n<\/script>/u,
+  )?.[1]
+  assert.ok(calibrationScript)
+  assert.doesNotThrow(() => new Function(calibrationScript))
+  for (const rubric of supportedOperatorRubrics()) {
+    const occurrences =
+      html.match(new RegExp('operator: "' + rubric.id + '"', "gu")) ?? []
+    assert.equal(
+      occurrences.length,
+      2,
+      "Erwartet Positiv- und Gegenfall für " + rubric.id,
+    )
+  }
+  assert.match(html, /result\.model\.task === "generative-assessment"/u)
+  assert.match(html, /expectedDiagnostic: "operator-not-met"/u)
+  assert.match(html, /lia-llm:download-consent/u)
 })
 
 test("aggregateCriteria keeps uncertain cases out of automatic passing", () => {
@@ -1463,12 +2376,16 @@ test("parseMacroOptions supports named and positional quiz options", () => {
     solution: true,
     feedback: true,
     operator: null,
+    rechtschreibung: false,
+    satzbau: false,
   })
   assert.deepEqual(parseMacroOptions("0.66;0;1"), {
     passThreshold: 0.66,
     solution: false,
     feedback: true,
     operator: null,
+    rechtschreibung: false,
+    satzbau: false,
   })
   assert.deepEqual(
     parseMacroOptions("0.66;feedback=1;operator=erklären;solution=0"),
@@ -1477,6 +2394,8 @@ test("parseMacroOptions supports named and positional quiz options", () => {
       solution: false,
       feedback: true,
       operator: "erklaeren",
+      rechtschreibung: false,
+      satzbau: false,
     },
   )
   assert.deepEqual(parseMacroOptions("0.66;1;1;erklaeren"), {
@@ -1484,7 +2403,38 @@ test("parseMacroOptions supports named and positional quiz options", () => {
     solution: true,
     feedback: true,
     operator: "erklaeren",
+    rechtschreibung: false,
+    satzbau: false,
   })
+})
+
+test("parseMacroOptions supports the exact named language-mode option string", () => {
+  assert.deepEqual(
+    parseMacroOptions(
+      "0.66;solution=1;feedback=1;operator=erklaeren;Rechtschreibung=1;Satzbau=1",
+    ),
+    {
+      passThreshold: 0.66,
+      solution: true,
+      feedback: true,
+      operator: "erklaeren",
+      rechtschreibung: true,
+      satzbau: true,
+    },
+  )
+  assert.deepEqual(
+    parseMacroOptions(
+      "0.5;FeEdBaCk=TrUe;ReChTsChReIbUnG=fAlSe;SaTzBaU=TRUE",
+    ),
+    {
+      passThreshold: 0.5,
+      solution: true,
+      feedback: true,
+      operator: null,
+      rechtschreibung: false,
+      satzbau: true,
+    },
+  )
 })
 
 test("parseMacroOptions applies backward-compatible defaults", () => {
@@ -1493,12 +2443,16 @@ test("parseMacroOptions applies backward-compatible defaults", () => {
     solution: true,
     feedback: false,
     operator: null,
+    rechtschreibung: false,
+    satzbau: false,
   })
   assert.deepEqual(parseMacroOptions("1;feedback=1"), {
     passThreshold: 1,
     solution: true,
     feedback: true,
     operator: null,
+    rechtschreibung: false,
+    satzbau: false,
   })
 })
 
@@ -1507,7 +2461,30 @@ test("parseMacroOptions rejects ambiguous or invalid input", () => {
   assert.throws(() => parseMacroOptions("0.66;solution=1;solution=0"), /mehrfach/u)
   assert.throws(() => parseMacroOptions("0.66;unknown=1"), /Unbekannte/u)
   assert.throws(
-    () => parseMacroOptions("0.66;operator=erläutern"),
+    () => parseMacroOptions("0.66;Rechtschreibung=1"),
+    /feedback=1/u,
+  )
+  assert.throws(
+    () => parseMacroOptions("0.66;feedback=false;Satzbau=true"),
+    /feedback=1/u,
+  )
+  assert.throws(
+    () =>
+      parseMacroOptions(
+        "0.66;feedback=1;Rechtschreibung=1;rechtschreibung=0",
+      ),
+    /mehrfach/u,
+  )
+  assert.throws(
+    () => parseMacroOptions("0.66;feedback=1;Satzbau=on"),
+    /0, 1, true oder false/u,
+  )
+  assert.equal(
+    parseMacroOptions("0.66;operator=erläutern").operator,
+    "erlaeutern",
+  )
+  assert.throws(
+    () => parseMacroOptions("0.66;operator=zeichnen"),
     /noch nicht unterstützt/u,
   )
   assert.throws(() => parseMacroOptions("0.66;solution=on"), /0, 1, true oder false/u)

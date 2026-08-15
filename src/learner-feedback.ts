@@ -1,5 +1,6 @@
 import type {
   EvaluationResult,
+  LanguageAnalysisResult,
   LearnerFeedback,
   OperatorRubric,
 } from "./types.ts"
@@ -11,6 +12,7 @@ export class EvaluationInputError extends Error {
   readonly actualCharacters: number
   readonly minimumCharacters: number
   readonly operator: OperatorRubric | undefined
+  readonly languageAnalysis: LanguageAnalysisResult | undefined
 
   constructor(
     code: EvaluationInputErrorCode,
@@ -18,6 +20,7 @@ export class EvaluationInputError extends Error {
     actualCharacters: number,
     minimumCharacters: number,
     operator?: OperatorRubric,
+    languageAnalysis?: LanguageAnalysisResult,
   ) {
     super(message)
     this.name = "EvaluationInputError"
@@ -25,6 +28,7 @@ export class EvaluationInputError extends Error {
     this.actualCharacters = actualCharacters
     this.minimumCharacters = minimumCharacters
     this.operator = operator
+    this.languageAnalysis = languageAnalysis
   }
 }
 
@@ -32,7 +36,27 @@ function isGerman(locale: string): boolean {
   return locale.toLowerCase().startsWith("de")
 }
 
-export function feedbackForResult(
+function missingOperatorCriterion(
+  result: EvaluationResult,
+): OperatorRubric["criteria"][number] | undefined {
+  if (!result.operator) return undefined
+  const missingIds = new Set(
+    result.criteria
+      .filter(
+        (criterion) =>
+          criterion.judgeFeedbackCode === "operator-not-met" &&
+          (criterion.status === "missed" ||
+            criterion.status === "contradicted"),
+      )
+      .map((criterion) => criterion.operatorCriterionId)
+      .filter((id): id is string => Boolean(id)),
+  )
+  return [...result.operator.criteria]
+    .filter((criterion) => missingIds.has(criterion.id))
+    .sort((left, right) => right.priority - left.priority)[0]
+}
+
+function contentFeedbackForResult(
   result: EvaluationResult,
   locale = "de-DE",
 ): LearnerFeedback | null {
@@ -76,13 +100,25 @@ export function feedbackForResult(
     }
   }
 
+  if (diagnostic?.code === "operator-check-unavailable") {
+    return {
+      code: "operator-check-unavailable",
+      message: german
+        ? "Die verlangte Antwortform konnte gerade nicht zuverlässig geprüft werden. Versuche die Prüfung erneut, sobald die Qualitätsprüfung verfügbar ist."
+        : "The required response form could not be checked reliably. Try again when quality assessment is available.",
+    }
+  }
+
   if (diagnostic?.code === "operator-not-met") {
+    const criterion = missingOperatorCriterion(result)
     return {
       code: "operator-not-met",
       message: german
-        ? result.operator?.operatorFeedback.de ??
+        ? criterion?.feedback.de ??
+          result.operator?.operatorFeedback.de ??
           "Die Antwort erfüllt die Anforderungen des Aufgabenoperators noch nicht."
-        : result.operator?.operatorFeedback.en ??
+        : criterion?.feedback.en ??
+          result.operator?.operatorFeedback.en ??
           "The answer does not yet meet the task operator's requirements.",
     }
   }
@@ -110,8 +146,75 @@ export function feedbackForResult(
   return {
     code: "incomplete",
     message: german
-      ? "Die Antwort erklärt den gefragten Zusammenhang noch nicht vollständig."
-      : "The answer does not yet explain the requested relationship completely.",
+      ? "Die Antwort bearbeitet die gefragten Inhalte noch nicht vollständig."
+      : "The answer does not yet address the requested content completely.",
+  }
+}
+
+function languageFeedback(
+  analysis: LanguageAnalysisResult | undefined,
+  locale: string,
+): LearnerFeedback | null {
+  if (!analysis) return null
+
+  const german = isGerman(locale)
+  if (analysis.status === "unavailable") {
+    return {
+      code: "language-analysis-unavailable",
+      message: german
+        ? "Sprachstatistik: Wörter insgesamt: " +
+          analysis.wordCount +
+          " · die angeforderte Fehlerzählung ist derzeit nicht verfügbar."
+        : "Language statistics: total words: " +
+          analysis.wordCount +
+          " · the requested error count is currently unavailable.",
+    }
+  }
+
+  const values = [
+    german
+      ? "Wörter insgesamt: " + analysis.wordCount
+      : "total words: " + analysis.wordCount,
+  ]
+  if (analysis.spelling) {
+    values.push(
+      german
+        ? "Rechtschreibfehler: " + analysis.spellingErrors
+        : "spelling errors: " + analysis.spellingErrors,
+      german
+        ? "Zeichensetzungsfehler: " + analysis.punctuationErrors
+        : "punctuation errors: " + analysis.punctuationErrors,
+    )
+  }
+  if (analysis.syntax) {
+    values.push(
+      german
+        ? "Satzbaufehler: " + analysis.syntaxErrors
+        : "sentence-structure errors: " + analysis.syntaxErrors,
+    )
+  }
+
+  return {
+    code: "language-analysis",
+    message:
+      (german
+        ? "Sprachstatistik (Fehlerzahlen als Modellschätzung):\n"
+        : "Language statistics (error counts are model estimates):\n") +
+      values.join(" · "),
+  }
+}
+
+export function feedbackForResult(
+  result: EvaluationResult,
+  locale = "de-DE",
+): LearnerFeedback | null {
+  const content = contentFeedbackForResult(result, locale)
+  const language = languageFeedback(result.languageAnalysis, locale)
+  if (!language) return content
+  if (!content) return language
+  return {
+    ...content,
+    message: content.message + " " + language.message,
   }
 }
 
@@ -122,7 +225,7 @@ export function feedbackForError(
   if (!(error instanceof EvaluationInputError)) return null
 
   if (error.code === "answer-too-short") {
-    return {
+    const content: LearnerFeedback = {
       code: "answer-too-short",
       message: isGerman(locale)
         ? error.operator?.tooShortFeedback.de ??
@@ -130,6 +233,13 @@ export function feedbackForError(
         : error.operator?.tooShortFeedback.en ??
           "The answer is much too short to address the task adequately.",
     }
+    const language = languageFeedback(error.languageAnalysis, locale)
+    return language
+      ? {
+          ...content,
+          message: content.message + " " + language.message,
+        }
+      : content
   }
 
   return null

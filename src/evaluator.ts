@@ -21,6 +21,7 @@ import {
   MAX_NLI_SEQUENCE_LENGTH,
   NLI_TASK,
 } from "./model-config.ts"
+import { unavailableLanguageAnalysis } from "./language-analysis.ts"
 import {
   aggregateCriteria,
   classifyCriterion,
@@ -104,19 +105,71 @@ function emit<T>(name: string, detail: T): void {
   globalThis.dispatchEvent(new CustomEvent(name, { detail }))
 }
 
-const runtimeAssetBaseUrl = (() => {
-  if (typeof document === "undefined") return undefined
-  const currentSource = (document.currentScript as HTMLScriptElement | null)?.src
-  if (currentSource) return new URL(".", currentSource).href
+const BUNDLE_RESOURCE_PATTERN = /(?:^|\/)index\.js(?:[?#]|$)/iu
 
-  const scripts = Array.from(document.scripts)
-  for (let index = scripts.length - 1; index >= 0; index -= 1) {
-    const source = scripts[index]?.src
-    if (source && /(?:^|\/)index(?:\.[\da-f]+)?\.js(?:[?#]|$)/iu.test(source)) {
-      return new URL(".", source).href
+function assetDirectoryUrl(source: string | undefined): string | undefined {
+  if (!source) return undefined
+  try {
+    const url = new URL(source)
+    if (
+      url.protocol === "blob:" ||
+      url.protocol === "data:" ||
+      url.protocol === "javascript:"
+    ) {
+      return undefined
+    }
+    return new URL(".", url).href
+  } catch {
+    return undefined
+  }
+}
+
+export function resolveRuntimeAssetBaseUrl(
+  currentSource: string | undefined,
+  resourceSources: readonly string[],
+  scriptSources: readonly string[],
+): string | undefined {
+  const currentBase = assetDirectoryUrl(currentSource)
+  if (currentBase) return currentBase
+
+  // LiaScript fetches metadata scripts and executes their source through a
+  // blob URL. The original HTTP URL remains available as a resource timing
+  // entry, so prefer the most recently fetched, un-hashed bundle there.
+  for (let index = resourceSources.length - 1; index >= 0; index -= 1) {
+    const source = resourceSources[index]
+    if (source && BUNDLE_RESOURCE_PATTERN.test(source)) {
+      const base = assetDirectoryUrl(source)
+      if (base) return base
+    }
+  }
+
+  for (let index = scriptSources.length - 1; index >= 0; index -= 1) {
+    const source = scriptSources[index]
+    if (source && BUNDLE_RESOURCE_PATTERN.test(source)) {
+      const base = assetDirectoryUrl(source)
+      if (base) return base
     }
   }
   return undefined
+}
+
+const runtimeAssetBaseUrl = (() => {
+  if (typeof document === "undefined") return undefined
+  const currentSource = (document.currentScript as HTMLScriptElement | null)?.src
+  let resourceSources: string[] = []
+  try {
+    resourceSources =
+      typeof performance === "undefined"
+        ? []
+        : performance.getEntriesByType("resource").map((entry) => entry.name)
+  } catch {
+    // Resource timing can be unavailable in restricted browser contexts.
+  }
+  return resolveRuntimeAssetBaseUrl(
+    currentSource,
+    resourceSources,
+    Array.from(document.scripts, (script) => script.src),
+  )
 })()
 
 const ORT_FACTORY_FILENAME = "ort-wasm-simd-threaded.asyncify.mjs"
@@ -203,6 +256,38 @@ function compactDiagnostic(
     code: status === "uncertain" ? "unclear" : "incomplete",
     source: "compact",
     severity: "blocking",
+  }
+}
+
+export function finalizeCompactAssessment(
+  assessment: ReturnType<typeof aggregateCriteria>,
+  hasOperator: boolean,
+  criteria: readonly CriterionResult[],
+): {
+  assessment: ReturnType<typeof aggregateCriteria>
+  diagnostic: EvaluationDiagnostic | undefined
+} {
+  if (hasOperator && assessment.passed) {
+    return {
+      assessment: {
+        ...assessment,
+        status: "uncertain",
+        passed: false,
+      },
+      diagnostic: {
+        code: "operator-check-unavailable",
+        source: "compact",
+        severity: "blocking",
+      },
+    }
+  }
+  return {
+    assessment,
+    diagnostic: compactDiagnostic(
+      assessment.status,
+      assessment.passed,
+      criteria,
+    ),
   }
 }
 
@@ -713,19 +798,24 @@ export class SemanticEvaluator {
         )
       }
 
-      const aggregated = aggregateCriteria(results, normalized.passThreshold)
-      const diagnostic = compactDiagnostic(
-        aggregated.status,
-        aggregated.passed,
+      const finalized = finalizeCompactAssessment(
+        aggregateCriteria(results, normalized.passThreshold),
+        normalized.operator !== undefined,
         results,
       )
       return {
-        ...aggregated,
+        ...finalized.assessment,
         mode: normalized.mode,
         criteria: results,
         answer: normalized.answer,
         operator: normalized.operator,
-        diagnostic,
+        diagnostic: finalized.diagnostic,
+        languageAnalysis: normalized.languageAnalysis
+          ? unavailableLanguageAnalysis(
+              normalized.answer,
+              normalized.languageAnalysis,
+            )
+          : undefined,
         durationMs: Number((now() - started).toFixed(1)),
         model: {
           id: this.config.modelId,

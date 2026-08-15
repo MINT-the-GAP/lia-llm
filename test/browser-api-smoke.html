@@ -1,22 +1,59 @@
 <!doctype html>
 <meta charset="utf-8">
 <title>lia-llm browser API smoke test</title>
+<style>
+  .lia-link { color: rgb(var(--color-highlight)); }
+</style>
 <body>
   <div id="textarea-owner" data-llm-textarea="5">
     <input class="lia-quiz__input" aria-label="Testantwort">
   </div>
+  <div id="quiz-layout-probe" class="lia-quiz" data-llm-textarea>
+    <ul id="empty-hints-probe" class="lia-quiz__hints"></ul>
+  </div>
   <lia-llm-solution id="solution-probe"></lia-llm-solution>
+  <lia-llm-feedback id="feedback-probe"></lia-llm-feedback>
+  <lia-llm-result-separator id="separator-probe"></lia-llm-result-separator>
   <lia-llm-activity id="activity-probe" hidden></lia-llm-activity>
   <lia-llm-activity id="activity-probe-two" hidden></lia-llm-activity>
-  <script src="../dist/index.js"></script>
   <script>
-  const initial = window.LiaLLM?.getStatus()
   window.__liaCalibration = []
   window.__liaCalibrationExpected = 1
   window.__liaCalibrationDone = false
+  document.documentElement.style.setProperty(
+    "--color-highlight",
+    "17, 34, 51"
+  )
+  window.__liaBundleLoad = (async () => {
+    const response = await fetch("../dist/index.js")
+    if (!response.ok) {
+      throw new Error(`Bundle konnte nicht geladen werden (${response.status}).`)
+    }
+    const source = await response.text()
+    const blobUrl = URL.createObjectURL(
+      new Blob([source], { type: "text/javascript" })
+    )
+    try {
+      await new Promise((resolve, reject) => {
+        const script = document.createElement("script")
+        script.src = blobUrl
+        script.addEventListener("load", resolve, { once: true })
+        script.addEventListener(
+          "error",
+          () => reject(new Error("Bundle konnte nicht ausgefuehrt werden.")),
+          { once: true }
+        )
+        document.head.append(script)
+      })
+    } finally {
+      URL.revokeObjectURL(blobUrl)
+    }
+  })()
 
   ;(async () => {
     try {
+      await window.__liaBundleLoad
+      const initial = window.LiaLLM?.getStatus()
       if (document.readyState === "loading") {
         await new Promise(resolve =>
           document.addEventListener("DOMContentLoaded", resolve, { once: true })
@@ -28,6 +65,9 @@
         "0.66;solution=1;feedback=1;operator=erklaeren"
       )
       const positional = window.LiaLLM?.parseMacroOptions("0.66;1;1;erklaeren")
+      const language = window.LiaLLM?.parseMacroOptions(
+        "0.66;solution=1;feedback=1;operator=erklaeren;Rechtschreibung=1;Satzbau=1"
+      )
       const solution = document.getElementById("solution-probe")
       const solutionStartedHidden =
         solution?.hidden === true && solution?.style.display === "none"
@@ -35,6 +75,37 @@
         "solution-probe",
         "Erster Absatz.\n\nZweiter Absatz."
       )
+      const feedbackProbe = document.getElementById("feedback-probe")
+      window.LiaLLM?.showFeedback(
+        "feedback-probe",
+        "Sprachstatistik:\nWörter insgesamt: 2"
+      )
+      const feedbackPreservesLineBreaks =
+        feedbackProbe?.textContent ===
+          "Sprachstatistik:\nWörter insgesamt: 2" &&
+        feedbackProbe?.style.whiteSpace === "pre-line"
+      const feedbackUsesCompactThemeStyle =
+        feedbackProbe?.classList.contains("lia-link") === true &&
+        parseFloat(feedbackProbe?.style.marginBlockStart || "") === 0.75
+      const quizSpacingIsCompacted =
+        getComputedStyle(
+          document.getElementById("quiz-layout-probe")
+        ).marginBottom === "0px" &&
+        getComputedStyle(
+          document.getElementById("empty-hints-probe")
+        ).display === "none"
+      const separatorProbe = document.getElementById("separator-probe")
+      const resultSeparatorMatchesTheme =
+        separatorProbe?.getAttribute("role") === "separator" &&
+        separatorProbe?.getAttribute("aria-orientation") === "horizontal" &&
+        separatorProbe?.classList.contains("lia-link") === true &&
+        separatorProbe?.style.cssText.includes(
+          "border-block-start: 1px solid currentcolor"
+        ) &&
+        getComputedStyle(separatorProbe).borderTopColor ===
+          "rgb(17, 34, 51)" &&
+        parseFloat(separatorProbe?.style.marginBlockStart || "") === 1 &&
+        parseFloat(separatorProbe?.style.marginBlockEnd || "") === 1.5
       const solutionBecameVisible =
         solution?.hidden === false && solution?.style.display === "block"
       window.LiaLLM?.showSolution("solution-probe", "")
@@ -258,7 +329,7 @@
 
       const matches = Boolean(
         window.LiaLLM &&
-        window.LiaLLM.version === "0.4.1" &&
+        window.LiaLLM.version === "0.5.0" &&
         typeof window.LiaLLM.evaluate === "function" &&
         typeof window.LiaLLM.feedbackForResult === "function" &&
         typeof window.LiaLLM.showFeedback === "function" &&
@@ -270,7 +341,11 @@
         named?.solution === true &&
         named?.feedback === true &&
         named?.operator === "erklaeren" &&
+        named?.rechtschreibung === false &&
+        named?.satzbau === false &&
         JSON.stringify(named) === JSON.stringify(positional) &&
+        language?.rechtschreibung === true &&
+        language?.satzbau === true &&
         area instanceof HTMLTextAreaElement &&
         !arrow.defaultPrevented &&
         !arrowUp.defaultPrevented &&
@@ -283,6 +358,10 @@
         solution?.textContent === "Erster Absatz.\n\nZweiter Absatz." &&
         solution?.hidden === false &&
         solution?.style.whiteSpace === "pre-wrap" &&
+        feedbackPreservesLineBreaks &&
+        feedbackUsesCompactThemeStyle &&
+        quizSpacingIsCompacted &&
+        resultSeparatorMatchesTheme &&
         quizPresenceStartsOnce &&
         activityStarted &&
         staleRunCannotHideCurrent &&
@@ -310,6 +389,10 @@
         solutionStartedHidden,
         solutionBecameVisible,
         solutionHidesWhenCleared,
+        feedbackPreservesLineBreaks,
+        feedbackUsesCompactThemeStyle,
+        quizSpacingIsCompacted,
+        resultSeparatorMatchesTheme,
         quizPresenceStartsOnce,
         activityStarted,
         staleRunCannotHideCurrent,

@@ -6,6 +6,10 @@ import {
   type DownloadPolicyDecision,
 } from "./download-policy.ts"
 import { SemanticEvaluator } from "./evaluator.ts"
+import {
+  normalizeLanguageAnalysisOptions,
+  unavailableLanguageAnalysis,
+} from "./language-analysis.ts"
 import { QualityEvaluator } from "./quality-evaluator.ts"
 import { normalizeRequest } from "./scoring.ts"
 import type {
@@ -79,6 +83,9 @@ function waitForRun<T>(promise: Promise<T>, run: EvaluationRun): Promise<T> {
 function snapshotRequest(request: EvaluationRequest): EvaluationRequest {
   return {
     ...request,
+    languageAnalysis: request.languageAnalysis
+      ? { ...request.languageAnalysis }
+      : undefined,
     criteria: Array.isArray(request.criteria)
       ? request.criteria.map((criterion) => ({
           ...criterion,
@@ -117,6 +124,41 @@ function supportsQualityRuntime(): boolean {
     "gpu" in navigator &&
     Boolean((navigator as Navigator & { gpu?: unknown }).gpu)
   )
+}
+
+function withLanguageAnalysisFallback(
+  request: EvaluationRequest,
+  result: EvaluationResult,
+): EvaluationResult {
+  const languageOptions = normalizeLanguageAnalysisOptions(
+    request.languageAnalysis,
+  )
+  if (!languageOptions || result.languageAnalysis) return result
+  return {
+    ...result,
+    languageAnalysis: unavailableLanguageAnalysis(
+      result.answer,
+      languageOptions,
+    ),
+  }
+}
+
+function operatorSafeCompactResult(
+  request: EvaluationRequest,
+  result: EvaluationResult,
+): EvaluationResult {
+  const languageSafe = withLanguageAnalysisFallback(request, result)
+  if (!request.operator?.trim() || !languageSafe.passed) return languageSafe
+  return {
+    ...languageSafe,
+    status: "uncertain",
+    passed: false,
+    diagnostic: {
+      code: "operator-check-unavailable",
+      source: "compact",
+      severity: "blocking",
+    },
+  }
 }
 
 export class AutomaticEvaluator {
@@ -392,6 +434,10 @@ export class AutomaticEvaluator {
     compactFallback?: EvaluationResult,
   ): Promise<EvaluationResult> {
     const generation = this.generation
+    const languageOnly =
+      compactFallback?.passed === true &&
+      !request.operator?.trim() &&
+      normalizeLanguageAnalysisOptions(request.languageAnalysis) !== undefined
     const fallback = async (): Promise<EvaluationResult> => {
       assertRunActive(run)
       this.reportProgress(options, run, {
@@ -399,8 +445,13 @@ export class AutomaticEvaluator {
         engine: "compact",
         message: "Prüfung wird mit dem Kompaktmodell abgeschlossen …",
       })
-      if (compactFallback) return compactFallback
-      return this.evaluateCompact(request, options, run)
+      if (compactFallback) {
+        return operatorSafeCompactResult(request, compactFallback)
+      }
+      return operatorSafeCompactResult(
+        request,
+        await this.evaluateCompact(request, options, run),
+      )
     }
     const task = async (): Promise<EvaluationResult> => {
       assertRunActive(run)
@@ -414,10 +465,26 @@ export class AutomaticEvaluator {
       this.reportProgress(options, run, {
         phase: "evaluating-quality",
         engine: "quality",
-        message: "Antwort wird gründlich geprüft …",
+        message: languageOnly
+          ? "Sprachstatistik wird erstellt …"
+          : "Antwort wird gründlich geprüft …",
       })
       try {
-        return await waitForRun(this.qualityEvaluator.evaluate(request), run)
+        if (languageOnly && compactFallback) {
+          const languageAnalysis = await waitForRun(
+            this.qualityEvaluator.evaluateLanguage(request),
+            run,
+          )
+          return withLanguageAnalysisFallback(request, {
+            ...compactFallback,
+            languageAnalysis:
+              languageAnalysis ?? compactFallback.languageAnalysis,
+          })
+        }
+        return withLanguageAnalysisFallback(
+          request,
+          await waitForRun(this.qualityEvaluator.evaluate(request), run),
+        )
       } catch (error) {
         if (isAbortError(error)) throw error
         this.markQualityDegraded(generation)
@@ -467,7 +534,10 @@ export class AutomaticEvaluator {
     options?: EvaluationOptions,
   ): Promise<EvaluationResult> {
     const request = snapshotRequest(originalRequest)
-    normalizeRequest(request)
+    const normalized = normalizeRequest(request)
+    const requiresQuality =
+      normalized.operator !== undefined ||
+      normalized.languageAnalysis !== undefined
     await this.waitForClear()
     const run: EvaluationRun = {
       generation: this.generation,
@@ -522,10 +592,13 @@ export class AutomaticEvaluator {
       }
     }
 
-    const compactResult = await this.evaluateCompact(request, options, run)
+    const compactResult = operatorSafeCompactResult(
+      request,
+      await this.evaluateCompact(request, options, run),
+    )
     assertRunActive(run)
     const qualityUpgrade = this.startQualityUpgrade(qualityCache)
-    if (compactResult.passed) return compactResult
+    if (compactResult.passed && !requiresQuality) return compactResult
 
     this.reportProgress(options, run, {
       phase: "preparing-quality",

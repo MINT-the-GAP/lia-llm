@@ -10,6 +10,10 @@ import type {
   NormalizedEvaluationRequest,
 } from "./types.ts"
 import { EvaluationInputError } from "./learner-feedback.ts"
+import {
+  normalizeLanguageAnalysisOptions,
+  unavailableLanguageAnalysis,
+} from "./language-analysis.ts"
 import { resolveOperatorRubric } from "./operator-rubrics.ts"
 
 export const DEFAULT_CRITERION_THRESHOLD = 0.55
@@ -18,6 +22,7 @@ export const DEFAULT_PASS_THRESHOLD = 1
 export const DEFAULT_UNCERTAINTY_MARGIN = 0.1
 export const DEFAULT_CONTRASTIVE_MARGIN = 0.15
 export const DEFAULT_MIN_ANSWER_CHARACTERS = 12
+export const LEGACY_MACRO_QUESTION = "LiaScript-Freitextaufgabe"
 
 const MAX_CRITERIA = 16
 const MAX_VARIANTS = 8
@@ -190,8 +195,20 @@ export function normalizeRequest(request: EvaluationRequest): NormalizedEvaluati
   const answer = normalizeAnswerText(request.answer)
   const reference = normalizeAnswerText(request.reference)
   const operator = resolveOperatorRubric(request.operator)
+  const languageAnalysis = normalizeLanguageAnalysisOptions(
+    request.languageAnalysis,
+  )
 
   if (!question) throw new Error("Die Fragestellung fehlt.")
+  if (
+    operator &&
+    question.toLocaleLowerCase("de-DE") ===
+      LEGACY_MACRO_QUESTION.toLocaleLowerCase("de-DE")
+  ) {
+    throw new Error(
+      "Operatoren benötigen den echten Aufgabenwortlaut. Verwende @LLMQuiz.question(...) oder übergib question über die API.",
+    )
+  }
   if (!reference) throw new Error("Die Musterlösung fehlt.")
   if (answer.length > MAX_TEXT_CHARACTERS) {
     throw new Error(`Die Antwort darf höchstens ${MAX_TEXT_CHARACTERS} Zeichen lang sein.`)
@@ -199,11 +216,8 @@ export function normalizeRequest(request: EvaluationRequest): NormalizedEvaluati
 
   const minAnswerCharacters = Math.max(
     1,
-    Math.floor(
-      request.minAnswerCharacters ??
-        operator?.minAnswerCharacters ??
-        DEFAULT_MIN_ANSWER_CHARACTERS,
-    ),
+    Math.floor(request.minAnswerCharacters ?? DEFAULT_MIN_ANSWER_CHARACTERS),
+    operator?.minAnswerCharacters ?? 1,
   )
   if (answer.length < minAnswerCharacters) {
     throw new EvaluationInputError(
@@ -212,6 +226,9 @@ export function normalizeRequest(request: EvaluationRequest): NormalizedEvaluati
       answer.length,
       minAnswerCharacters,
       operator,
+      languageAnalysis
+        ? unavailableLanguageAnalysis(answer, languageAnalysis)
+        : undefined,
     )
   }
 
@@ -269,6 +286,7 @@ export function normalizeRequest(request: EvaluationRequest): NormalizedEvaluati
       request.contrastiveMargin ?? DEFAULT_CONTRASTIVE_MARGIN,
     ),
     minAnswerCharacters,
+    languageAnalysis,
   }
 }
 

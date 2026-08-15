@@ -1,6 +1,6 @@
 <!--
 author:      MINT-the-GAP, Martin Lommatzsch
-version:     0.4.1
+version:     0.5.0
 language:    de
 narrator:    Deutsch Female
 comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
@@ -17,7 +17,8 @@ attribute:   [WebLLM](https://webllm.mlc.ai/docs/) by MLC is licensed under
              by Moritz Laurer, converted for Transformers.js by Xenova, is licensed under
              [MIT](https://huggingface.co/MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7/blob/main/LICENSE).
 
-@LLMQuiz: @LLMQuiz_(@uid,@0,```@1```)
+@LLMQuiz: @LLMQuiz_(@uid,@0,```LiaScript-Freitextaufgabe```,```@1```)
+@LLMQuiz.question: @LLMQuiz_(@uid,@0,```@1```,```@2```)
 
 @LLMQuiz_
 <script output="lia-llm-result-@0">
@@ -27,7 +28,8 @@ const runId = activityId + "-" + Date.now().toString(36) + "-" +
   Math.random().toString(36).slice(2)
 const evaluationController = new AbortController()
 const optionSource = `@'1`
-const reference = `@'2`
+const question = `@'2`
+const reference = `@'3`
 const answer = `@'input`.replace(/\u2028/gu, "\n")
 let active = true
 let finished = false
@@ -74,19 +76,31 @@ Promise.resolve()
     if (!window.LiaLLM) {
       throw new Error("lia-llm konnte nicht geladen werden.")
     }
-    if (window.LiaLLM.version !== "0.4.1") {
-      throw new Error(`lia-llm 0.4.1 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
+    if (window.LiaLLM.version !== "0.5.0") {
+      throw new Error(`lia-llm 0.5.0 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
     }
 
     const options = window.LiaLLM.parseMacroOptions(optionSource)
     feedbackEnabled = options.feedback
+    if (options.operator && question === "LiaScript-Freitextaufgabe") {
+      throw new Error(
+        "Operatoren benötigen den echten Aufgabenwortlaut. Verwende @LLMQuiz.question(...)."
+      )
+    }
 
     return window.LiaLLM.evaluate({
-      question: "LiaScript-Freitextaufgabe",
+      question,
       answer,
       reference,
       operator: options.operator ?? undefined,
-      criterionThreshold: options.passThreshold
+      criterionThreshold: options.passThreshold,
+      languageAnalysis:
+        options.rechtschreibung || options.satzbau
+          ? {
+              spelling: options.rechtschreibung,
+              syntax: options.satzbau
+            }
+          : undefined
     }, {
       signal: evaluationController.signal,
       onProgress: progress => {
@@ -122,10 +136,14 @@ Promise.resolve()
 <script style="display:block" modify="false">
 const solutionResult = "@input(`lia-llm-result-@0`)"
 const solutionOptions = window.LiaLLM?.parseMacroOptions?.(`@'1`)
-const solutionReference = `@'2`
+const solutionReference = `@'3`
+const resultSeparator =
+  "\n\n<lia-llm-result-separator></lia-llm-result-separator>"
 
 if (solutionResult === "true" && solutionOptions?.solution) {
-  send.liascript(solutionReference)
+  send.liascript(solutionReference + resultSeparator)
+} else if (solutionResult === "true" || solutionResult === "false") {
+  send.liascript(resultSeparator)
 } else {
   send.clear()
 }
@@ -137,8 +155,9 @@ if (solutionResult === "true" && solutionOptions?.solution) {
 
     --{{0}}--
 `lia-llm` ergänzt ein normales LiaScript-Freitextquiz um eine lokale, semantische
-Auswertung anhand einer Musterlösung. Es gibt dafür genau ein öffentliches Makro:
-`@LLMQuiz(...)`.
+Auswertung anhand einer Musterlösung. Für neue Aufgaben ist
+`@LLMQuiz.question(Optionen,Aufgabenwortlaut)` das empfohlene öffentliche Makro.
+`@LLMQuiz(...)` bleibt für ältere Aufgaben ohne Operator erhalten.
 
 Die vollständige Antwort wird im Zusammenhang mit der vollständigen Musterlösung betrachtet.
 Synonyme, Umschreibungen und andere Satzstrukturen dürfen dieselbe Aussage ausdrücken. Das stärkere
@@ -169,30 +188,33 @@ vollständige Musterlösung für den lokalen Vergleich. Sie wird in der gerender
 nicht angezeigt. Mit `solution=1` erscheint sie erst, nachdem die Antwort als richtig bewertet wurde.
 Bei der Anzeige wird ihr Inhalt vollständig als LiaScript neu geparst. Dadurch werden insbesondere
 Markdown-Strukturen sowie Inline- und Blockformeln in TeX gerendert und nicht als Quelltext gezeigt.
+Bei `@LLMQuiz.question` wird der echte Aufgabenwortlaut zusätzlich an die Auswertung übergeben.
 
 ```` markdown
 Aufgabe 1: Erkläre, warum Eis auf flüssigem Wasser schwimmt.
 
 <!-- data-solution-button="off" data-llm-textarea="5" -->
 [[Antwort]]
-```text @LLMQuiz(0.66;solution=1;feedback=1;operator=erklaeren)
+```text @LLMQuiz.question(0.66;solution=1;feedback=1;operator=erklaeren,`Erkläre, warum Eis auf flüssigem Wasser schwimmt.`)
 Eis besitzt eine geringere Dichte als flüssiges Wasser. Beim Gefrieren bildet das
 Wasserstoffbrückennetzwerk eine offene Kristallstruktur, die mehr Volumen einnimmt.
 Deshalb schwimmt Eis an der Oberfläche.
 ```
 ````
 
-`@LLMQuiz(...)` muss in derselben Zeile wie die öffnenden drei Backticks stehen. In der nächsten
+`@LLMQuiz.question(...)` muss in derselben Zeile wie die öffnenden drei Backticks stehen. In der nächsten
 Zeile wäre der Aufruf nur Teil der Musterlösung und würde nicht ausgeführt.
 
-Das Makro benötigt keine Backticks um seine Optionen. Die benannte und die kurze Schreibweise sind
-gleichwertig:
+Die Optionen benötigen keine Backticks. Der Aufgabenwortlaut wird als zweiter Parameter übergeben;
+enthält er wie üblich Kommas, muss er mit Backticks geschützt werden. Benannte und kurze
+Optionsschreibweise sind gleichwertig:
 
 ``` text
-@LLMQuiz(0.66;solution=1;feedback=1)
-@LLMQuiz(0.66;1;1)
-@LLMQuiz(0.66;solution=1;feedback=1;operator=erklaeren)
-@LLMQuiz(0.66;1;1;erklaeren)
+@LLMQuiz.question(0.66;solution=1;feedback=1,`Beschreibe den Verlauf.`)
+@LLMQuiz.question(0.66;1;1,`Beschreibe den Verlauf.`)
+@LLMQuiz.question(0.66;solution=1;feedback=1;operator=beschreiben,`Beschreibe den Verlauf.`)
+@LLMQuiz.question(0.66;1;1;beschreiben,`Beschreibe den Verlauf.`)
+@LLMQuiz.question(0.66;solution=1;feedback=1;operator=erklaeren;Rechtschreibung=1;Satzbau=1,`Erkläre, warum Eis auf flüssigem Wasser schwimmt.`)
 ```
 
 | Teil | Bedeutung |
@@ -202,7 +224,9 @@ gleichwertig:
 | `solution=0` / zweiter Wert `0` | Musterlösung unabhängig vom Ergebnis nie anzeigen |
 | `feedback=1` / dritter Wert `1` | kurze priorisierte Rückmeldung einschalten; ein reiner Stilhinweis kann auch bei richtiger Antwort erscheinen |
 | `feedback=0` / dritter Wert `0` | zusätzliches Kurzfeedback ausschalten |
-| `operator=erklaeren` / vierter Wert `erklaeren` | zusätzlich prüfen, ob die Antwort einen Zusammenhang erklärt |
+| `operator=...` / vierter Wert | zusätzlich die verlangte Antwortform des gesetzten Operators prüfen |
+| `Rechtschreibung=1` | Wortzahl sowie getrennte Schätzungen für Zeichensetzungs- und Rechtschreibfehler ausgeben |
+| `Satzbau=1` | Wortzahl sowie eine Schätzung für Satzbaufehler ausgeben |
 
 Ohne Optionen gelten `solution=1` und `feedback=0`:
 
@@ -212,15 +236,32 @@ Ohne Optionen gelten `solution=1` und `feedback=0`:
 
 Benannte Optionen dürfen in beliebiger Reihenfolge stehen. Benannte und positionale Angaben werden
 innerhalb eines Aufrufs nicht gemischt; Tippfehler und unbekannte Optionen führen zu einer klaren
-Fehlermeldung.
+Fehlermeldung. `Rechtschreibung` und `Satzbau` sind ausschließlich benannte Optionen. Ihre
+Namen sind nicht von Groß- und Kleinschreibung abhängig; als Werte sind `0`, `1`, `false`
+und `true` zulässig. Sobald mindestens eine dieser Optionen eingeschaltet ist, muss auch
+`feedback=1` gesetzt sein, damit die Sprachstatistik sichtbar ausgegeben werden kann.
 
 `operator` ist optional. Ohne diese Angabe bewertet das Makro fachliche Richtigkeit, Relevanz und
-Vollständigkeit allgemein. Mit `operator=erklaeren` erhält das Qualitätsmodell zusätzlich die
-Anforderungen an eine Erklärung und kann gezielt melden, dass zwar passende Inhalte vorkommen, der
-gefragte Zusammenhang aber noch nicht erklärt wurde. Weitere Operatoren werden auf Grundlage der
-fachspezifischen Ausgangstabelle [Operatoren.md](Operatoren.md) und der technischen
-[Operator- und Feedbackmatrix](docs/operatoren.md) ergänzt; Operatoren werden dabei nicht mit
-einzelnen Sätzen der Musterlösung oder mit Antwortsynonymen gleichgesetzt.
+Vollständigkeit allgemein. Aktiv sind `erklaeren`, `erlaeutern`, `beschreiben`,
+`begruenden`, `vergleichen` und `beurteilen`; Umlaute und dokumentierte
+Imperativformen werden normalisiert. Das Qualitätsmodell erhält für jedes Profil einen strukturierten
+Antwortvertrag mit erforderlichen Teilleistungen, Beleg- und Verfahrensregeln sowie Grenzen.
+Es meldet bei einer fehlenden Teilleistung eine validierte Kriteriums-ID; dadurch kann das
+priorisierte, konkrete Operatorfeedback angezeigt werden.
+Ein Operator kann nur mit `@LLMQuiz.question` verwendet werden, weil sein konkreter Umfang aus dem
+echten Aufgabenwortlaut folgt. Der Operator wird nicht heimlich aus einem Verb erkannt und nicht
+pauschal einem Anforderungsbereich zugeordnet. Die fachliche Grundlage steht in
+[Operatoren.md](Operatoren.md), die technische Matrix in [docs/operatoren.md](docs/operatoren.md).
+
+Operatoraufgaben bestehen erst nach der Prüfung durch das Qualitätsmodell. Das Kompaktmodell darf
+den Fachinhalt vorprüfen, aber die verlangte Antwortform nicht allein freigeben. Ist die
+Qualitätsprüfung etwa ohne WebGPU oder nach einem Modellfehler nicht verfügbar, wird ein sonst
+bestandener Kompaktbefund zu `uncertain` und bittet bei `feedback=1` um eine
+erneute Prüfung; er wird nicht fälschlich freigegeben. Ein bereits erkannter fachlicher Fehler oder
+unvollständiger Inhalt bleibt dagegen der vorrangige Befund.
+
+Das ältere `@LLMQuiz(Optionen)` verwendet weiterhin den allgemeinen Kontext
+„LiaScript-Freitextaufgabe“ und ist deshalb nur ohne Operator zulässig.
 
 Der native LiaScript-Lösungsbutton bleibt bei dieser Quizform ausgeschaltet; die sichtbare Ausgabe
 wird ausschließlich über `solution` gesteuert. Soll die Musterlösung nie erscheinen:
@@ -248,15 +289,49 @@ Mit `feedback=1` zeigt das Makro höchstens eine kurze, priorisierte Rückmeldun
 kann das beispielsweise sein:
 
 - „Die Antwort enthält inhaltliche Fehler.“
-- „Die Antwort erklärt den gefragten Zusammenhang noch nicht vollständig.“
+- „Die Antwort bearbeitet die gefragten Inhalte noch nicht vollständig.“
 - „Die Antwort ist deutlich zu kurz, um etwas zu erklären.“
-- „Die Antwort entspricht noch nicht den Kriterien einer Erklärung.“
+- „Stelle Ursache, Prinzip oder Bedingung und die daraus folgende Wirkung nachvollziehbar in Beziehung.“
+- „Die verlangte Antwortform konnte gerade nicht zuverlässig geprüft werden.“
 - „Die Antwort ist zu umgangssprachlich verfasst.“
 
 Die fachliche Richtig/Falsch-Entscheidung bleibt von einem bloßen Stilhinweis getrennt: Eine
 inhaltlich richtige Antwort wird nicht allein wegen Umgangssprache falsch. Das Makro zeigt keine
 Kriterienliste, keine Konfidenzen und keinen Text aus der Musterlösung. Die detaillierten
 Diagnosedaten bleiben intern für Tests, Kalibrierung oder ein späteres Fine-Tuning erhalten.
+
+### Optionale Sprachstatistik
+
+Mit `Rechtschreibung=1` ergänzt das Kurzfeedback die Gesamtzahl der Wörter sowie getrennte
+Zählungen für Zeichensetzungs- und Rechtschreibfehler. `Satzbau=1` ergänzt die Zahl der
+Satzbaufehler. Beide Modi können einzeln oder gemeinsam verwendet werden:
+
+```` markdown
+Aufgabe: Erkläre, warum Eis auf flüssigem Wasser schwimmt.
+
+<!-- data-solution-button="off" data-llm-textarea="5" -->
+[[Antwort]]
+```text @LLMQuiz.question(0.66;solution=1;feedback=1;operator=erklaeren;Rechtschreibung=1;Satzbau=1,`Erkläre, warum Eis auf flüssigem Wasser schwimmt.`)
+Eis besitzt eine geringere Dichte als flüssiges Wasser. Beim Gefrieren entsteht eine
+offene Kristallstruktur, die mehr Volumen einnimmt.
+```
+````
+
+Der echte Aufgabenwortlaut steht bei `@LLMQuiz.question` nach dem Komma als zweiter
+Makroparameter. Enthält er ein Komma, schützen die Backticks den vollständigen Text vor der
+Parametertrennung.
+
+Die Wortzahl wird im Browser nach einer festen Segmentierungsregel bestimmt und ist deshalb keine
+Modellschätzung. Die Fehlerzahlen stammen dagegen aus einer konservativen Prüfung durch das lokal
+ausgeführte Quality-Modell. Sie sind Hinweise für die Überarbeitung, keine verbindliche Korrektur:
+Weder Rechtschreibung, Zeichensetzung noch Satzbau verändern für sich die fachliche
+Richtig/Falsch-Entscheidung.
+
+Für die Fehlerzählung muss das Quality-Modell lokal verfügbar sein; bei Bedarf gelten dafür
+dieselben Download-, Cache- und WebGPU-Bedingungen wie für die gründliche Inhaltsprüfung. Ist diese
+Prüfung nicht verfügbar oder liefert sie kein gültiges Ergebnis, bleibt die deterministisch
+ermittelte Wortzahl sichtbar. Die angeforderten Fehlerzahlen werden dann als nicht verfügbar
+gekennzeichnet und nicht fälschlich mit null angegeben.
 
 ## Modelle, Laden und Cache
 
@@ -345,17 +420,19 @@ eingeschaltete Kurzfeedback angezeigt:
 
 Aufgabe 1: Erkläre, warum Eis auf flüssigem Wasser schwimmt.
 
+
 <!-- data-solution-button="off" data-llm-textarea="5" -->
 [[Antwort]]
 [[?]] Hinweis
-```text @LLMQuiz(0.66;solution=1;feedback=1;operator=erklaeren)
+```text @LLMQuiz(0.66;solution=1;feedback=1;Rechtschreibung=1;Satzbau=1)
 Beim Gefrieren entsteht eine besondere Molekülstruktur, durch die Eis eine geringere
 Dichte als flüssiges Wasser hat. Deshalb schwimmt Eis auf Wasser.
 ```
 
+
 Eine sinngleiche Antwort darf andere Wörter verwenden:
 
-> Wasser hat eine größere Dichte als Eis, da Eis durch die Wasserstoffbrückenbindung sich beim Gefrieren besonders anordnet und somit mehr Volumen pro Molekül braucht. Durch die geringere Dichte von Eis schwimmt es auf dem Wasser.
+> Wasser hat eine größere Dichte als Eis da Eis durch die Wasserstoffbrückenbindung sich beim Gefrieren besonders anordnet und somit mehr Volumen pro Molekül braucht. Durch die geringere Dichte von Eis schwimmt es auf dem Wasser.
 
 Eine umgekehrte Kernaussage muss falsch bleiben:
 

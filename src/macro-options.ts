@@ -5,6 +5,8 @@ export interface LLMQuizMacroOptions {
   solution: boolean
   feedback: boolean
   operator: string | null
+  rechtschreibung: boolean
+  satzbau: boolean
 }
 
 const DEFAULT_OPTIONS: LLMQuizMacroOptions = {
@@ -12,6 +14,8 @@ const DEFAULT_OPTIONS: LLMQuizMacroOptions = {
   solution: true,
   feedback: false,
   operator: null,
+  rechtschreibung: false,
+  satzbau: false,
 }
 
 const DECIMAL_PATTERN = /^(?:0(?:\.\d+)?|1(?:\.0+)?)$/u
@@ -28,7 +32,10 @@ function parsePassThreshold(value: string): number {
   return threshold
 }
 
-function parseBooleanOption(name: "solution" | "feedback", value: string): boolean {
+function parseBooleanOption(
+  name: "solution" | "feedback" | "rechtschreibung" | "satzbau",
+  value: string,
+): boolean {
   switch (value.toLowerCase()) {
     case "1":
     case "true":
@@ -89,7 +96,10 @@ export function parseMacroOptions(source: string): LLMQuizMacroOptions {
 
   const seen = new Set<string>()
   for (const part of parts) {
-    const match = /^(solution|feedback|operator)\s*=\s*(\S+)$/iu.exec(part)
+    const match =
+      /^(solution|feedback|operator|rechtschreibung|satzbau)\s*=\s*(\S+)$/iu.exec(
+        part,
+      )
     if (!match) {
       throw new Error(`Unbekannte oder ungültige Makrooption: "${part}".`)
     }
@@ -98,6 +108,8 @@ export function parseMacroOptions(source: string): LLMQuizMacroOptions {
       | "solution"
       | "feedback"
       | "operator"
+      | "rechtschreibung"
+      | "satzbau"
     if (seen.has(name)) {
       throw new Error(`Die Makrooption ${name} wurde mehrfach angegeben.`)
     }
@@ -107,6 +119,12 @@ export function parseMacroOptions(source: string): LLMQuizMacroOptions {
     } else {
       options[name] = parseBooleanOption(name, match[2]!)
     }
+  }
+
+  if ((options.rechtschreibung || options.satzbau) && !options.feedback) {
+    throw new Error(
+      "Rechtschreibung oder Satzbau benötigen feedback=1, damit die Sprachstatistik angezeigt wird.",
+    )
   }
 
   return options

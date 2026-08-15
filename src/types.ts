@@ -41,15 +41,49 @@ export type LearnerFeedbackCode =
   | "unclear"
   | "too-colloquial"
   | "operator-not-met"
+  | "operator-check-unavailable"
+  | "language-analysis"
+  | "language-analysis-unavailable"
 
 export type RuntimeDevice = "wasm" | "webgpu"
 export type RuntimeDType = "q8" | "fp32" | "fp16" | "q4" | "q4f16"
+
+export type OperatorRequirementPolicy =
+  | "not-required"
+  | "required"
+  | "task-dependent"
+
+export interface OperatorResponseContract {
+  /** The kind of response the learner is expected to produce. */
+  product: string
+  /** Required rhetorical or logical ordering; the task wording controls its concrete scope. */
+  organization: readonly string[]
+  evidencePolicy: OperatorRequirementPolicy
+  procedurePolicy: OperatorRequirementPolicy
+  /** Boundaries that must not be invented from the operator verb alone. */
+  constraints: readonly string[]
+}
+
+export interface OperatorCriterion {
+  id: string
+  label: string
+  requirement: string
+  priority: number
+  required: boolean
+  feedback: {
+    de: string
+    en: string
+  }
+}
 
 export interface OperatorRubric {
   id: string
   label: string
   aliases: readonly string[]
   minAnswerCharacters: number
+  responseContract: OperatorResponseContract
+  criteria: readonly OperatorCriterion[]
+  /** Flat compatibility view used by older API consumers and prompt integrations. */
   requirements: readonly string[]
   operatorFeedback: {
     de: string
@@ -98,6 +132,29 @@ export interface EvaluationRequest {
   uncertaintyMargin?: number
   contrastiveMargin?: number
   minAnswerCharacters?: number
+  languageAnalysis?: LanguageAnalysisOptions
+}
+
+export interface LanguageAnalysisOptions {
+  /** Count spelling and punctuation errors separately. */
+  spelling?: boolean
+  /** Count sentence-structure errors. */
+  syntax?: boolean
+}
+
+export interface NormalizedLanguageAnalysisOptions {
+  spelling: boolean
+  syntax: boolean
+}
+
+export interface LanguageAnalysisResult
+  extends NormalizedLanguageAnalysisOptions {
+  status: "completed" | "unavailable"
+  /** Deterministic Unicode-aware word count. */
+  wordCount: number
+  spellingErrors?: number
+  punctuationErrors?: number
+  syntaxErrors?: number
 }
 
 export type EvaluationProgressPhase =
@@ -131,6 +188,7 @@ export interface NormalizedEvaluationRequest {
   uncertaintyMargin: number
   contrastiveMargin: number
   minAnswerCharacters: number
+  languageAnalysis?: NormalizedLanguageAnalysisOptions
 }
 
 export interface NliScores {
@@ -164,10 +222,16 @@ export interface CriterionResult extends NliScores {
   judgeDecision?: QualityDecision
   judgeFeedbackCode?: QualityFeedbackCode
   judgeConfidence?: number
+  /** Missing operator criterion reported by the quality model after runtime validation. */
+  operatorCriterionId?: string
 }
 
+export type EvaluationDiagnosticCode =
+  | Exclude<QualityFeedbackCode, "none">
+  | "operator-check-unavailable"
+
 export interface EvaluationDiagnostic {
-  code: Exclude<QualityFeedbackCode, "none">
+  code: EvaluationDiagnosticCode
   confidence?: number
   source: "deterministic" | "compact" | "quality"
   severity: "blocking" | "advisory"
@@ -183,6 +247,8 @@ export interface EvaluationResult {
   answer: string
   operator?: OperatorRubric
   diagnostic?: EvaluationDiagnostic
+  /** Optional advisory language statistics; never changes `passed`. */
+  languageAnalysis?: LanguageAnalysisResult
   durationMs: number
   model: {
     id: string

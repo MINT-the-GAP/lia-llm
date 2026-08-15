@@ -17,10 +17,14 @@ import { registerQuizTextareas } from "./quiz-textarea.ts"
 import { registerQuizPresenceElement } from "./quiz-presence-element.ts"
 import { QualityEvaluator } from "./quality-evaluator.ts"
 import { parseCriteria } from "./scoring.ts"
-import { registerSolutionElement, showSolution } from "./solution-element.ts"
+import {
+  registerResultSeparatorElement,
+  registerSolutionElement,
+  showSolution,
+} from "./solution-element.ts"
 import type { LiaLLMApi } from "./types.ts"
 
-const VERSION = "0.4.1"
+const VERSION = "0.5.0"
 
 interface LiaLLMGlobal {
   LiaLLM?: LiaLLMApi
@@ -62,6 +66,7 @@ registerQuizPresenceElement(() => {
 })
 registerFeedbackElement()
 registerSolutionElement()
+registerResultSeparatorElement()
 
 export {
   AutomaticEvaluator,

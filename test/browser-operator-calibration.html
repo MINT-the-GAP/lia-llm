@@ -1,0 +1,150 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>lia-llm operator calibration</title>
+<script src="../dist/index.js"></script>
+<pre id="output">starting</pre>
+<script>
+const cases = [
+  {
+    operator: "erklaeren",
+    question: "Erkläre, warum Eis auf flüssigem Wasser schwimmt.",
+    reference: "Beim Gefrieren entsteht eine offene Kristallstruktur. Dadurch nimmt Eis bei gleicher Masse mehr Volumen ein, besitzt eine geringere Dichte als Wasser und schwimmt.",
+    answer: "Die offene Kristallstruktur vergrößert beim Gefrieren das Volumen. Dadurch sinkt die Dichte unter die von Wasser, weshalb Eis schwimmt.",
+    expected: true
+  },
+  {
+    operator: "erklaeren",
+    question: "Erkläre, warum Eis auf flüssigem Wasser schwimmt.",
+    reference: "Beim Gefrieren entsteht eine offene Kristallstruktur. Dadurch nimmt Eis bei gleicher Masse mehr Volumen ein, besitzt eine geringere Dichte als Wasser und schwimmt.",
+    answer: "Eis hat eine geringere Dichte als flüssiges Wasser und schwimmt.",
+    expected: false,
+    expectedDiagnostic: "operator-not-met"
+  },
+  {
+    operator: "erlaeutern",
+    question: "Erläutere an Beispielen den Unterschied zwischen direkter und indirekter Proportionalität.",
+    reference: "Bei direkter Proportionalität bleibt der Quotient konstant, etwa wenn doppelte Stückzahl den doppelten Preis kostet. Bei indirekter Proportionalität bleibt das Produkt konstant, etwa wenn doppelte Geschwindigkeit die halbe Fahrzeit bewirkt.",
+    answer: "Direkt proportional bedeutet einen konstanten Quotienten: Verdoppelt sich die Stückzahl, verdoppelt sich der Preis. Indirekt proportional bedeutet ein konstantes Produkt: Doppelte Geschwindigkeit halbiert die Fahrzeit.",
+    expected: true
+  },
+  {
+    operator: "erlaeutern",
+    question: "Erläutere an Beispielen den Unterschied zwischen direkter und indirekter Proportionalität.",
+    reference: "Bei direkter Proportionalität bleibt der Quotient konstant, etwa wenn doppelte Stückzahl den doppelten Preis kostet. Bei indirekter Proportionalität bleibt das Produkt konstant, etwa wenn doppelte Geschwindigkeit die halbe Fahrzeit bewirkt.",
+    answer: "Bei direkter Proportionalität ist der Quotient konstant, bei indirekter Proportionalität das Produkt.",
+    expected: false,
+    expectedDiagnostic: "operator-not-met"
+  },
+  {
+    operator: "beschreiben",
+    question: "Beschreibe den Blutweg vom rechten Vorhof bis zur Aorta in der richtigen Reihenfolge.",
+    reference: "Vom rechten Vorhof fließt das Blut in die rechte Kammer, durch die Lungenarterie zur Lunge, über die Lungenvenen in den linken Vorhof, weiter in die linke Kammer und schließlich durch die Aorta.",
+    answer: "Zuerst gelangt das Blut vom rechten Vorhof in die rechte Kammer. Danach fließt es über die Lungenarterie zur Lunge, über die Lungenvenen zum linken Vorhof, in die linke Kammer und zuletzt in die Aorta.",
+    expected: true
+  },
+  {
+    operator: "beschreiben",
+    question: "Beschreibe den Blutweg vom rechten Vorhof bis zur Aorta in der richtigen Reihenfolge.",
+    reference: "Vom rechten Vorhof fließt das Blut in die rechte Kammer, durch die Lungenarterie zur Lunge, über die Lungenvenen in den linken Vorhof, weiter in die linke Kammer und schließlich durch die Aorta.",
+    answer: "Rechter Vorhof, Aorta, Lungenvene, rechte Kammer, linker Vorhof, Lunge und linke Kammer sind beteiligt.",
+    expected: false,
+    expectedDiagnostic: "operator-not-met"
+  },
+  {
+    operator: "begruenden",
+    question: "Begründe, warum jedes Quadrat auch ein Rechteck ist.",
+    reference: "Ein Rechteck ist ein Viereck mit vier rechten Winkeln. Ein Quadrat besitzt vier rechte Winkel und erfüllt daher die Definition eines Rechtecks.",
+    answer: "Ein Rechteck ist durch vier rechte Winkel definiert. Da jedes Quadrat vier rechte Winkel besitzt, erfüllt es diese Definition und ist somit ein Rechteck.",
+    expected: true
+  },
+  {
+    operator: "begruenden",
+    question: "Begründe, warum jedes Quadrat auch ein Rechteck ist.",
+    reference: "Ein Rechteck ist ein Viereck mit vier rechten Winkeln. Ein Quadrat besitzt vier rechte Winkel und erfüllt daher die Definition eines Rechtecks.",
+    answer: "Jedes Quadrat ist auch ein Rechteck.",
+    expected: false,
+    expectedDiagnostic: "operator-not-met"
+  },
+  {
+    operator: "vergleichen",
+    question: "Vergleiche Quadrat und Rechteck hinsichtlich Seitenlängen und Winkeln.",
+    reference: "Beide besitzen vier rechte Winkel. Beim Quadrat sind alle vier Seiten gleich lang, beim Rechteck müssen nur die jeweils gegenüberliegenden Seiten gleich lang sein.",
+    answer: "Beide Figuren haben vier rechte Winkel. Beim Quadrat sind jedoch alle vier Seiten gleich lang, während beim Rechteck nur die gegenüberliegenden Seiten gleich lang sein müssen.",
+    expected: true
+  },
+  {
+    operator: "vergleichen",
+    question: "Vergleiche Quadrat und Rechteck hinsichtlich Seitenlängen und Winkeln.",
+    reference: "Beide besitzen vier rechte Winkel. Beim Quadrat sind alle vier Seiten gleich lang, beim Rechteck müssen nur die jeweils gegenüberliegenden Seiten gleich lang sein.",
+    answer: "Ein Quadrat hat vier rechte Winkel und vier gleich lange Seiten. Ein Rechteck hat vier rechte Winkel und gegenüberliegende gleich lange Seiten.",
+    expected: false,
+    expectedDiagnostic: "operator-not-met"
+  },
+  {
+    operator: "beurteilen",
+    question: "Beurteile die Aussage: Der Würfel ist fair, weil bei zwölf Würfen zweimal eine Sechs fiel.",
+    reference: "Zwei Sechsen in zwölf Würfen entsprechen zwar dem Erwartungswert eines fairen Würfels. Die Stichprobe ist aber zu klein, um daraus zuverlässig auf Fairness zu schließen. Die Aussage ist daher nicht hinreichend belegt.",
+    answer: "Die beobachteten zwei Sechsen entsprechen zwar dem Erwartungswert. Zwölf Würfe sind jedoch eine zu kleine Stichprobe für einen belastbaren Fairnessnachweis; die Aussage ist deshalb nicht hinreichend belegt.",
+    expected: true
+  },
+  {
+    operator: "beurteilen",
+    question: "Beurteile die Aussage: Der Würfel ist fair, weil bei zwölf Würfen zweimal eine Sechs fiel.",
+    reference: "Zwei Sechsen in zwölf Würfen entsprechen zwar dem Erwartungswert eines fairen Würfels. Die Stichprobe ist aber zu klein, um daraus zuverlässig auf Fairness zu schließen. Die Aussage ist daher nicht hinreichend belegt.",
+    answer: "Die Aussage stimmt, der Würfel ist fair.",
+    expected: false,
+    expectedDiagnostic: "operator-not-met"
+  }
+]
+
+window.addEventListener("lia-llm:download-consent", event => {
+  event.detail?.respond?.(true)
+})
+window.__liaCalibrationDone = false
+window.__liaCalibration = []
+window.__liaCalibrationExpected = cases.length
+
+;(async () => {
+  try {
+    for (let index = 0; index < cases.length; index += 1) {
+      const item = cases[index]
+      const result = await window.LiaLLM.evaluate({
+        question: item.question,
+        answer: item.answer,
+        reference: item.reference,
+        operator: item.operator,
+        criterionThreshold: 0.66,
+        contradictionThreshold: 0.65
+      })
+      const compactFeedback = window.LiaLLM.formatResult(result, "de-DE")
+      const qualityUsed = result.model.task === "generative-assessment"
+      const diagnosticMatches =
+        !item.expectedDiagnostic ||
+        result.diagnostic?.code === item.expectedDiagnostic
+      window.__liaCalibration.push({
+        case: index + 1,
+        operator: item.operator,
+        expected: item.expected,
+        passed: result.passed,
+        status: result.status,
+        diagnostic: result.diagnostic?.code,
+        model: result.model,
+        matches:
+          result.passed === item.expected &&
+          result.operator?.id === item.operator &&
+          qualityUsed &&
+          diagnosticMatches,
+        compactFeedbackHasCriteria:
+          /Gesamtantwort|Bestätigung:|Sicher bestätigte Abdeckung/.test(compactFeedback)
+      })
+      document.querySelector("#output").textContent =
+        JSON.stringify(window.__liaCalibration, null, 2)
+    }
+  } catch (error) {
+    window.__liaCalibrationError =
+      error instanceof Error ? error.stack : String(error)
+  } finally {
+    window.__liaCalibrationDone = true
+  }
+})()
+</script>

@@ -39,3 +39,31 @@ export function registerSolutionElement(): void {
 
   customElements.define("lia-llm-solution", LiaLLMSolutionElement)
 }
+
+export function registerResultSeparatorElement(): void {
+  if (
+    typeof customElements === "undefined" ||
+    typeof HTMLElement === "undefined" ||
+    customElements.get("lia-llm-result-separator")
+  ) {
+    return
+  }
+
+  class LiaLLMResultSeparatorElement extends HTMLElement {
+    connectedCallback(): void {
+      this.setAttribute("role", "separator")
+      this.setAttribute("aria-orientation", "horizontal")
+      this.classList.add("lia-link")
+      this.style.display = "block"
+      this.style.inlineSize = "100%"
+      this.style.blockSize = "0"
+      this.style.borderBlockStart = "1px solid currentColor"
+      this.style.marginBlock = "1rem 1.5rem"
+    }
+  }
+
+  customElements.define(
+    "lia-llm-result-separator",
+    LiaLLMResultSeparatorElement,
+  )
+}
