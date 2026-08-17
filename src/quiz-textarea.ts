@@ -1,11 +1,15 @@
-const SELECTOR = '[data-llm-textarea] input.lia-quiz__input'
+const HOST_TAG = "lia-llm-textarea-host"
+const HOST_SELECTOR = HOST_TAG
 const DEFAULT_ROWS = 5
 const MIN_ROWS = 2
 const MAX_ROWS = 12
 const NATIVE_LINE_BREAK = "\u2028"
+const TEXTAREA_DESCRIPTION_ID = "lia-llm-textarea-description"
 
 interface TextareaProxy {
+  host: HTMLElement
   area: HTMLTextAreaElement
+  description: HTMLSpanElement
   originalStyle: string
   originalAriaHidden: string | null
   originalTabIndex: string | null
@@ -53,6 +57,41 @@ function isEnabled(owner: HTMLElement): boolean {
   return value !== "false" && value !== "0"
 }
 
+function quizForHost(host: HTMLElement): HTMLElement | null {
+  const containingQuiz = host.closest<HTMLElement>(".lia-quiz")
+  if (containingQuiz) return containingQuiz
+
+  const slide = host.closest<HTMLElement>("main.lia-slide__content")
+  if (!slide) return null
+
+  let top = host
+  while (top.parentElement && top.parentElement !== slide) {
+    top = top.parentElement
+  }
+  if (top.parentElement !== slide) return null
+
+  let previous = top.previousElementSibling as HTMLElement | null
+  while (previous) {
+    if (previous.matches(".lia-quiz")) return previous
+    const quizzes = previous.querySelectorAll<HTMLElement>(".lia-quiz")
+    if (quizzes.length > 0) return quizzes[quizzes.length - 1] ?? null
+    previous = previous.previousElementSibling as HTMLElement | null
+  }
+  return null
+}
+
+function ownerForHost(host: HTMLElement): HTMLElement | null {
+  const containingOwner = host.closest<HTMLElement>("[data-llm-textarea]")
+  if (containingOwner) return containingOwner
+  const quiz = quizForHost(host)
+  return quiz?.matches("[data-llm-textarea]") ? quiz : null
+}
+
+function inputForHost(host: HTMLElement): HTMLInputElement | null {
+  const owner = ownerForHost(host)
+  return owner?.querySelector<HTMLInputElement>("input.lia-quiz__input") ?? null
+}
+
 function setNativeValue(input: HTMLInputElement, value: string): void {
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set
   if (setter) setter.call(input, value)
@@ -73,24 +112,70 @@ function dispatchInput(input: HTMLInputElement): void {
   }
 }
 
-function copyAriaAttribute(
-  input: HTMLInputElement,
-  area: HTMLTextAreaElement,
-  name: string,
-): void {
-  const value = input.getAttribute(name)
-  if (value === null) area.removeAttribute(name)
-  else area.setAttribute(name, value)
+function normalizedAccessibleText(value: string | null | undefined): string {
+  return (value ?? "").replace(/\s+/gu, " ").trim()
+}
+
+function ariaReferenceText(input: HTMLInputElement, attribute: string): string {
+  const ids = (input.getAttribute(attribute) ?? "").trim().split(/\s+/u)
+  const texts = ids
+    .map((id) =>
+      normalizedAccessibleText(input.ownerDocument.getElementById(id)?.textContent),
+    )
+    .filter(Boolean)
+  return [...new Set(texts)].join(" ")
+}
+
+function accessibleNameForInput(input: HTMLInputElement): string {
+  const referenced = ariaReferenceText(input, "aria-labelledby")
+  if (referenced) return referenced
+
+  const direct = normalizedAccessibleText(input.getAttribute("aria-label"))
+  if (direct) return direct
+
+  const labels = Array.from(input.labels ?? [], (label) =>
+    normalizedAccessibleText(label.textContent),
+  ).filter(Boolean)
+  return labels.join(" ") || "Quizantwort"
+}
+
+function accessibleDescriptionForInput(input: HTMLInputElement): string {
+  const texts = [
+    ariaReferenceText(input, "aria-describedby"),
+    normalizedAccessibleText(input.getAttribute("aria-description")),
+  ]
+  if (
+    input.getAttribute("aria-invalid") === "true" ||
+    input.classList.contains("is-failure")
+  ) {
+    texts.push(ariaReferenceText(input, "aria-errormessage"))
+  }
+  return [...new Set(texts.filter(Boolean))].join(" ")
 }
 
 function syncPresentation(input: HTMLInputElement, proxy: TextareaProxy): void {
-  const { area } = proxy
+  const { area, description } = proxy
   if (area.disabled !== input.disabled) area.disabled = input.disabled
+  const owner = ownerForHost(proxy.host)
+  const placeholder =
+    owner?.getAttribute("data-llm-placeholder") ??
+    input.placeholder ??
+    "Antwort eingeben …"
+  if (area.placeholder !== placeholder) area.placeholder = placeholder
 
   const className = `${input.className} lia-llm-textarea`.trim()
   if (area.className !== className) area.className = className
-  copyAriaAttribute(input, area, "aria-describedby")
-  copyAriaAttribute(input, area, "aria-labelledby")
+  area.setAttribute("aria-label", accessibleNameForInput(input))
+  area.removeAttribute("aria-labelledby")
+
+  const descriptionText = accessibleDescriptionForInput(input)
+  description.textContent = descriptionText
+  if (descriptionText) {
+    area.setAttribute("aria-describedby", TEXTAREA_DESCRIPTION_ID)
+  } else {
+    area.removeAttribute("aria-describedby")
+  }
+  area.removeAttribute("aria-errormessage")
 
   const invalid = input.getAttribute("aria-invalid")
   if (invalid !== null) area.setAttribute("aria-invalid", invalid)
@@ -115,18 +200,117 @@ function visuallyHide(input: HTMLInputElement): void {
   input.style.setProperty("border", "0", "important")
 }
 
-function enhance(input: HTMLInputElement): void {
+function createShadowTextarea(
+  host: HTMLElement,
+): { area: HTMLTextAreaElement; description: HTMLSpanElement } | null {
+  let root = host.shadowRoot
+  if (!root) {
+    try {
+      root = host.attachShadow({ mode: "open" })
+    } catch {
+      return null
+    }
+  }
+
+  let style = root.querySelector<HTMLStyleElement>(
+    "style[data-lia-llm-textarea-style]",
+  )
+  if (!style) {
+    style = document.createElement("style")
+    style.setAttribute("data-lia-llm-textarea-style", "")
+    style.textContent = `
+:host {
+  box-sizing: border-box;
+  display: block;
+  inline-size: 100%;
+}
+:host([hidden]) { display: none; }
+textarea {
+  display: block;
+  box-sizing: border-box;
+  inline-size: 100%;
+  block-size: auto;
+  min-block-size: 0;
+  resize: vertical;
+  border: 1px solid currentColor;
+  border-radius: .2rem;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: 1.45;
+  padding: .45rem .55rem;
+}
+textarea:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+.lia-llm-textarea-description {
+  position: absolute;
+  inline-size: 1px;
+  block-size: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+textarea.is-success:not(.is-failure) {
+  border-color: color-mix(in srgb, #00875a 72%, currentColor);
+  border-width: 2px;
+  box-shadow: inset 4px 0 0 color-mix(in srgb, #00875a 72%, currentColor);
+}
+textarea.is-failure,
+textarea[aria-invalid="true"] {
+  border-color: color-mix(in srgb, #d32f2f 76%, currentColor);
+  border-width: 2px;
+  box-shadow: inset 4px 0 0 color-mix(in srgb, #d32f2f 76%, currentColor);
+}
+`
+    root.prepend(style)
+  }
+
+  let description = root.querySelector<HTMLSpanElement>(
+    "#" + TEXTAREA_DESCRIPTION_ID,
+  )
+  if (!description) {
+    description = document.createElement("span")
+    description.id = TEXTAREA_DESCRIPTION_ID
+    description.className = "lia-llm-textarea-description"
+    root.append(description)
+  }
+
+  let area = root.querySelector<HTMLTextAreaElement>(
+    "textarea[data-lia-llm-textarea]",
+  )
+  if (!area) {
+    area = document.createElement("textarea")
+    area.setAttribute("data-lia-llm-textarea", "")
+    root.append(area)
+  }
+  return { area, description }
+}
+
+function enhance(host: HTMLElement): void {
+  const input = inputForHost(host)
+  const owner = ownerForHost(host)
+  if (!input || !owner || !isEnabled(owner)) {
+    host.hidden = true
+    return
+  }
+
   const current = proxies.get(input)
-  if (current?.area.isConnected) {
+  if (current?.host === host && current.area.isConnected) {
+    host.hidden = false
     syncPresentation(input, current)
     return
   }
   if (current) removeProxy(input, current)
 
-  const owner = input.closest<HTMLElement>("[data-llm-textarea]")
-  if (!owner || !isEnabled(owner)) return
-
-  const area = document.createElement("textarea")
+  const shadowTextarea = createShadowTextarea(host)
+  if (!shadowTextarea) return
+  const { area, description } = shadowTextarea
   const hadFocus = document.activeElement === input
   area.rows = parseTextareaRows(owner.getAttribute("data-llm-textarea"))
   area.maxLength = 8_000
@@ -135,19 +319,11 @@ function enhance(input: HTMLInputElement): void {
     owner.getAttribute("data-llm-placeholder") ?? input.placeholder ?? "Antwort eingeben …"
   area.spellcheck = true
   area.wrap = "soft"
-  area.setAttribute("aria-label", input.getAttribute("aria-label") ?? "Quizantwort")
-  area.setAttribute("data-lia-llm-textarea", "")
-  area.style.setProperty("display", "block")
-  area.style.setProperty("box-sizing", "border-box")
-  area.style.setProperty("width", "100%")
-  area.style.setProperty("height", "auto", "important")
-  area.style.setProperty("min-height", "0", "important")
-  area.style.setProperty("resize", "vertical")
-  area.style.setProperty("font", "inherit")
-  area.style.setProperty("line-height", "1.45")
-
+  area.setAttribute("aria-label", accessibleNameForInput(input))
   const proxy: TextareaProxy = {
+    host,
     area,
+    description,
     originalStyle: input.style.cssText,
     originalAriaHidden: input.getAttribute("aria-hidden"),
     originalTabIndex: input.getAttribute("tabindex"),
@@ -193,7 +369,7 @@ function enhance(input: HTMLInputElement): void {
   input.setAttribute("tabindex", "-1")
 
   proxies.set(input, proxy)
-  input.after(area)
+  host.hidden = false
   syncPresentation(input, proxy)
   if (hadFocus) area.focus()
 }
@@ -205,6 +381,7 @@ function removeProxy(input: HTMLInputElement, proxy: TextareaProxy): void {
   input.removeEventListener("input", proxy.onNativeInput)
   input.removeEventListener("focus", proxy.onNativeFocus)
   proxy.area.remove()
+  proxy.host.hidden = true
 
   if (input.isConnected) {
     input.style.cssText = proxy.originalStyle
@@ -219,11 +396,12 @@ function removeProxy(input: HTMLInputElement, proxy: TextareaProxy): void {
 
 function reconcile(): void {
   for (const [input, proxy] of [...proxies]) {
-    const owner = input.closest<HTMLElement>("[data-llm-textarea]")
+    const owner = ownerForHost(proxy.host)
     if (
       !input.isConnected ||
+      !proxy.host.isConnected ||
       !proxy.area.isConnected ||
-      !input.matches(SELECTOR) ||
+      inputForHost(proxy.host) !== input ||
       !owner ||
       !isEnabled(owner)
     ) {
@@ -234,7 +412,7 @@ function reconcile(): void {
     }
   }
 
-  document.querySelectorAll<HTMLInputElement>(SELECTOR).forEach(enhance)
+  document.querySelectorAll<HTMLElement>(HOST_SELECTOR).forEach(enhance)
 }
 
 function scheduleReconciliation(): void {
@@ -258,6 +436,27 @@ export function registerQuizTextareas(): void {
   registrationStarted = true
   globalRegistration.__liaLlmQuizTextareasRegistered = true
 
+  if (
+    typeof customElements !== "undefined" &&
+    typeof HTMLElement !== "undefined" &&
+    !customElements.get(HOST_TAG)
+  ) {
+    class LiaLLMTextareaHostElement extends HTMLElement {
+      connectedCallback(): void {
+        this.hidden = true
+        scheduleReconciliation()
+      }
+
+      disconnectedCallback(): void {
+        for (const [input, proxy] of proxies) {
+          if (proxy.host === this) removeProxy(input, proxy)
+        }
+      }
+    }
+
+    customElements.define(HOST_TAG, LiaLLMTextareaHostElement)
+  }
+
   const start = (): void => {
     if (observer || !document.documentElement) return
     reconcile()
@@ -269,16 +468,23 @@ export function registerQuizTextareas(): void {
           shouldReconcile = true
           continue
         }
+        if (mutation.type === "characterData") {
+          shouldReconcile = true
+          continue
+        }
 
         if (mutation.target instanceof HTMLInputElement) {
           const proxy = proxies.get(mutation.target)
           if (proxy) syncPresentation(mutation.target, proxy)
-          if (proxy || mutation.target.matches(SELECTOR)) shouldReconcile = true
+          if (proxy || mutation.target.matches("input.lia-quiz__input")) {
+            shouldReconcile = true
+          }
           continue
         }
 
         if (
-          mutation.attributeName === "data-llm-textarea" &&
+          (mutation.attributeName === "data-llm-textarea" ||
+            mutation.attributeName === "data-llm-placeholder") &&
           mutation.target instanceof HTMLElement
         ) {
           shouldReconcile = true
@@ -289,9 +495,23 @@ export function registerQuizTextareas(): void {
     })
     observer.observe(document.documentElement, {
       childList: true,
+      characterData: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ["class", "disabled", "value", "data-llm-textarea"],
+      attributeFilter: [
+        "aria-describedby",
+        "aria-description",
+        "aria-errormessage",
+        "aria-invalid",
+        "aria-label",
+        "aria-labelledby",
+        "class",
+        "disabled",
+        "placeholder",
+        "value",
+        "data-llm-textarea",
+        "data-llm-placeholder",
+      ],
     })
   }
 

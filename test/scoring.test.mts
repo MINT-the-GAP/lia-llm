@@ -15,7 +15,16 @@ import {
 import { AutomaticEvaluator } from "../src/automatic-evaluator.ts"
 import { countWords } from "../src/language-analysis.ts"
 import {
+  PINNED_RUNTIME_ASSET_BASE_URL,
+  RUNTIME_ASSETS,
+  RUNTIME_ASSET_CACHE_KEY,
+  checkDefaultCompactModelCache,
+  clearRuntimeAssetCache,
+  defaultCompactModelCacheUrls,
+  isValidRuntimeAsset,
   finalizeCompactAssessment,
+  loadRuntimeAsset,
+  openRuntimeAssetCache,
   resolveRuntimeAssetBaseUrl,
   SemanticEvaluator,
 } from "../src/evaluator.ts"
@@ -40,9 +49,16 @@ import {
 import { progressPercent } from "../src/load-overlay.ts"
 import { ResilientFetchSession } from "../src/resilient-fetch.ts"
 import {
+  createQualityAppConfig,
+  QUALITY_MODEL_ID,
+  QUALITY_MODEL_LIB_REVISION,
+  QUALITY_MODEL_REVISION,
+} from "../src/quality-model-config.ts"
+import {
   classifyQualityDecision,
   completeLanguageAnalysis,
   finalizeQualityAssessment,
+  hasPinnedQualityWeightsInCache,
   LANGUAGE_ANALYSIS_SYSTEM_PROMPT,
   parseLanguageJudgeOutput,
   parseQualityJudgeOutput,
@@ -61,6 +77,138 @@ import type {
   NliEvidence,
   RuntimeStatus,
 } from "../src/types.ts"
+
+function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength,
+  ) as ArrayBuffer
+}
+
+function requestUrl(request: RequestInfo | URL): string {
+  if (request instanceof Request) return request.url
+  if (request instanceof URL) return request.href
+  return request
+}
+
+class MemoryRuntimeCache {
+  private readonly entries = new Map<string, Response>()
+  deleteCalls = 0
+  readonly matchedUrls: string[] = []
+  keysCalls = 0
+  putCalls = 0
+  rejectPut = false
+  lastPutUrl: string | undefined
+
+  asCache(): Cache {
+    return this as unknown as Cache
+  }
+
+  seed(url: string, response: Response): void {
+    this.entries.set(url, response.clone())
+  }
+
+  has(url: string): boolean {
+    return this.entries.has(url)
+  }
+
+  async match(request: RequestInfo | URL): Promise<Response | undefined> {
+    const url = requestUrl(request)
+    this.matchedUrls.push(url)
+    return this.entries.get(url)?.clone()
+  }
+
+  async put(request: RequestInfo | URL, response: Response): Promise<void> {
+    this.putCalls += 1
+    this.lastPutUrl = requestUrl(request)
+    if (this.rejectPut) throw new Error("Cache quota exceeded")
+    this.entries.set(this.lastPutUrl, response.clone())
+  }
+
+  async delete(request: RequestInfo | URL): Promise<boolean> {
+    this.deleteCalls += 1
+    return this.entries.delete(requestUrl(request))
+  }
+
+  async keys(): Promise<readonly Request[]> {
+    this.keysCalls += 1
+    return Array.from(this.entries.keys(), (url) => new Request(url))
+  }
+}
+
+class RuntimeCacheStorageStub {
+  readonly cachesByName = new Map<string, MemoryRuntimeCache>()
+  readonly deletedNames: string[] = []
+  readonly rejectedOpenNames = new Set<string>()
+
+  asCacheStorage(): CacheStorage {
+    return this as unknown as CacheStorage
+  }
+
+  async keys(): Promise<string[]> {
+    return [...this.cachesByName.keys()]
+  }
+
+  async open(name: string): Promise<Cache> {
+    if (this.rejectedOpenNames.has(name)) {
+      throw new Error(`Cache ${name} is unavailable`)
+    }
+    let cache = this.cachesByName.get(name)
+    if (!cache) {
+      cache = new MemoryRuntimeCache()
+      this.cachesByName.set(name, cache)
+    }
+    return cache.asCache()
+  }
+
+  async delete(name: string): Promise<boolean> {
+    this.deletedNames.push(name)
+    return this.cachesByName.delete(name)
+  }
+}
+
+async function withCacheStorage<T>(
+  storage: CacheStorage,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "caches")
+  Object.defineProperty(globalThis, "caches", {
+    configurable: true,
+    value: storage,
+  })
+  try {
+    return await operation()
+  } finally {
+    if (descriptor) {
+      Object.defineProperty(globalThis, "caches", descriptor)
+    } else {
+      Reflect.deleteProperty(globalThis, "caches")
+    }
+  }
+}
+
+async function withGlobalFetch<T>(
+  replacement: (
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ) => Promise<Response>,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "fetch")
+  Object.defineProperty(globalThis, "fetch", {
+    configurable: true,
+    value: replacement,
+  })
+  try {
+    return await operation()
+  } finally {
+    if (descriptor) {
+      Object.defineProperty(globalThis, "fetch", descriptor)
+    } else {
+      Reflect.deleteProperty(globalThis, "fetch")
+    }
+  }
+}
 
 test("parseCriteria accepts a compact separator syntax", () => {
   assert.deepEqual(parseCriteria("Energieumwandlung || Stoffbilanz\nSauerstoff"), [
@@ -1181,8 +1329,501 @@ test("runtime asset base resolution survives LiaScript blob execution", () => {
       [],
       ["http://localhost:8001/liascript/index.51910d37.js"],
     ),
-    undefined,
+    PINNED_RUNTIME_ASSET_BASE_URL,
   )
+})
+
+test("runtime asset base resolution uses explicit overrides before discovery", () => {
+  assert.equal(
+    resolveRuntimeAssetBaseUrl(
+      "https://example.org/templates/lia-llm/dist/index.js",
+      [
+        "https://raw.githubusercontent.com/MINT-the-GAP/lia-llm/refs/heads/main/README.md",
+      ],
+      [],
+      "https://assets.example.test/custom-ort",
+    ),
+    "https://assets.example.test/custom-ort/",
+  )
+  assert.equal(
+    resolveRuntimeAssetBaseUrl(
+      "https://example.org/templates/lia-llm/dist/index.js",
+      [],
+      [],
+      "blob:https://example.org/not-a-network-base",
+    ),
+    "https://example.org/templates/lia-llm/dist/",
+  )
+})
+
+test("runtime asset base resolution recognizes only lia-llm sources", () => {
+  const pinnedRevision = "0838e25f4da7ec8267637966ef747ef568517748"
+  assert.equal(
+    resolveRuntimeAssetBaseUrl(
+      "blob:https://liascript.github.io/course/bundle",
+      [
+        "https://example.org/unrelated/dist/index.js",
+        `https://raw.githubusercontent.com/MINT-the-GAP/lia-llm/${pinnedRevision}/README.md`,
+      ],
+      ["https://liascript.github.io/course/index.aca4b632.js"],
+    ),
+    `https://raw.githubusercontent.com/MINT-the-GAP/lia-llm/${pinnedRevision}/dist/`,
+  )
+  assert.equal(
+    resolveRuntimeAssetBaseUrl(
+      "blob:https://liascript.github.io/course/bundle",
+      ["https://cdn.example.org/templates/lia-llm/dist/index.js?cache=1"],
+      [],
+    ),
+    "https://cdn.example.org/templates/lia-llm/dist/",
+  )
+  assert.equal(
+    resolveRuntimeAssetBaseUrl(
+      "blob:https://liascript.github.io/course/bundle",
+      ["https://example.org/unrelated/dist/index.js"],
+      ["https://liascript.github.io/course/index.aca4b632.js"],
+    ),
+    PINNED_RUNTIME_ASSET_BASE_URL,
+  )
+  assert.equal(
+    resolveRuntimeAssetBaseUrl(
+      "blob:https://liascript.github.io/course/bundle",
+      [
+        "https://raw.githubusercontent.com/MINT-the-GAP/lia-llm/refs/heads/main/dist/index.js",
+        "https://raw.githubusercontent.com/MINT-the-GAP/lia-llm/refs/heads/main/README.md",
+      ],
+      [],
+    ),
+    PINNED_RUNTIME_ASSET_BASE_URL,
+  )
+})
+
+test("pinned runtime assets pass exact integrity checks", async () => {
+  const factory = readFileSync(
+    new URL("../dist/ort-wasm-simd-threaded.asyncify.mjs", import.meta.url),
+  )
+  const wasm = readFileSync(
+    new URL("../dist/ort-wasm-simd-threaded.asyncify.wasm", import.meta.url),
+  )
+
+  assert.equal(
+    await isValidRuntimeAsset(
+      "ort-wasm-simd-threaded.asyncify.mjs",
+      exactArrayBuffer(factory),
+    ),
+    true,
+  )
+  assert.equal(
+    await isValidRuntimeAsset(
+      "ort-wasm-simd-threaded.asyncify.wasm",
+      exactArrayBuffer(wasm),
+    ),
+    true,
+  )
+  assert.match(RUNTIME_ASSET_CACHE_KEY, /0838e25f4da7ec8267637966ef747ef568517748/u)
+})
+
+test("runtime integrity checks reject portal HTML and truncated WASM", async () => {
+  const portal = new TextEncoder().encode(
+    "<!doctype html><title>Schulproxy-Anmeldung</title>",
+  )
+  const truncatedWasm = new Uint8Array([
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+  ])
+  assert.equal(
+    await isValidRuntimeAsset(
+      "ort-wasm-simd-threaded.asyncify.mjs",
+      portal.buffer,
+    ),
+    false,
+  )
+  assert.equal(
+    await isValidRuntimeAsset(
+      "ort-wasm-simd-threaded.asyncify.wasm",
+      truncatedWasm.buffer,
+    ),
+    false,
+  )
+})
+
+test("quality weights and WebLLM runtime both use immutable revisions", () => {
+  const appConfig = createQualityAppConfig({
+    model_list: [
+      {
+        model_id: QUALITY_MODEL_ID,
+        model: "https://huggingface.co/mlc-ai/example/resolve/main/",
+        model_lib:
+          "https://raw.githubusercontent.com/mlc-ai/binary-mlc-llm-libs/main/" +
+          "web-llm-models/v0_2_84/base/example.wasm",
+      },
+    ],
+  } as never)
+  const record = appConfig.model_list[0]
+  assert.match(record?.model ?? "", new RegExp(QUALITY_MODEL_REVISION, "u"))
+  assert.match(
+    record?.model_lib ?? "",
+    new RegExp(QUALITY_MODEL_LIB_REVISION, "u"),
+  )
+  assert.doesNotMatch(record?.model_lib ?? "", /\/main\//u)
+})
+
+test("quality weight cache probe uses only manifest-directed matches", async () => {
+  const modelUrl =
+    `https://huggingface.co/mlc-ai/${QUALITY_MODEL_ID}/resolve/` +
+    `${QUALITY_MODEL_REVISION}/`
+  const manifestUrl = new URL("tensor-cache.json", modelUrl).href
+  const firstWeight = new URL("params/params_shard_0.bin", modelUrl).href
+  const secondWeight = new URL("params_shard_1.bin", modelUrl).href
+  const storage = new RuntimeCacheStorageStub()
+  const modelCache = new MemoryRuntimeCache()
+  storage.cachesByName.set("webllm/model", modelCache)
+  let fetchCalls = 0
+
+  await withCacheStorage(storage.asCacheStorage(), async () =>
+    withGlobalFetch(
+      async () => {
+        fetchCalls += 1
+        throw new Error("quality cache inspection must not fetch")
+      },
+      async () => {
+        assert.equal(await hasPinnedQualityWeightsInCache(modelUrl), false)
+
+        modelCache.seed(
+          manifestUrl,
+          new Response(
+            JSON.stringify({
+              metadata: { ParamSize: 2 },
+              records: [
+                { dataPath: "params/params_shard_0.bin", nbytes: 4 },
+                { dataPath: "params_shard_1.bin", nbytes: 4 },
+              ],
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          ),
+        )
+        modelCache.seed(firstWeight, new Response("first", { status: 200 }))
+        assert.equal(await hasPinnedQualityWeightsInCache(modelUrl), false)
+
+        modelCache.seed(secondWeight, new Response("second", { status: 200 }))
+        assert.equal(await hasPinnedQualityWeightsInCache(modelUrl), true)
+      },
+    ),
+  )
+
+  assert.equal(fetchCalls, 0)
+  assert.equal(modelCache.keysCalls, 0)
+  assert.deepEqual(modelCache.matchedUrls, [
+    manifestUrl,
+    manifestUrl,
+    firstWeight,
+    secondWeight,
+    manifestUrl,
+    firstWeight,
+    secondWeight,
+  ])
+})
+
+test("quality weight cache probe rejects invalid manifests without I/O fallback", async () => {
+  const modelUrl =
+    `https://huggingface.co/mlc-ai/${QUALITY_MODEL_ID}/resolve/` +
+    `${QUALITY_MODEL_REVISION}/`
+  const manifestUrl = new URL("tensor-cache.json", modelUrl).href
+  const storage = new RuntimeCacheStorageStub()
+  const modelCache = new MemoryRuntimeCache()
+  storage.cachesByName.set("webllm/model", modelCache)
+  const invalidManifests = [
+    "{",
+    JSON.stringify({}),
+    JSON.stringify({ records: [] }),
+    JSON.stringify({ records: [{ dataPath: "" }] }),
+    JSON.stringify({ records: [{ dataPath: 42 }] }),
+    JSON.stringify({ records: [{ dataPath: "../outside.bin" }] }),
+    JSON.stringify({ records: [{ dataPath: "https://example.test/weight.bin" }] }),
+  ]
+  let fetchCalls = 0
+
+  await withCacheStorage(storage.asCacheStorage(), async () =>
+    withGlobalFetch(
+      async () => {
+        fetchCalls += 1
+        throw new Error("quality cache inspection must not fetch")
+      },
+      async () => {
+        for (const manifest of invalidManifests) {
+          modelCache.seed(
+            manifestUrl,
+            new Response(manifest, {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            }),
+          )
+          assert.equal(await hasPinnedQualityWeightsInCache(modelUrl), false)
+        }
+      },
+    ),
+  )
+  assert.equal(fetchCalls, 0)
+  assert.equal(modelCache.keysCalls, 0)
+})
+
+test("quality cache I/O failure is reported without fetching", async () => {
+  const storage = new RuntimeCacheStorageStub()
+  storage.rejectedOpenNames.add("webllm/model")
+  let fetchCalls = 0
+
+  await withCacheStorage(storage.asCacheStorage(), async () =>
+    withGlobalFetch(
+      async () => {
+        fetchCalls += 1
+        throw new Error("quality cache inspection must not fetch")
+      },
+      async () => {
+        const evaluator = new QualityEvaluator()
+        const info = await evaluator.getCacheInfo()
+        assert.equal(info.cached, false)
+        assert.equal(info.downloadCached, false)
+        assert.equal(info.filesCached, 0)
+        assert.equal(info.filesTotal, 4)
+        assert.match(info.error ?? "", /webllm\/model is unavailable/u)
+      },
+    ),
+  )
+  assert.equal(fetchCalls, 0)
+})
+
+test("SemanticEvaluator degrades cleanly when CacheStorage is absent", async () => {
+  assert.equal(typeof caches, "undefined")
+  const evaluator = new SemanticEvaluator()
+  const cache = await evaluator.getCacheInfo()
+  assert.equal(cache.supported, false)
+  assert.equal(cache.cached, false)
+  assert.equal(cache.estimatedBytes, 378_614_439)
+})
+
+test("default compact cache probe is pinned, network-free, and exact", async () => {
+  const storage = new RuntimeCacheStorageStub()
+  const modelCache = new MemoryRuntimeCache()
+  storage.cachesByName.set("transformers-cache", modelCache)
+  const pinnedUrls = defaultCompactModelCacheUrls()
+  assert.equal(pinnedUrls.length, 4)
+  for (const url of pinnedUrls) {
+    const mainUrl = url.replace(/\/resolve\/[^/]+\//u, "/resolve/main/")
+    modelCache.seed(mainUrl, new Response("main alias", { status: 200 }))
+  }
+
+  let fetchCalls = 0
+  await withCacheStorage(storage.asCacheStorage(), async () =>
+    withGlobalFetch(
+      async () => {
+        fetchCalls += 1
+        throw new Error("cache inspection must not fetch")
+      },
+      async () => {
+        const fresh = await checkDefaultCompactModelCache()
+        assert.equal(fresh.allCached, false)
+        assert.equal(fresh.files.filter((file) => file.cached).length, 0)
+
+        modelCache.seed(pinnedUrls[0]!, new Response("config", { status: 200 }))
+        modelCache.seed(
+          pinnedUrls[2]!,
+          new Response("tokenizer", { status: 200 }),
+        )
+        const partial = await checkDefaultCompactModelCache()
+        assert.equal(partial.allCached, false)
+        assert.equal(partial.files.filter((file) => file.cached).length, 2)
+
+        modelCache.seed(
+          pinnedUrls[1]!,
+          new Response("tokenizer config", { status: 200 }),
+        )
+        modelCache.seed(pinnedUrls[3]!, new Response("onnx", { status: 200 }))
+        const full = await checkDefaultCompactModelCache()
+        assert.equal(full.allCached, true)
+        assert.equal(full.files.filter((file) => file.cached).length, 4)
+      },
+    ),
+  )
+
+  assert.equal(fetchCalls, 0)
+  assert.equal(modelCache.matchedUrls.length, 12)
+  assert.equal(
+    modelCache.matchedUrls.every((url) => pinnedUrls.includes(url)),
+    true,
+  )
+  assert.equal(
+    modelCache.matchedUrls.some((url) => /\/resolve\/main\//u.test(url)),
+    false,
+  )
+})
+
+test("default compact cache I/O failure is reported without fetching", async () => {
+  const storage = new RuntimeCacheStorageStub()
+  storage.rejectedOpenNames.add("transformers-cache")
+  let fetchCalls = 0
+
+  await withCacheStorage(storage.asCacheStorage(), async () =>
+    withGlobalFetch(
+      async () => {
+        fetchCalls += 1
+        throw new Error("cache inspection must not fetch")
+      },
+      async () => {
+        const evaluator = new SemanticEvaluator()
+        const info = await evaluator.getCacheInfo()
+        assert.equal(info.supported, false)
+        assert.equal(info.cached, false)
+        assert.equal(info.downloadCached, false)
+        assert.equal(info.filesCached, 0)
+        assert.equal(info.filesTotal, 6)
+        assert.match(info.error ?? "", /transformers-cache is unavailable/u)
+      },
+    ),
+  )
+  assert.equal(fetchCalls, 0)
+})
+
+test("verified runtime download is cached and reused without network", async () => {
+  const asset = RUNTIME_ASSETS[0]
+  const source = exactArrayBuffer(
+    readFileSync(
+      new URL("../dist/ort-wasm-simd-threaded.asyncify.mjs", import.meta.url),
+    ),
+  )
+  const cache = new MemoryRuntimeCache()
+  let onlineCalls = 0
+  const online = new ResilientFetchSession(async () => {
+    onlineCalls += 1
+    return new Response(source.slice(0), {
+      status: 200,
+      headers: { "Content-Length": String(source.byteLength) },
+    })
+  })
+
+  const cold = await loadRuntimeAsset(online, cache.asCache(), asset)
+  assert.equal(cold.byteLength, source.byteLength)
+  assert.equal(onlineCalls, 1)
+  assert.equal(cache.putCalls, 1)
+  assert.ok(cache.lastPutUrl)
+  assert.equal(cache.has(cache.lastPutUrl), true)
+
+  let offlineCalls = 0
+  const offline = new ResilientFetchSession(async () => {
+    offlineCalls += 1
+    throw new Error("network blocked")
+  })
+  const warm = await loadRuntimeAsset(offline, cache.asCache(), asset)
+  assert.equal(warm.byteLength, source.byteLength)
+  assert.equal(offlineCalls, 0)
+  assert.equal(cache.putCalls, 1)
+})
+
+test("runtime loading remains online-capable when cache open or put fails", async () => {
+  const asset = RUNTIME_ASSETS[0]
+  const source = exactArrayBuffer(
+    readFileSync(
+      new URL("../dist/ort-wasm-simd-threaded.asyncify.mjs", import.meta.url),
+    ),
+  )
+  const storage = new RuntimeCacheStorageStub()
+  storage.rejectedOpenNames.add(RUNTIME_ASSET_CACHE_KEY)
+
+  await withCacheStorage(storage.asCacheStorage(), async () => {
+    const unavailable = await openRuntimeAssetCache()
+    assert.equal(unavailable, null)
+    const session = new ResilientFetchSession(async () =>
+      new Response(source.slice(0), { status: 200 }),
+    )
+    const loaded = await loadRuntimeAsset(session, unavailable, asset)
+    assert.equal(loaded.byteLength, source.byteLength)
+  })
+
+  const rejectingCache = new MemoryRuntimeCache()
+  rejectingCache.rejectPut = true
+  const session = new ResilientFetchSession(async () =>
+    new Response(source.slice(0), { status: 200 }),
+  )
+  const loaded = await loadRuntimeAsset(session, rejectingCache.asCache(), asset)
+  assert.equal(loaded.byteLength, source.byteLength)
+  assert.equal(rejectingCache.putCalls, 1)
+  assert.equal(
+    rejectingCache.lastPutUrl
+      ? rejectingCache.has(rejectingCache.lastPutUrl)
+      : false,
+    false,
+  )
+})
+
+test("invalid cached runtime is replaced and corrupt HTTP 200 is never cached", async () => {
+  const asset = RUNTIME_ASSETS[0]
+  const source = exactArrayBuffer(
+    readFileSync(
+      new URL("../dist/ort-wasm-simd-threaded.asyncify.mjs", import.meta.url),
+    ),
+  )
+  const cache = new MemoryRuntimeCache()
+  const prime = new ResilientFetchSession(async () =>
+    new Response(source.slice(0), { status: 200 }),
+  )
+  await loadRuntimeAsset(prime, cache.asCache(), asset)
+  assert.ok(cache.lastPutUrl)
+
+  const portal = new Uint8Array(asset.byteLength)
+  portal.set(
+    new TextEncoder().encode("<!doctype html><title>Schulproxy</title>"),
+  )
+  cache.seed(cache.lastPutUrl, new Response(portal, { status: 200 }))
+  let replacementCalls = 0
+  const replacement = new ResilientFetchSession(async () => {
+    replacementCalls += 1
+    return new Response(source.slice(0), { status: 200 })
+  })
+  await loadRuntimeAsset(replacement, cache.asCache(), asset)
+  assert.equal(cache.deleteCalls, 1)
+  assert.equal(replacementCalls, 1)
+  assert.equal(cache.putCalls, 2)
+  assert.equal(cache.has(cache.lastPutUrl), true)
+
+  const emptyCache = new MemoryRuntimeCache()
+  const corruptNetwork = new ResilientFetchSession(async () =>
+    new Response(portal.slice(0), {
+      status: 200,
+      headers: { "Content-Length": String(portal.byteLength) },
+    }),
+  )
+  await assert.rejects(
+    loadRuntimeAsset(corruptNetwork, emptyCache.asCache(), asset),
+    /kein .*ONNX-Artefakt/u,
+  )
+  assert.equal(emptyCache.putCalls, 0)
+})
+
+test("runtime prefix clear counts successful generations despite one failure", async () => {
+  const storage = new RuntimeCacheStorageStub()
+  const current = new MemoryRuntimeCache()
+  current.seed("https://cache.test/current/mjs", new Response("mjs"))
+  current.seed("https://cache.test/current/wasm", new Response("wasm"))
+  const broken = new MemoryRuntimeCache()
+  broken.seed("https://cache.test/broken/wasm", new Response("wasm"))
+  const legacy = new MemoryRuntimeCache()
+  legacy.seed("https://cache.test/legacy/wasm", new Response("wasm"))
+  const unrelated = new MemoryRuntimeCache()
+  unrelated.seed("https://cache.test/unrelated", new Response("keep"))
+  const brokenName = "lia-llm-ort-runtime-broken"
+  const legacyName = "lia-llm-ort-runtime-legacy"
+  storage.cachesByName.set(RUNTIME_ASSET_CACHE_KEY, current)
+  storage.cachesByName.set(brokenName, broken)
+  storage.cachesByName.set(legacyName, legacy)
+  storage.cachesByName.set("unrelated-cache", unrelated)
+  storage.rejectedOpenNames.add(brokenName)
+
+  await withCacheStorage(storage.asCacheStorage(), async () => {
+    assert.equal(await clearRuntimeAssetCache(), 3)
+  })
+  assert.deepEqual(storage.deletedNames, [RUNTIME_ASSET_CACHE_KEY, legacyName])
+  assert.equal(storage.cachesByName.has(RUNTIME_ASSET_CACHE_KEY), false)
+  assert.equal(storage.cachesByName.has(legacyName), false)
+  assert.equal(storage.cachesByName.has(brokenName), true)
+  assert.equal(storage.cachesByName.has("unrelated-cache"), true)
 })
 
 test("compact content cannot finally pass an operator task", () => {
@@ -1280,6 +1921,161 @@ test("operator-not-met blocks fractional quality passing but keeps low confidenc
     qualityDiagnosticForCriteria([uncertainOperator])?.code,
     "unclear",
   )
+})
+
+test("automatic evaluator does not wait for persistent storage and records later outcomes", async () => {
+  const createMockEvaluator = (engine: "compact" | "quality") => {
+    const status: RuntimeStatus = {
+      phase: "idle",
+      assessmentEngine: engine,
+      modelId: `${engine}-persistence-test`,
+      revision: "test",
+      device: engine === "quality" ? "webgpu" : "wasm",
+      dtype: engine === "quality" ? "q4f16" : "q8",
+    }
+    return {
+      preloadCalls: 0,
+      getStatus() {
+        return status
+      },
+      async getCacheInfo(): Promise<ModelCacheInfo> {
+        return {
+          supported: true,
+          cached: false,
+          downloadCached: false,
+          filesCached: 0,
+          filesTotal: 1,
+          estimatedBytes: 1,
+        }
+      },
+      async preload() {
+        this.preloadCalls += 1
+        status.phase = "ready"
+        return status
+      },
+    }
+  }
+
+  const navigatorObject = globalThis.navigator
+  const gpuDescriptor = Object.getOwnPropertyDescriptor(navigatorObject, "gpu")
+  const storageDescriptor = Object.getOwnPropertyDescriptor(
+    navigatorObject,
+    "storage",
+  )
+  const connectionDescriptor = Object.getOwnPropertyDescriptor(
+    navigatorObject,
+    "connection",
+  )
+  const installStorage = (
+    persist: () => Promise<boolean>,
+  ): void => {
+    Object.defineProperty(navigatorObject, "storage", {
+      configurable: true,
+      value: {
+        persisted: async () => false,
+        persist,
+      },
+    })
+  }
+  Object.defineProperty(navigatorObject, "gpu", {
+    configurable: true,
+    value: undefined,
+  })
+  Object.defineProperty(navigatorObject, "connection", {
+    configurable: true,
+    value: { type: "wifi", saveData: false },
+  })
+
+  try {
+    let pendingPersistCalls = 0
+    installStorage(() => {
+      pendingPersistCalls += 1
+      return new Promise<boolean>(() => undefined)
+    })
+    const pendingCompact = createMockEvaluator("compact")
+    const pendingQuality = createMockEvaluator("quality")
+    const pendingAutomatic = new AutomaticEvaluator(
+      pendingCompact as never,
+      pendingQuality as never,
+    )
+    let timeout!: ReturnType<typeof setTimeout>
+    try {
+      const loaded = await Promise.race([
+        pendingAutomatic.preload(),
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error("model preload waited for persist()")),
+            1_000,
+          )
+        }),
+      ])
+      assert.equal(loaded.phase, "ready")
+    } finally {
+      clearTimeout(timeout)
+    }
+    assert.equal(pendingCompact.preloadCalls, 1)
+    await pendingAutomatic.preload()
+    assert.equal(pendingPersistCalls, 1)
+
+    for (const persistent of [true, false]) {
+      let reportPersistRequested!: () => void
+      const persistRequested = new Promise<void>((resolve) => {
+        reportPersistRequested = resolve
+      })
+      let resolvePersist!: (value: boolean) => void
+      const persistResult = new Promise<boolean>((resolve) => {
+        resolvePersist = resolve
+      })
+      let persistCalls = 0
+      installStorage(() => {
+        persistCalls += 1
+        reportPersistRequested()
+        return persistResult
+      })
+
+      const compact = createMockEvaluator("compact")
+      const quality = createMockEvaluator("quality")
+      const automatic = new AutomaticEvaluator(
+        compact as never,
+        quality as never,
+      )
+      await automatic.preload()
+      await persistRequested
+      resolvePersist(persistent)
+      await new Promise((resolve) => setTimeout(resolve, 0))
+
+      const cache = await automatic.getCacheInfo()
+      assert.equal(cache.persistent, persistent)
+      assert.equal(persistCalls, 1)
+    }
+
+    installStorage(async () => {
+      throw new Error("persist permission rejected")
+    })
+    const rejectedAutomatic = new AutomaticEvaluator(
+      createMockEvaluator("compact") as never,
+      createMockEvaluator("quality") as never,
+    )
+    await rejectedAutomatic.preload()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal((await rejectedAutomatic.getCacheInfo()).persistent, false)
+  } finally {
+    if (gpuDescriptor) {
+      Object.defineProperty(navigatorObject, "gpu", gpuDescriptor)
+    } else {
+      delete (navigatorObject as Navigator & { gpu?: unknown }).gpu
+    }
+    if (storageDescriptor) {
+      Object.defineProperty(navigatorObject, "storage", storageDescriptor)
+    } else {
+      delete (navigatorObject as Navigator & { storage?: StorageManager }).storage
+    }
+    if (connectionDescriptor) {
+      Object.defineProperty(navigatorObject, "connection", connectionDescriptor)
+    } else {
+      delete (navigatorObject as Navigator & { connection?: unknown }).connection
+    }
+  }
 })
 
 test("automatic evaluator prefers cached quality, keeps uncached quality in the background, and falls back", async () => {
@@ -2189,6 +2985,10 @@ test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper
     /\n@LLMQuiz_\n([\s\S]*?)\n@end/u,
   )?.[1]
   assert.ok(macro)
+  assert.match(
+    macro,
+    /<lia-llm-textarea-host hidden><\/lia-llm-textarea-host>/u,
+  )
   assert.match(
     macro,
     /<lia-llm-feedback id="lia-llm-feedback-@0"><\/lia-llm-feedback>/u,

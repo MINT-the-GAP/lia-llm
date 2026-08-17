@@ -5,21 +5,67 @@
   .lia-link { color: rgb(var(--color-highlight)); }
 </style>
 <body>
-  <div id="textarea-owner" data-llm-textarea="5">
-    <input class="lia-quiz__input" aria-label="Testantwort">
-  </div>
+  <main class="lia-slide__content">
+    <div
+      id="textarea-owner"
+      class="lia-quiz"
+      data-llm-textarea="5"
+      data-elm-owned-container
+    >
+      <span id="textarea-label" hidden>Ausführliche Begründung</span>
+      <span id="textarea-help" hidden>Begründe in mehreren Sätzen.</span>
+      <span id="textarea-error" hidden>Die Antwort ist noch nicht korrekt.</span>
+      <input
+        class="lia-quiz__input is-failure"
+        aria-label="Testantwort"
+        aria-labelledby="textarea-label"
+        aria-describedby="textarea-help"
+        aria-errormessage="textarea-error"
+      >
+    </div>
+    <lia-llm-textarea-host
+      id="textarea-host"
+      data-elm-owned-host
+      hidden
+    >elm-owned-placeholder</lia-llm-textarea-host>
+  </main>
   <div id="quiz-layout-probe" class="lia-quiz" data-llm-textarea>
     <ul id="empty-hints-probe" class="lia-quiz__hints"></ul>
   </div>
-  <lia-llm-solution id="solution-probe"></lia-llm-solution>
-  <lia-llm-feedback id="feedback-probe"></lia-llm-feedback>
+  <lia-llm-solution
+    id="solution-probe"
+    data-elm-owned-host
+  >elm-owned-placeholder</lia-llm-solution>
+  <lia-llm-feedback
+    id="feedback-probe"
+    data-elm-owned-host
+  >elm-owned-placeholder</lia-llm-feedback>
   <lia-llm-result-separator id="separator-probe"></lia-llm-result-separator>
-  <lia-llm-activity id="activity-probe" hidden></lia-llm-activity>
-  <lia-llm-activity id="activity-probe-two" hidden></lia-llm-activity>
+  <lia-llm-activity
+    id="activity-probe"
+    data-elm-owned-host
+    hidden
+  >elm-owned-placeholder</lia-llm-activity>
+  <lia-llm-activity
+    id="activity-probe-two"
+    data-elm-owned-host
+    hidden
+  >elm-owned-placeholder</lia-llm-activity>
   <script>
   window.__liaCalibration = []
   window.__liaCalibrationExpected = 1
   window.__liaCalibrationDone = false
+  const elmOwnedLightDom = new Map(
+    Array.from(
+      document.querySelectorAll(
+        "[data-elm-owned-host], [data-elm-owned-container]"
+      ),
+      host => [host, Array.from(host.childNodes)]
+    )
+  )
+  for (const nodes of elmOwnedLightDom.values()) {
+    for (const node of nodes) node.created_by_elm = true
+  }
   document.documentElement.style.setProperty(
     "--color-highlight",
     "17, 34, 51"
@@ -69,6 +115,8 @@
         "0.66;solution=1;feedback=1;operator=erklaeren;Rechtschreibung=1;Satzbau=1"
       )
       const solution = document.getElementById("solution-probe")
+      const solutionContent = () =>
+        solution?.shadowRoot?.querySelector(".lia-llm-solution-content")
       const solutionStartedHidden =
         solution?.hidden === true && solution?.style.display === "none"
       window.LiaLLM?.showSolution(
@@ -81,7 +129,8 @@
         "Sprachstatistik:\nWörter insgesamt: 2"
       )
       const feedbackPreservesLineBreaks =
-        feedbackProbe?.textContent ===
+        feedbackProbe?.shadowRoot?.querySelector(".lia-llm-feedback-content")
+          ?.textContent ===
           "Sprachstatistik:\nWörter insgesamt: 2" &&
         feedbackProbe?.style.whiteSpace === "pre-line"
       const feedbackUsesCompactThemeStyle =
@@ -99,9 +148,8 @@
         separatorProbe?.getAttribute("role") === "separator" &&
         separatorProbe?.getAttribute("aria-orientation") === "horizontal" &&
         separatorProbe?.classList.contains("lia-link") === true &&
-        separatorProbe?.style.cssText.includes(
-          "border-block-start: 1px solid currentcolor"
-        ) &&
+        separatorProbe?.style.borderBlockStartWidth === "1px" &&
+        separatorProbe?.style.borderBlockStartStyle === "solid" &&
         getComputedStyle(separatorProbe).borderTopColor ===
           "rgb(17, 34, 51)" &&
         parseFloat(separatorProbe?.style.marginBlockStart || "") === 1 &&
@@ -112,7 +160,7 @@
       const solutionHidesWhenCleared =
         solution?.hidden === true &&
         solution?.style.display === "none" &&
-        solution?.textContent === ""
+        solutionContent()?.textContent === ""
       window.LiaLLM?.showSolution(
         "solution-probe",
         "Erster Absatz.\n\nZweiter Absatz."
@@ -153,11 +201,12 @@
         activity?.hidden === false &&
         activity?.style.display === "grid" &&
         activity?.getAttribute("aria-busy") === "true" &&
-        activity?.querySelector(".lia-llm-activity-label")?.textContent ===
+        activity?.shadowRoot?.querySelector(".lia-llm-activity-label")
+          ?.textContent ===
           "Kompaktmodell wird vorbereitet …" &&
-        activity?.querySelector(".lia-llm-activity-track")
+        activity?.shadowRoot?.querySelector(".lia-llm-activity-track")
           ?.getAttribute("role") === "progressbar" &&
-        !activity?.querySelector(".lia-llm-activity-track")
+        !activity?.shadowRoot?.querySelector(".lia-llm-activity-track")
           ?.hasAttribute("aria-valuenow")
       window.LiaLLM?.showActivity(
         "activity-probe",
@@ -167,7 +216,8 @@
       window.LiaLLM?.showActivity("activity-probe", "run-one", "")
       const staleRunCannotHideCurrent =
         activity?.hidden === false &&
-        activity?.querySelector(".lia-llm-activity-label")?.textContent ===
+        activity?.shadowRoot?.querySelector(".lia-llm-activity-label")
+          ?.textContent ===
           "Antwort wird gründlich geprüft …"
       window.LiaLLM?.showActivity(
         "activity-probe-two",
@@ -180,14 +230,64 @@
         activity?.style.display === "none" &&
         activity?.getAttribute("aria-busy") === "false" &&
         secondActivity?.hidden === false &&
-        secondActivity?.querySelector(".lia-llm-activity-label")?.textContent ===
+        secondActivity?.shadowRoot?.querySelector(".lia-llm-activity-label")
+          ?.textContent ===
           "Antwort wird schnell geprüft …"
       window.LiaLLM?.showActivity("activity-probe-two", "second-run", "")
       const activityClears = secondActivity?.hidden === true
 
-      const area = document.querySelector(
-        "#textarea-owner textarea[data-lia-llm-textarea]"
+      const textareaOwner = document.getElementById("textarea-owner")
+      const textareaHost = document.getElementById("textarea-host")
+      const area = textareaHost?.shadowRoot?.querySelector(
+        "textarea[data-lia-llm-textarea]"
       )
+      const textareaLivesOnlyInShadow =
+        area?.getRootNode() === textareaHost?.shadowRoot &&
+        textareaOwner?.querySelector("textarea") === null
+      const descriptionId = area?.getAttribute("aria-describedby")
+      const localDescription = descriptionId
+        ? textareaHost?.shadowRoot?.getElementById(descriptionId)
+        : null
+      const textareaAriaStaysInsideShadow =
+        area?.getAttribute("aria-label") === "Ausführliche Begründung" &&
+        area?.hasAttribute("aria-labelledby") === false &&
+        localDescription?.getRootNode() === textareaHost?.shadowRoot &&
+        localDescription?.textContent ===
+          "Begründe in mehreren Sätzen. Die Antwort ist noch nicht korrekt."
+      const textareaStyle =
+        area instanceof HTMLTextAreaElement ? getComputedStyle(area) : null
+      const textareaValidationIsVisible =
+        area?.classList.contains("is-failure") === true &&
+        area?.getAttribute("aria-invalid") === "true" &&
+        parseFloat(textareaStyle?.borderLeftWidth ?? "0") >= 2 &&
+        textareaStyle?.boxShadow !== "none"
+      const helpTextNode =
+        document.getElementById("textarea-help")?.firstChild
+      if (helpTextNode instanceof Text) {
+        helpTextNode.data = "Nutze die Dreiecksungleichung."
+      }
+      await new Promise(resolve => setTimeout(resolve, 0))
+      const textareaAriaTracksTextChanges =
+        localDescription?.textContent ===
+        "Nutze die Dreiecksungleichung. Die Antwort ist noch nicht korrekt."
+      const elmManagedLightDomIsUntouched =
+        Array.from(elmOwnedLightDom).every(([host, nodes]) =>
+          host.childNodes.length === nodes.length &&
+          nodes.every(
+            (node, index) =>
+              host.childNodes[index] === node &&
+              node.created_by_elm === true
+          )
+        )
+      if (area instanceof HTMLTextAreaElement) {
+        area.value = "Erster Absatz.\n\nZweiter Absatz."
+        area.dispatchEvent(
+          new Event("input", { bubbles: true, composed: true })
+        )
+      }
+      const textareaSyncsParagraphs =
+        textareaOwner?.querySelector("input")?.value ===
+        "Erster Absatz.\u2028\u2028Zweiter Absatz."
       let bubbledKeys = []
       document.body.addEventListener("keydown", event => {
         bubbledKeys.push(event.key)
@@ -196,19 +296,22 @@
       const arrow = new KeyboardEvent("keydown", {
         key: "ArrowLeft",
         bubbles: true,
-        cancelable: true
+        cancelable: true,
+        composed: true
       })
       area?.dispatchEvent(arrow)
       const arrowUp = new KeyboardEvent("keydown", {
         key: "ArrowUp",
         bubbles: true,
-        cancelable: true
+        cancelable: true,
+        composed: true
       })
       area?.dispatchEvent(arrowUp)
       const letter = new KeyboardEvent("keydown", {
         key: "a",
         bubbles: true,
-        cancelable: true
+        cancelable: true,
+        composed: true
       })
       area?.dispatchEvent(letter)
 
@@ -347,6 +450,12 @@
         language?.rechtschreibung === true &&
         language?.satzbau === true &&
         area instanceof HTMLTextAreaElement &&
+        textareaLivesOnlyInShadow &&
+        textareaAriaStaysInsideShadow &&
+        textareaAriaTracksTextChanges &&
+        textareaValidationIsVisible &&
+        textareaSyncsParagraphs &&
+        elmManagedLightDomIsUntouched &&
         !arrow.defaultPrevented &&
         !arrowUp.defaultPrevented &&
         !bubbledKeys.includes("ArrowLeft") &&
@@ -355,7 +464,8 @@
         solutionStartedHidden &&
         solutionBecameVisible &&
         solutionHidesWhenCleared &&
-        solution?.textContent === "Erster Absatz.\n\nZweiter Absatz." &&
+        solutionContent()?.textContent ===
+          "Erster Absatz.\n\nZweiter Absatz." &&
         solution?.hidden === false &&
         solution?.style.whiteSpace === "pre-wrap" &&
         feedbackPreservesLineBreaks &&
@@ -375,8 +485,8 @@
         consentWasVisible &&
         consentResponse === false &&
         overlay?.dataset.consent === "0" &&
-        cacheInfo?.estimatedBytes === 2635000000 &&
-        cacheInfo?.engines?.compact?.estimatedBytes === 355000000 &&
+        cacheInfo?.estimatedBytes === 2658614439 &&
+        cacheInfo?.engines?.compact?.estimatedBytes === 378614439 &&
         cacheInfo?.engines?.quality?.estimatedBytes === 2280000000
       )
       window.__liaCalibration.push({
@@ -386,6 +496,12 @@
         initial,
         named,
         positional,
+        textareaLivesOnlyInShadow,
+        textareaAriaStaysInsideShadow,
+        textareaAriaTracksTextChanges,
+        textareaValidationIsVisible,
+        textareaSyncsParagraphs,
+        elmManagedLightDomIsUntouched,
         solutionStartedHidden,
         solutionBecameVisible,
         solutionHidesWhenCleared,

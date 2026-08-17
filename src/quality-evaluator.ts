@@ -549,6 +549,62 @@ export function finalizeQualityAssessment(
   }
 }
 
+function qualityWeightUrls(
+  manifest: unknown,
+  modelUrl: string,
+): string[] | null {
+  if (typeof manifest !== "object" || manifest === null || Array.isArray(manifest)) {
+    return null
+  }
+  const records = (manifest as { records?: unknown }).records
+  if (!Array.isArray(records) || records.length === 0) return null
+
+  const urls: string[] = []
+  for (const record of records) {
+    if (typeof record !== "object" || record === null || Array.isArray(record)) {
+      return null
+    }
+    const dataPath = (record as { dataPath?: unknown }).dataPath
+    if (typeof dataPath !== "string" || dataPath.trim().length === 0) {
+      return null
+    }
+    let dataUrl: string
+    try {
+      dataUrl = new URL(dataPath, modelUrl).href
+    } catch {
+      return null
+    }
+    if (!dataUrl.startsWith(modelUrl)) return null
+    urls.push(dataUrl)
+  }
+  return [...new Set(urls)]
+}
+
+export async function hasPinnedQualityWeightsInCache(
+  modelUrl: string,
+): Promise<boolean> {
+  if (typeof caches === "undefined") {
+    throw new Error("Browser cache is not available in this environment.")
+  }
+  const modelCache = await caches.open("webllm/model")
+  const manifestUrl = new URL("tensor-cache.json", modelUrl).href
+  const manifestResponse = await modelCache.match(manifestUrl)
+  if (!manifestResponse?.ok) return false
+
+  let manifest: unknown
+  try {
+    manifest = await manifestResponse.json()
+  } catch {
+    return false
+  }
+  const weightUrls = qualityWeightUrls(manifest, modelUrl)
+  if (!weightUrls) return false
+  for (const weightUrl of weightUrls) {
+    if ((await modelCache.match(weightUrl))?.ok !== true) return false
+  }
+  return true
+}
+
 export class QualityEvaluator {
   private phase: RuntimeStatus["phase"] = "idle"
   private loadSource: ModelLoadSource | undefined
@@ -956,10 +1012,7 @@ export class QualityEvaluator {
         ? modelRecord.model
         : `${modelRecord.model}/`
       const configUrl = new URL("mlc-chat-config.json", modelUrl).href
-      weightsCached = await webLlm.hasModelInCache(
-        QUALITY_MODEL_ID,
-        appConfig,
-      )
+      weightsCached = await hasPinnedQualityWeightsInCache(modelUrl)
 
       const configCache = await caches.open("webllm/config")
       const configResponse = await configCache.match(configUrl)
@@ -1044,14 +1097,42 @@ export class QualityEvaluator {
         if (typeof caches === "undefined") return 0
 
         const appConfig = createQualityAppConfig(webLlm.prebuiltAppConfig)
-        const wasCached = await webLlm.hasModelInCache(
-          QUALITY_MODEL_ID,
-          appConfig,
-        ).catch(
-          () => false,
+        const modelRecord = appConfig.model_list.find(
+          (candidate) => candidate.model_id === QUALITY_MODEL_ID,
         )
-        await webLlm.deleteModelAllInfoInCache(QUALITY_MODEL_ID, appConfig)
-        return wasCached ? 1 : 0
+        if (!modelRecord) {
+          throw new Error(
+            `WebLLM enthält keine Konfiguration für ${QUALITY_MODEL_ID}.`,
+          )
+        }
+
+        const modelUrl = modelRecord.model.endsWith("/")
+          ? modelRecord.model
+          : `${modelRecord.model}/`
+        const targets = [
+          {
+            cacheName: "webllm/model",
+            matches: (url: string) => url.startsWith(modelUrl),
+          },
+          {
+            cacheName: "webllm/config",
+            matches: (url: string) => url.startsWith(modelUrl),
+          },
+          {
+            cacheName: "webllm/wasm",
+            matches: (url: string) => url === modelRecord.model_lib,
+          },
+        ] as const
+        let filesDeleted = 0
+        for (const target of targets) {
+          const cache = await caches.open(target.cacheName)
+          for (const request of await cache.keys()) {
+            if (target.matches(request.url) && (await cache.delete(request))) {
+              filesDeleted += 1
+            }
+          }
+        }
+        return filesDeleted
       } finally {
         this.loadSource = undefined
         this.setPhase("idle")

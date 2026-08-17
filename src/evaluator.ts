@@ -105,7 +105,17 @@ function emit<T>(name: string, detail: T): void {
   globalThis.dispatchEvent(new CustomEvent(name, { detail }))
 }
 
-const BUNDLE_RESOURCE_PATTERN = /(?:^|\/)index\.js(?:[?#]|$)/iu
+// Keep the runtime factory and WASM paired with the onnxruntime-web version
+// bundled into this release. Update this immutable ref together with that
+// dependency and the checked-in dist assets.
+export const PINNED_RUNTIME_ASSET_BASE_URL =
+  "https://raw.githubusercontent.com/MINT-the-GAP/lia-llm/0838e25f4da7ec8267637966ef747ef568517748/dist/"
+
+const LIA_LLM_BUNDLE_PATH_PATTERN =
+  /(?:^|\/)lia-llm\/(?:.*\/)?dist\/index\.js$/iu
+const LOCAL_BUNDLE_PATH_PATTERN = /\/dist\/index\.js$/iu
+const RAW_LIA_LLM_SOURCE_PATH_PATTERN =
+  /^\/MINT-the-GAP\/lia-llm\/(refs\/(?:heads|tags)\/.+|[\da-f]{40}|main)\/(README\.md|dist\/index\.js)$/iu
 
 function assetDirectoryUrl(source: string | undefined): string | undefined {
   if (!source) return undefined
@@ -124,37 +134,102 @@ function assetDirectoryUrl(source: string | undefined): string | undefined {
   }
 }
 
-export function resolveRuntimeAssetBaseUrl(
-  currentSource: string | undefined,
-  resourceSources: readonly string[],
-  scriptSources: readonly string[],
-): string | undefined {
-  const currentBase = assetDirectoryUrl(currentSource)
-  if (currentBase) return currentBase
-
-  // LiaScript fetches metadata scripts and executes their source through a
-  // blob URL. The original HTTP URL remains available as a resource timing
-  // entry, so prefer the most recently fetched, un-hashed bundle there.
-  for (let index = resourceSources.length - 1; index >= 0; index -= 1) {
-    const source = resourceSources[index]
-    if (source && BUNDLE_RESOURCE_PATTERN.test(source)) {
-      const base = assetDirectoryUrl(source)
-      if (base) return base
+function explicitAssetBaseUrl(source: string | undefined): string | undefined {
+  if (!source) return undefined
+  try {
+    const url = new URL(source)
+    if (
+      url.protocol === "blob:" ||
+      url.protocol === "data:" ||
+      url.protocol === "javascript:"
+    ) {
+      return undefined
     }
+    url.search = ""
+    url.hash = ""
+    if (!url.pathname.endsWith("/")) url.pathname += "/"
+    return url.href
+  } catch {
+    return undefined
   }
+}
 
-  for (let index = scriptSources.length - 1; index >= 0; index -= 1) {
-    const source = scriptSources[index]
-    if (source && BUNDLE_RESOURCE_PATTERN.test(source)) {
-      const base = assetDirectoryUrl(source)
-      if (base) return base
+function isLoopbackUrl(url: URL): boolean {
+  return (
+    url.hostname === "localhost" ||
+    url.hostname.endsWith(".localhost") ||
+    url.hostname === "127.0.0.1" ||
+    url.hostname === "[::1]"
+  )
+}
+
+function knownRuntimeAssetBaseUrl(source: string | undefined): string | undefined {
+  if (!source) return undefined
+  try {
+    const url = new URL(source)
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined
+
+    if (url.hostname === "raw.githubusercontent.com") {
+      const match = url.pathname.match(RAW_LIA_LLM_SOURCE_PATH_PATTERN)
+      if (!match) return undefined
+      const revision = match[1] ?? ""
+      const sourcePath = match[2] ?? ""
+      if (!/^[\da-f]{40}$/iu.test(revision)) {
+        // A LiaScript import normally exposes refs/heads/main in resource
+        // timing. The runtime must nevertheless stay paired with this bundle.
+        return PINNED_RUNTIME_ASSET_BASE_URL
+      }
+      return sourcePath === "README.md"
+        ? new URL("./dist/", url).href
+        : new URL(".", url).href
     }
+
+    if (
+      LIA_LLM_BUNDLE_PATH_PATTERN.test(url.pathname) ||
+      (isLoopbackUrl(url) && LOCAL_BUNDLE_PATH_PATTERN.test(url.pathname))
+    ) {
+      return new URL(".", url).href
+    }
+
+  } catch {
+    // Ignore malformed resource and script URLs.
   }
   return undefined
 }
 
+export function resolveRuntimeAssetBaseUrl(
+  currentSource: string | undefined,
+  resourceSources: readonly string[],
+  scriptSources: readonly string[],
+  overrideBaseUrl?: string,
+): string {
+  const overrideBase = explicitAssetBaseUrl(overrideBaseUrl)
+  if (overrideBase) return overrideBase
+
+  const currentBase = assetDirectoryUrl(currentSource)
+  if (currentBase) return currentBase
+
+  // LiaScript fetches metadata scripts and executes their source through a
+  // blob URL. Prefer a narrowly matched lia-llm bundle or imported README
+  // when its original URL is still visible in resource timing.
+  for (let index = resourceSources.length - 1; index >= 0; index -= 1) {
+    const source = resourceSources[index]
+    const base = knownRuntimeAssetBaseUrl(source)
+    if (base) return base
+  }
+
+  for (let index = scriptSources.length - 1; index >= 0; index -= 1) {
+    const source = scriptSources[index]
+    const base = knownRuntimeAssetBaseUrl(source)
+    if (base) return base
+  }
+  return PINNED_RUNTIME_ASSET_BASE_URL
+}
+
 const runtimeAssetBaseUrl = (() => {
-  if (typeof document === "undefined") return undefined
+  if (typeof document === "undefined") {
+    return resolveRuntimeAssetBaseUrl(undefined, [], [])
+  }
   const currentSource = (document.currentScript as HTMLScriptElement | null)?.src
   let resourceSources: string[] = []
   try {
@@ -174,12 +249,37 @@ const runtimeAssetBaseUrl = (() => {
 
 const ORT_FACTORY_FILENAME = "ort-wasm-simd-threaded.asyncify.mjs"
 const ORT_WASM_FILENAME = "ort-wasm-simd-threaded.asyncify.wasm"
+const RUNTIME_ASSET_CACHE_PREFIX = "lia-llm-ort-runtime-"
+export const RUNTIME_ASSET_CACHE_KEY =
+  `${RUNTIME_ASSET_CACHE_PREFIX}0838e25f4da7ec8267637966ef747ef568517748`
+
+export const RUNTIME_ASSETS = [
+  {
+    filename: ORT_FACTORY_FILENAME,
+    label: "MJS",
+    contentType: "text/javascript",
+    byteLength: 47_389,
+    sha256: "5959c6733039619c9af710d8e1bae8d6e84402787990637be987c2b1bd6c5fa9",
+  },
+  {
+    filename: ORT_WASM_FILENAME,
+    label: "WASM",
+    contentType: "application/wasm",
+    byteLength: 23_567_050,
+    sha256: "e0c0c6d3e73d43b8a249972f8358f845b08cc16fec3c80efafdf8bed40366786",
+  },
+] as const
+const RUNTIME_ASSET_ESTIMATED_BYTES = RUNTIME_ASSETS.reduce(
+  (total, asset) => total + asset.byteLength,
+  0,
+)
+const COMPACT_CACHE_ESTIMATED_BYTES =
+  DEFAULT_MODEL_ESTIMATED_BYTES + RUNTIME_ASSET_ESTIMATED_BYTES
+
 let localOnnxRuntimePromise: Promise<void> | null = null
 
 function runtimeAssetUrl(filename: string): string {
-  return runtimeAssetBaseUrl
-    ? new URL(filename, runtimeAssetBaseUrl).href
-    : filename
+  return new URL(filename, runtimeAssetBaseUrl).href
 }
 
 function configureLocalOnnxRuntime(): void {
@@ -190,6 +290,220 @@ function configureLocalOnnxRuntime(): void {
   }
 }
 
+interface RuntimeAssetCacheInfo {
+  supported: boolean
+  filesCached: number
+  filesTotal: number
+  allCached: boolean
+  error?: string
+}
+
+export async function openRuntimeAssetCache(): Promise<Cache | null> {
+  if (typeof caches === "undefined") return null
+  try {
+    return await caches.open(RUNTIME_ASSET_CACHE_KEY)
+  } catch {
+    return null
+  }
+}
+
+async function sha256Hex(bytes: ArrayBuffer): Promise<string | null> {
+  try {
+    if (typeof crypto === "undefined") return null
+    const subtle = crypto.subtle
+    if (!subtle) return null
+    const digest = await subtle.digest("SHA-256", bytes)
+    return Array.from(new Uint8Array(digest), (value) =>
+      value.toString(16).padStart(2, "0"),
+    ).join("")
+  } catch {
+    return null
+  }
+}
+
+type RuntimeAssetValidation = "invalid" | "structural" | "verified"
+
+async function validateRuntimeAsset(
+  filename: string,
+  bytes: ArrayBuffer,
+): Promise<RuntimeAssetValidation> {
+  const asset = RUNTIME_ASSETS.find((candidate) => candidate.filename === filename)
+  if (!asset || bytes.byteLength !== asset.byteLength) return "invalid"
+  const view = new Uint8Array(bytes)
+  if (filename === ORT_WASM_FILENAME) {
+    if (
+      !(
+        view[0] === 0x00 &&
+        view[1] === 0x61 &&
+        view[2] === 0x73 &&
+        view[3] === 0x6d &&
+        view[4] === 0x01 &&
+        view[5] === 0x00 &&
+        view[6] === 0x00 &&
+        view[7] === 0x00
+      )
+    ) {
+      return "invalid"
+    }
+  }
+  if (filename === ORT_FACTORY_FILENAME) {
+    const code = new TextDecoder().decode(view)
+    if (
+      !code.startsWith("async function ortWasmThreaded") ||
+      !code.includes("export default ortWasmThreaded")
+    ) {
+      return "invalid"
+    }
+  }
+  const digest = await sha256Hex(bytes)
+  if (digest === null) return "structural"
+  return digest === asset.sha256 ? "verified" : "invalid"
+}
+
+export async function isValidRuntimeAsset(
+  filename: string,
+  bytes: ArrayBuffer,
+): Promise<boolean> {
+  return (await validateRuntimeAsset(filename, bytes)) === "verified"
+}
+
+async function readCachedRuntimeAsset(
+  cache: Cache | null,
+  url: string,
+  filename: string,
+): Promise<ArrayBuffer | null> {
+  if (!cache) return null
+  try {
+    const response = await cache.match(url)
+    if (!response?.ok) return null
+    const bytes = await response.arrayBuffer()
+    const validation = await validateRuntimeAsset(filename, bytes)
+    const asset = RUNTIME_ASSETS.find(
+      (candidate) => candidate.filename === filename,
+    )
+    if (
+      validation === "verified" ||
+      (validation === "structural" &&
+        asset &&
+        response.headers.get("X-Lia-LLM-Runtime-Cache") === "verified" &&
+        response.headers.get("X-Lia-LLM-SHA256") === asset.sha256)
+    ) {
+      return bytes
+    }
+    await cache.delete(url)
+  } catch {
+    // A broken or unavailable cache must not block online loading.
+  }
+  return null
+}
+
+async function cacheRuntimeAsset(
+  cache: Cache | null,
+  url: string,
+  bytes: ArrayBuffer,
+  asset: (typeof RUNTIME_ASSETS)[number],
+): Promise<void> {
+  if (!cache) return
+  try {
+    await cache.put(
+      url,
+      new Response(bytes.slice(0), {
+        status: 200,
+        headers: {
+          "Content-Type": asset.contentType,
+          "Content-Length": String(bytes.byteLength),
+          "X-Lia-LLM-Runtime-Cache": "verified",
+          "X-Lia-LLM-SHA256": asset.sha256,
+        },
+      }),
+    )
+  } catch {
+    // CacheStorage is best effort. The current online run can still continue.
+  }
+}
+
+export async function loadRuntimeAsset(
+  session: ResilientFetchSession,
+  cache: Cache | null,
+  asset: (typeof RUNTIME_ASSETS)[number],
+): Promise<ArrayBuffer> {
+  const url = runtimeAssetUrl(asset.filename)
+  const cached = await readCachedRuntimeAsset(cache, url, asset.filename)
+  if (cached) return cached
+
+  const response = await session.fetch(url)
+  if (!response.ok) {
+    throw new Error(`${asset.label} ${response.status}`)
+  }
+  const bytes = await response.arrayBuffer()
+  const validation = await validateRuntimeAsset(asset.filename, bytes)
+  if (validation === "invalid") {
+    throw new Error(`${asset.label} enthielt kein gültiges ONNX-Artefakt`)
+  }
+  if (validation === "verified") {
+    await cacheRuntimeAsset(cache, url, bytes, asset)
+  }
+  return bytes
+}
+
+async function getRuntimeAssetCacheInfo(): Promise<RuntimeAssetCacheInfo> {
+  const filesTotal = RUNTIME_ASSETS.length
+  if (typeof caches === "undefined") {
+    return { supported: false, filesCached: 0, filesTotal, allCached: false }
+  }
+  try {
+    const cache = await caches.open(RUNTIME_ASSET_CACHE_KEY)
+    const matches = await Promise.all(
+      RUNTIME_ASSETS.map((asset) =>
+        readCachedRuntimeAsset(
+          cache,
+          runtimeAssetUrl(asset.filename),
+          asset.filename,
+        ),
+      ),
+    )
+    const filesCached = matches.filter(Boolean).length
+    return {
+      supported: true,
+      filesCached,
+      filesTotal,
+      allCached: filesCached === filesTotal,
+    }
+  } catch (error) {
+    return {
+      supported: false,
+      filesCached: 0,
+      filesTotal,
+      allCached: false,
+      error: errorMessage(error),
+    }
+  }
+}
+
+export async function clearRuntimeAssetCache(): Promise<number> {
+  if (typeof caches === "undefined") return 0
+  let cacheNames: string[]
+  try {
+    cacheNames = (await caches.keys()).filter((name) =>
+      name.startsWith(RUNTIME_ASSET_CACHE_PREFIX),
+    )
+  } catch {
+    return 0
+  }
+
+  let filesDeleted = 0
+  for (const cacheName of cacheNames) {
+    try {
+      const cache = await caches.open(cacheName)
+      const fileCount = (await cache.keys()).length
+      if (await caches.delete(cacheName)) filesDeleted += fileCount
+    } catch {
+      // Keep counting other versioned runtime caches independently.
+    }
+  }
+  return filesDeleted
+}
+
 async function prepareLocalOnnxRuntime(
   session: ResilientFetchSession,
 ): Promise<void> {
@@ -197,19 +511,20 @@ async function prepareLocalOnnxRuntime(
   if (!wasmOptions || wasmOptions.wasmBinary) return
   if (!localOnnxRuntimePromise) {
     localOnnxRuntimePromise = (async () => {
-      const [factoryResponse, wasmResponse] = await Promise.all([
-        session.fetch(runtimeAssetUrl(ORT_FACTORY_FILENAME)),
-        session.fetch(runtimeAssetUrl(ORT_WASM_FILENAME)),
-      ])
-      if (!factoryResponse.ok || !wasmResponse.ok) {
+      const cache = await openRuntimeAssetCache()
+      let factoryBytes: ArrayBuffer
+      let wasmBinary: ArrayBuffer
+      try {
+        ;[factoryBytes, wasmBinary] = await Promise.all([
+          loadRuntimeAsset(session, cache, RUNTIME_ASSETS[0]),
+          loadRuntimeAsset(session, cache, RUNTIME_ASSETS[1]),
+        ])
+      } catch (error) {
         throw new Error(
-          `Die lokale ONNX-Laufzeit konnte nicht geladen werden (MJS ${factoryResponse.status}, WASM ${wasmResponse.status}).`,
+          `Die lokale ONNX-Laufzeit konnte nicht geladen werden (${errorMessage(error)}).`,
         )
       }
-      const [factoryCode, wasmBinary] = await Promise.all([
-        factoryResponse.text(),
-        wasmResponse.arrayBuffer(),
-      ])
+      const factoryCode = new TextDecoder().decode(factoryBytes)
       const factoryBlobUrl = URL.createObjectURL(
         new Blob([factoryCode], { type: "text/javascript" }),
       )
@@ -407,7 +722,43 @@ function hubUrl(modelId: string, revision: string, file: string): string {
   return new URL(`${path}${file}`, env.remoteHost).href
 }
 
-async function aliasPinnedTokenizerMetadata(
+const DEFAULT_COMPACT_MODEL_CACHE_FILES = [
+  "config.json",
+  "tokenizer_config.json",
+  "tokenizer.json",
+  "onnx/model_quantized.onnx",
+] as const
+
+export function defaultCompactModelCacheUrls(): string[] {
+  return DEFAULT_COMPACT_MODEL_CACHE_FILES.map((file) =>
+    hubUrl(DEFAULT_MODEL_ID, DEFAULT_MODEL_REVISION, file),
+  )
+}
+
+export async function checkDefaultCompactModelCache(): Promise<{
+  allCached: boolean
+  files: Array<{ file: string; cached: boolean }>
+}> {
+  if (typeof caches === "undefined") {
+    throw new Error("Browser cache is not available in this environment.")
+  }
+  const cache = await caches.open(env.cacheKey)
+  const urls = defaultCompactModelCacheUrls()
+  const files = await Promise.all(
+    DEFAULT_COMPACT_MODEL_CACHE_FILES.map(async (file, index) => ({
+      file,
+      cached: (await cache.match(urls[index]!))?.ok === true,
+    })),
+  )
+  return {
+    allCached: files.every((file) => file.cached),
+    files,
+  }
+}
+
+const PINNED_METADATA_ALIASES = ["config.json", "tokenizer_config.json"] as const
+
+async function aliasPinnedMetadata(
   modelId: string,
   revision: string,
 ): Promise<void> {
@@ -421,18 +772,20 @@ async function aliasPinnedTokenizerMetadata(
 
   try {
     const cache = await caches.open(env.cacheKey)
-    const pinnedUrl = hubUrl(modelId, revision, "tokenizer_config.json")
-    const mainUrl = hubUrl(modelId, "main", "tokenizer_config.json")
-    const pinned = await cache.match(pinnedUrl)
-    if (pinned && !(await cache.match(mainUrl))) {
-      await cache.put(mainUrl, pinned.clone())
+    for (const filename of PINNED_METADATA_ALIASES) {
+      const pinnedUrl = hubUrl(modelId, revision, filename)
+      const mainUrl = hubUrl(modelId, "main", filename)
+      const pinned = await cache.match(pinnedUrl)
+      if (pinned) {
+        await cache.put(mainUrl, pinned.clone())
+      }
     }
   } catch {
-    // Best effort: online loading still works without this metadata alias.
+    // Best effort: online loading still works without these metadata aliases.
   }
 }
 
-async function deleteTokenizerMetadataAlias(
+async function deletePinnedMetadataAliases(
   modelId: string,
   revision: string,
 ): Promise<number> {
@@ -446,12 +799,41 @@ async function deleteTokenizerMetadataAlias(
 
   try {
     const cache = await caches.open(env.cacheKey)
-    return (await cache.delete(hubUrl(modelId, "main", "tokenizer_config.json")))
-      ? 1
-      : 0
+    const deleted = await Promise.all(
+      PINNED_METADATA_ALIASES.map((filename) =>
+        cache.delete(hubUrl(modelId, "main", filename)),
+      ),
+    )
+    return deleted.filter(Boolean).length
   } catch {
     return 0
   }
+}
+
+function modelCacheUrlPrefix(modelId: string): string {
+  const revisionToken = "{revision}"
+  const path = env.remotePathTemplate.replaceAll("{model}", modelId)
+  const revisionIndex = path.indexOf(revisionToken)
+  const prefix =
+    revisionIndex < 0 ? path : path.slice(0, revisionIndex)
+  return new URL(prefix, env.remoteHost).href
+}
+
+async function clearCachedModels(modelIds: readonly string[]): Promise<number> {
+  if (typeof caches === "undefined" || !env.useBrowserCache) return 0
+  const cache = await caches.open(env.cacheKey)
+  const prefixes = [...new Set(modelIds)].map(modelCacheUrlPrefix)
+  const requests = await cache.keys()
+  let filesDeleted = 0
+  for (const request of requests) {
+    if (
+      prefixes.some((prefix) => request.url.startsWith(prefix)) &&
+      (await cache.delete(request))
+    ) {
+      filesDeleted += 1
+    }
+  }
+  return filesDeleted
 }
 
 export class SemanticEvaluator {
@@ -467,9 +849,10 @@ export class SemanticEvaluator {
   constructor() {
     env.allowLocalModels = false
     env.allowRemoteModels = true
-    env.useBrowserCache = true
-    // ORT is shipped with this exact bundle. Avoid the fragile CDN
-    // fetch -> response.clone() -> Cache.put() preload seen in Edge.
+    env.useBrowserCache = typeof caches !== "undefined"
+    // ORT is shipped with this exact bundle and persisted by the versioned
+    // cache above. Keep the library preload disabled to avoid its fragile
+    // fetch -> response.clone() -> Cache.put() path seen in Edge.
     configureLocalOnnxRuntime()
     env.useWasmCache = false
   }
@@ -575,7 +958,6 @@ export class SemanticEvaluator {
       revision: this.config.revision,
       progress_callback: onProgress,
     })
-    await aliasPinnedTokenizerMetadata(this.config.modelId, this.config.revision)
 
     const loadModel = async (
       selectedDevice: typeof device,
@@ -601,6 +983,11 @@ export class SemanticEvaluator {
       dtype = "q8"
       model = await loadModel(device, dtype)
     }
+
+    // Transformers.js 4.2 discovers pipeline files with `main` metadata even
+    // when the model itself is pinned. Aliasing the already cached immutable
+    // metadata keeps cache inspection and deletion functional while offline.
+    await aliasPinnedMetadata(this.config.modelId, this.config.revision)
 
     try {
       const labels = resolveNliLabels(model.config)
@@ -639,7 +1026,7 @@ export class SemanticEvaluator {
             this.config.modelId,
             this.registryOptions(),
           )
-          await deleteTokenizerMetadataAlias(
+          await deletePinnedMetadataAliases(
             this.config.modelId,
             this.config.revision,
           )
@@ -842,6 +1229,15 @@ export class SemanticEvaluator {
     }
   }
 
+  private usesDefaultCompactModelCache(): boolean {
+    return (
+      this.config.modelId === DEFAULT_MODEL_ID &&
+      this.config.revision === DEFAULT_MODEL_REVISION &&
+      this.config.device === "wasm" &&
+      this.config.dtype === "q8"
+    )
+  }
+
   async getCacheInfo(): Promise<ModelCacheInfo> {
     if (typeof caches === "undefined") {
       return {
@@ -850,33 +1246,44 @@ export class SemanticEvaluator {
         downloadCached: false,
         filesCached: 0,
         filesTotal: 0,
-        estimatedBytes: DEFAULT_MODEL_ESTIMATED_BYTES,
+        estimatedBytes: COMPACT_CACHE_ESTIMATED_BYTES,
       }
     }
 
+    const usesDefaultCache = this.usesDefaultCompactModelCache()
     try {
-      const result = await ModelRegistry.is_pipeline_cached_files(
-        NLI_TASK,
-        this.config.modelId,
-        this.registryOptions(),
-      )
+      const modelCache = usesDefaultCache
+        ? checkDefaultCompactModelCache()
+        : ModelRegistry.is_pipeline_cached_files(
+            NLI_TASK,
+            this.config.modelId,
+            this.registryOptions(),
+          )
+      const [result, runtimeCache] = await Promise.all([
+        modelCache,
+        getRuntimeAssetCacheInfo(),
+      ])
       const files = result.files ?? []
       return {
-        supported: true,
-        cached: result.allCached,
+        supported: runtimeCache.supported,
+        cached: result.allCached && runtimeCache.allCached,
         downloadCached: result.allCached,
-        filesCached: files.filter((file) => file.cached).length,
-        filesTotal: files.length,
-        estimatedBytes: DEFAULT_MODEL_ESTIMATED_BYTES,
+        filesCached:
+          files.filter((file) => file.cached).length + runtimeCache.filesCached,
+        filesTotal: files.length + runtimeCache.filesTotal,
+        estimatedBytes: COMPACT_CACHE_ESTIMATED_BYTES,
+        error: runtimeCache.error,
       }
     } catch (error) {
       return {
-        supported: true,
+        supported: !usesDefaultCache,
         cached: false,
         downloadCached: false,
         filesCached: 0,
-        filesTotal: 0,
-        estimatedBytes: DEFAULT_MODEL_ESTIMATED_BYTES,
+        filesTotal: usesDefaultCache
+          ? DEFAULT_COMPACT_MODEL_CACHE_FILES.length + RUNTIME_ASSETS.length
+          : 0,
+        estimatedBytes: COMPACT_CACHE_ESTIMATED_BYTES,
         error: errorMessage(error),
       }
     }
@@ -921,58 +1328,16 @@ export class SemanticEvaluator {
       let filesDeleted = 0
       const errors: unknown[] = []
       try {
-        const result = await ModelRegistry.clear_pipeline_cache(
-          NLI_TASK,
+        filesDeleted += await clearCachedModels([
           this.config.modelId,
-          this.registryOptions(),
-        )
-        filesDeleted += result.filesDeleted
-      } catch (error) {
-        errors.push(error)
-      }
-
-      try {
-        const legacy = await ModelRegistry.clear_pipeline_cache(
-          LEGACY_EMBEDDING_CACHE.task,
           LEGACY_EMBEDDING_CACHE.modelId,
-          {
-            revision: LEGACY_EMBEDDING_CACHE.revision,
-            device: LEGACY_EMBEDDING_CACHE.device,
-            dtype: LEGACY_EMBEDDING_CACHE.dtype,
-          },
-        )
-        filesDeleted += legacy.filesDeleted
-      } catch (error) {
-        errors.push(error)
-      }
-
-      try {
-        const legacy = await ModelRegistry.clear_pipeline_cache(
-          LEGACY_NLI_CACHE.task,
           LEGACY_NLI_CACHE.modelId,
-          {
-            revision: LEGACY_NLI_CACHE.revision,
-            device: LEGACY_NLI_CACHE.device,
-            dtype: LEGACY_NLI_CACHE.dtype,
-          },
-        )
-        filesDeleted += legacy.filesDeleted
+        ])
       } catch (error) {
         errors.push(error)
       }
 
-      filesDeleted += await deleteTokenizerMetadataAlias(
-        this.config.modelId,
-        this.config.revision,
-      )
-      filesDeleted += await deleteTokenizerMetadataAlias(
-        LEGACY_EMBEDDING_CACHE.modelId,
-        LEGACY_EMBEDDING_CACHE.revision,
-      )
-      filesDeleted += await deleteTokenizerMetadataAlias(
-        LEGACY_NLI_CACHE.modelId,
-        LEGACY_NLI_CACHE.revision,
-      )
+      filesDeleted += await clearRuntimeAssetCache()
       this.loadSource = undefined
       this.setPhase("idle")
 

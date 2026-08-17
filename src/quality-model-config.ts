@@ -3,7 +3,26 @@ import type { AppConfig, ModelRecord } from "@mlc-ai/web-llm"
 export const QUALITY_MODEL_ID = "Qwen3-4B-q4f16_1-MLC"
 export const QUALITY_MODEL_REVISION =
   "a5c9fab855e3ccbdfed2e7e69683d75f30332161"
+export const QUALITY_MODEL_LIB_REVISION =
+  "025bcaf3780fa8254f5e5efd3bfea0a5397248f4"
 export const QUALITY_MODEL_ESTIMATED_BYTES = 2_280_000_000
+
+function pinnedModelLib(source: string): string {
+  const url = new URL(source)
+  const mutablePrefix = "/mlc-ai/binary-mlc-llm-libs/main/"
+  if (
+    url.hostname !== "raw.githubusercontent.com" ||
+    !url.pathname.startsWith(mutablePrefix)
+  ) {
+    throw new Error(
+      "Die WebLLM-Laufzeit verweist nicht auf das erwartete MLC-Artefakt.",
+    )
+  }
+  url.pathname =
+    `/mlc-ai/binary-mlc-llm-libs/${QUALITY_MODEL_LIB_REVISION}/` +
+    url.pathname.slice(mutablePrefix.length)
+  return url.href
+}
 
 function pinnedModelRecord(prebuiltAppConfig: AppConfig): ModelRecord {
   const record = prebuiltAppConfig.model_list.find(
@@ -20,6 +39,7 @@ function pinnedModelRecord(prebuiltAppConfig: AppConfig): ModelRecord {
     model:
       `https://huggingface.co/mlc-ai/${QUALITY_MODEL_ID}/resolve/` +
       `${QUALITY_MODEL_REVISION}/`,
+    model_lib: pinnedModelLib(record.model_lib),
   }
 }
 

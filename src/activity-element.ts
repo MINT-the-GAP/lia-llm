@@ -15,6 +15,60 @@ const ACTIVITY_MESSAGES: Record<EvaluationProgressPhase, string> = {
   "fallback-compact": "Prüfung wird mit dem Kompaktmodell abgeschlossen …",
 }
 
+const ACTIVITY_SHADOW_STYLE = `
+.lia-llm-activity-label {
+  font-size: .78em;
+  line-height: 1.25;
+  text-align: right;
+  opacity: .78;
+}
+.lia-llm-activity-track {
+  height: 3px;
+  width: 100%;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, currentColor 16%, transparent);
+}
+.lia-llm-activity-fill {
+  height: 100%;
+  width: 32%;
+  border-radius: inherit;
+  background: currentColor;
+  opacity: .7;
+  animation: lia_llm_quiz_activity 1.05s ease-in-out infinite;
+}
+@keyframes lia_llm_quiz_activity {
+  0% { transform: translateX(-115%); }
+  100% { transform: translateX(360%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .lia-llm-activity-fill { animation-duration: 2.1s; }
+}
+`
+
+function ensureActivityShadow(element: HTMLElement): ShadowRoot {
+  const shadow = element.shadowRoot ?? element.attachShadow({ mode: "open" })
+  if (shadow.querySelector(".lia-llm-activity-label")) return shadow
+
+  const ownerDocument = element.ownerDocument
+  const style = ownerDocument.createElement("style")
+  style.textContent = ACTIVITY_SHADOW_STYLE
+
+  const label = ownerDocument.createElement("span")
+  label.className = "lia-llm-activity-label"
+
+  const track = ownerDocument.createElement("span")
+  track.className = "lia-llm-activity-track"
+  track.setAttribute("role", "progressbar")
+  track.setAttribute("aria-label", "Fortschritt der lokalen Antwortauswertung")
+
+  const fill = ownerDocument.createElement("span")
+  fill.className = "lia-llm-activity-fill"
+  track.append(fill)
+  shadow.append(style, label, track)
+  return shadow
+}
+
 function renderActivity(
   element: HTMLElement,
   state: ActivityState | undefined,
@@ -24,9 +78,10 @@ function renderActivity(
   element.style.display = visible ? "grid" : "none"
   element.setAttribute("aria-busy", String(visible))
 
-  const label = element.querySelector<HTMLElement>(".lia-llm-activity-label")
+  const shadow = ensureActivityShadow(element)
+  const label = shadow.querySelector<HTMLElement>(".lia-llm-activity-label")
   if (label) label.textContent = state ? ACTIVITY_MESSAGES[state.phase] : ""
-  const track = element.querySelector<HTMLElement>(".lia-llm-activity-track")
+  const track = shadow.querySelector<HTMLElement>(".lia-llm-activity-track")
   if (track) {
     if (visible) track.setAttribute("aria-valuetext", "Antwort wird ausgewertet")
     else track.removeAttribute("aria-valuetext")
@@ -75,26 +130,7 @@ export function registerActivityElement(): void {
       this.style.width = "min(22rem, 100%)"
       this.style.margin = ".35rem 0 .15rem auto"
       this.style.gap = ".25rem"
-      this.innerHTML = [
-        "<style>",
-        "lia-llm-activity .lia-llm-activity-label{font-size:.78em;",
-        "line-height:1.25;text-align:right;opacity:.78}",
-        "lia-llm-activity .lia-llm-activity-track{height:3px;width:100%;",
-        "overflow:hidden;border-radius:999px;",
-        "background:color-mix(in srgb,currentColor 16%,transparent)}",
-        "lia-llm-activity .lia-llm-activity-fill{height:100%;width:32%;",
-        "border-radius:inherit;background:currentColor;opacity:.7;",
-        "animation:lia_llm_quiz_activity 1.05s ease-in-out infinite}",
-        "@keyframes lia_llm_quiz_activity{0%{transform:translateX(-115%)}",
-        "100%{transform:translateX(360%)}}",
-        "@media (prefers-reduced-motion:reduce){",
-        "lia-llm-activity .lia-llm-activity-fill{animation-duration:2.1s}}",
-        "</style>",
-        '<span class="lia-llm-activity-label"></span>',
-        '<span class="lia-llm-activity-track" role="progressbar" ',
-        'aria-label="Fortschritt der lokalen Antwortauswertung">',
-        '<span class="lia-llm-activity-fill"></span></span>',
-      ].join("")
+      ensureActivityShadow(this)
       renderActivity(this, activityById.get(this.id))
     }
 

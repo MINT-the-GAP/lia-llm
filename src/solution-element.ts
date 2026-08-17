@@ -1,7 +1,20 @@
 const solutionById = new Map<string, string>()
+const SOLUTION_CONTENT_CLASS = "lia-llm-solution-content"
+
+function ensureSolutionContent(element: HTMLElement): HTMLElement {
+  const shadow = element.shadowRoot ?? element.attachShadow({ mode: "open" })
+  const current = shadow.querySelector<HTMLElement>(`.${SOLUTION_CONTENT_CLASS}`)
+  if (current) return current
+
+  const content = element.ownerDocument.createElement("span")
+  content.className = SOLUTION_CONTENT_CLASS
+  content.setAttribute("part", "content")
+  shadow.append(content)
+  return content
+}
 
 function renderSolution(element: HTMLElement, text: string): void {
-  element.textContent = text
+  ensureSolutionContent(element).textContent = text
   const visible = text.length > 0
   element.hidden = !visible
   element.style.display = visible ? "block" : "none"
@@ -33,6 +46,7 @@ export function registerSolutionElement(): void {
   class LiaLLMSolutionElement extends HTMLElement {
     connectedCallback(): void {
       this.style.whiteSpace = "pre-wrap"
+      ensureSolutionContent(this)
       renderSolution(this, solutionById.get(this.id) ?? "")
     }
   }

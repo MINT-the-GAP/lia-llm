@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>lia-llm cache hardening</title>
+    <script>
+      window.__liaLlmHardening = {
+        errors: [],
+        progress: [],
+      }
+
+      window.__liaLlmHardeningLog = (status, detail = {}) => {
+        console.log(
+          "HARDENING_PROGRESS " + JSON.stringify({ status, ...detail })
+        )
+      }
+
+      if (new URLSearchParams(location.search).has("traceCache")) {
+        const tracePromiseMethod = (prototype, method) => {
+          const original = prototype?.[method]
+          if (typeof original !== "function") return
+          prototype[method] = function (...args) {
+            window.__liaLlmHardeningLog("cache-call", { method })
+            let result
+            try {
+              result = original.apply(this, args)
+            } catch (error) {
+              window.__liaLlmHardeningLog("cache-throw", {
+                method,
+                message: error?.message || String(error),
+              })
+              throw error
+            }
+            return Promise.resolve(result).then(
+              value => {
+                window.__liaLlmHardeningLog("cache-return", { method })
+                return value
+              },
+              error => {
+                window.__liaLlmHardeningLog("cache-reject", {
+                  method,
+                  message: error?.message || String(error),
+                })
+                throw error
+              }
+            )
+          }
+        }
+        if (typeof CacheStorage !== "undefined") {
+          tracePromiseMethod(CacheStorage.prototype, "open")
+          tracePromiseMethod(CacheStorage.prototype, "keys")
+        }
+        if (typeof Cache !== "undefined") {
+          for (const method of ["match", "keys", "put", "delete"]) {
+            tracePromiseMethod(Cache.prototype, method)
+          }
+        }
+      }
+
+      window.addEventListener(
+        "lia-llm:download-consent",
+        (event) => {
+          const detail = event.detail
+          if (!detail || typeof detail.respond !== "function") return
+          detail.handled = true
+          detail.respond(false)
+        },
+        true
+      )
+
+      window.addEventListener("lia-llm:progress", (event) => {
+        const detail = event.detail || {}
+        const entry = {
+          status: detail.status,
+          progress: detail.progress,
+          loaded: detail.loaded,
+          total: detail.total,
+          file: detail.file,
+          message: detail.message,
+        }
+        window.__liaLlmHardening.progress.push(entry)
+        if (window.__liaLlmHardening.progress.length > 200) {
+          window.__liaLlmHardening.progress.shift()
+        }
+        const now = Date.now()
+        const last = window.__liaLlmHardening.lastProgressLog || 0
+        const frequentProgress =
+          detail.status === "progress" || detail.status === "progress_total"
+        if (
+          !frequentProgress ||
+          now - last > 5000 ||
+          Number(detail.progress) >= 100
+        ) {
+          window.__liaLlmHardening.lastProgressLog = now
+          console.log("HARDENING_PROGRESS " + JSON.stringify(entry))
+        }
+      })
+
+      window.addEventListener("error", (event) => {
+        window.__liaLlmHardening.errors.push(
+          event.error?.message || event.message || "window error"
+        )
+      })
+      window.addEventListener("unhandledrejection", (event) => {
+        window.__liaLlmHardening.errors.push(
+          event.reason?.message || String(event.reason)
+        )
+      })
+    </script>
+    <script src="../dist/index.js"></script>
+  </head>
+  <body>
+    <main>
+      <h1>lia-llm cache hardening</h1>
+      <p id="status">Bereit</p>
+    </main>
+    <script>
+      const compactCache = (cache) => cache?.engines?.compact || null
+
+      async function cacheManifest() {
+        if (typeof caches === "undefined") return []
+        const names = await caches.keys()
+        return Promise.all(
+          names.map(async (name) => {
+            const cache = await caches.open(name)
+            const keys = await cache.keys()
+            return {
+              name,
+              entries: keys.length,
+              paths: keys.slice(0, 20).map((request) => {
+                const url = new URL(request.url)
+                return url.origin + url.pathname
+              }),
+            }
+          })
+        )
+      }
+
+      async function storageSnapshot() {
+        const snapshot = {
+          cacheStorage: typeof caches !== "undefined",
+          persisted: false,
+        }
+        try {
+          snapshot.persisted =
+            (await navigator.storage?.persisted?.()) === true
+        } catch {}
+        try {
+          const estimate = await navigator.storage?.estimate?.()
+          snapshot.usage = estimate?.usage
+          snapshot.quota = estimate?.quota
+        } catch {}
+        return snapshot
+      }
+
+      window.runCacheHardening = async () => {
+        if (!window.LiaLLM) throw new Error("LiaLLM API fehlt.")
+        document.getElementById("status").textContent = "Modell wird geladen"
+        window.__liaLlmHardeningLog("cache-info-start")
+        const before = await window.LiaLLM.getCacheInfo()
+        window.__liaLlmHardeningLog("cache-info-done")
+        window.__liaLlmHardeningLog("preload-start")
+        const preloadStatus = await window.LiaLLM.preload()
+        window.__liaLlmHardeningLog("preload-done")
+        window.__liaLlmHardeningLog("evaluate-start")
+        const result = await window.LiaLLM.evaluate({
+          question: "Warum schwimmt Eis auf Wasser?",
+          answer:
+            "Eis besitzt eine geringere Dichte als flüssiges Wasser und schwimmt deshalb.",
+          reference:
+            "Eis besitzt eine geringere Dichte als flüssiges Wasser und schwimmt deshalb.",
+        })
+        window.__liaLlmHardeningLog("evaluate-done")
+        const after = await window.LiaLLM.getCacheInfo()
+        const manifest = await cacheManifest()
+        const storage = await storageSnapshot()
+        document.getElementById("status").textContent = "Fertig"
+        return {
+          before: compactCache(before),
+          after: compactCache(after),
+          preloadStatus,
+          finalStatus: window.LiaLLM.getStatus(),
+          result: {
+            status: result.status,
+            passed: result.passed,
+            model: result.model,
+          },
+          manifest,
+          storage,
+          errors: [...window.__liaLlmHardening.errors],
+          progressTail: window.__liaLlmHardening.progress.slice(-20),
+        }
+      }
+
+      window.clearHardeningCache = async () => {
+        if (!window.LiaLLM) throw new Error("LiaLLM API fehlt.")
+        const deleted = await window.LiaLLM.clearCache()
+        return {
+          deleted,
+          manifest: await cacheManifest(),
+        }
+      }
+    </script>
+  </body>
+</html>

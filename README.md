@@ -130,6 +130,7 @@ Promise.resolve()
 
 "LIA: wait"
 </script>
+<lia-llm-textarea-host hidden></lia-llm-textarea-host>
 <lia-llm-quiz-use hidden></lia-llm-quiz-use>
 <lia-llm-activity id="lia-llm-activity-@0" hidden></lia-llm-activity>
 <lia-llm-feedback id="lia-llm-feedback-@0"></lia-llm-feedback>
@@ -281,7 +282,8 @@ bleibt sie im Kursquelltext und im Browser auffindbar.
 
 `data-llm-textarea="5"` erzeugt ein vergrößerbares Feld mit fünf sichtbaren Zeilen. Werte von 2 bis
 12 sind möglich. Absätze und Leerzeilen bleiben bei der Auswertung erhalten. Im Feld bleiben alle
-vier Pfeiltasten beim Cursor und lösen keinen Folienwechsel aus.
+vier Pfeiltasten beim Cursor und lösen keinen Folienwechsel aus. Das sichtbare Feld liegt in einem
+eigenen Shadow-DOM-Sidecar; die von LiaScript verwaltete Quiz-Kindliste bleibt dabei unverändert.
 
 ### Kurzes Feedback
 
@@ -363,7 +365,7 @@ Schwelle liegen. Ein solcher Befund ist jetzt nur noch vorläufig:
 | Stufe | Modell und Laufzeit | Erster Download | Einordnung |
 | --- | --- | ---: | --- |
 | Qualität | Qwen3-4B über WebLLM | ca. 2,28 GB | wird bevorzugt, sobald es gecacht oder betriebsbereit ist; besser für Kontext, Synonyme, Paraphrasen und Negationen |
-| schneller Start/Fallback | mDeBERTa-v3 NLI über Transformers.js | ca. 355 MB | überbrückt ein noch fehlendes Qualitätsmodell und läuft bei Bedarf mit WASM |
+| schneller Start/Fallback | mDeBERTa-v3 NLI über Transformers.js | ca. 379 MB inklusive ONNX-Laufzeit | überbrückt ein noch fehlendes Qualitätsmodell und läuft bei Bedarf mit WASM |
 
 Es gibt zwei bewusst getrennte Anzeigen:
 
@@ -411,6 +413,9 @@ Ladezustand zu bleiben.
 Browser dürfen Persistenz ablehnen; ausdrücklich gelöschte Website-Daten, privater Modus,
 Speicherbereinigung oder eine andere Herkunft entfernen beziehungsweise trennen den Cache. Eine
 absolute, browserübergreifende Dauerhaftigkeit kann eine Webanwendung deshalb nicht garantieren.
+
+Der reproduzierbare Cold-/Neustart-/Offline-Härtetest samt Schulnetzbedingungen ist in
+[`test/BROWSER-HARDENING.md`](test/BROWSER-HARDENING.md) dokumentiert.
 
 ## Probieraufgabe
 

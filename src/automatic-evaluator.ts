@@ -264,6 +264,25 @@ export class AutomaticEvaluator {
     }
   }
 
+  private requestPersistenceInBackground(): void {
+    if (this.persistenceRequested) return
+
+    this.persistenceRequested = true
+    const generation = this.generation
+    void requestPersistentStorage().then(
+      (persistent) => {
+        if (generation === this.generation) {
+          this.persistentStorage = persistent
+        }
+      },
+      () => {
+        if (generation === this.generation) {
+          this.persistentStorage = false
+        }
+      },
+    )
+  }
+
   private async authorizeLoad(
     engine: AssessmentEngine,
     status: RuntimeStatus,
@@ -272,7 +291,9 @@ export class AutomaticEvaluator {
     const downloadCached = cache.downloadCached ?? cache.cached
     const decision = decideModelDownload({
       engine,
-      cached: downloadCached,
+      // Offline startup requires every runtime and metadata component, not
+      // only the large model payload represented by downloadCached.
+      cached: cache.cached,
       network: captureNetworkSnapshot(),
     })
     if (decision === "skip") return { allowed: false, decision }
@@ -280,9 +301,8 @@ export class AutomaticEvaluator {
     const allowed =
       decision === "auto" ||
       (await this.askForConsent(engine, status, cache))
-    if (allowed && !downloadCached && !this.persistenceRequested) {
-      this.persistenceRequested = true
-      this.persistentStorage = await requestPersistentStorage()
+    if (allowed && !downloadCached) {
+      this.requestPersistenceInBackground()
     }
     return { allowed, decision }
   }

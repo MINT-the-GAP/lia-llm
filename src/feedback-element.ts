@@ -1,5 +1,6 @@
 const feedbackById = new Map<string, string>()
 const FEEDBACK_LAYOUT_STYLE_ID = "lia-llm-feedback-layout"
+const FEEDBACK_CONTENT_CLASS = "lia-llm-feedback-content"
 
 function registerFeedbackLayoutStyles(): void {
   if (
@@ -21,8 +22,20 @@ function registerFeedbackLayoutStyles(): void {
   document.head.append(style)
 }
 
+function ensureFeedbackContent(element: HTMLElement): HTMLElement {
+  const shadow = element.shadowRoot ?? element.attachShadow({ mode: "open" })
+  const current = shadow.querySelector<HTMLElement>(`.${FEEDBACK_CONTENT_CLASS}`)
+  if (current) return current
+
+  const content = element.ownerDocument.createElement("span")
+  content.className = FEEDBACK_CONTENT_CLASS
+  content.setAttribute("part", "content")
+  shadow.append(content)
+  return content
+}
+
 function renderFeedback(element: HTMLElement, message: string): void {
-  element.textContent = message
+  ensureFeedbackContent(element).textContent = message
   element.hidden = !message
 }
 
@@ -59,6 +72,7 @@ export function registerFeedbackElement(): void {
       this.style.marginBlockStart = ".75rem"
       this.style.fontWeight = "600"
       this.style.whiteSpace = "pre-line"
+      ensureFeedbackContent(this)
       renderFeedback(this, feedbackById.get(this.id) ?? "")
     }
   }
