@@ -440,10 +440,330 @@
         ortWasmMagic[2] === 115 &&
         ortWasmMagic[3] === 109
 
+      const privacyCanary = "STUDENT_ANSWER_MUST_NOT_APPEAR_7f83c1"
+      const tokenCanary = "PRIVATE_QUERY_TOKEN_9ac247"
+      const stackCanary = "PRIVATE_STACK_VALUE_31be9a"
+      const originalRelativeUrl =
+        location.pathname + location.search + location.hash
+      history.replaceState(
+        null,
+        "",
+        location.pathname + "?token=" + tokenCanary + "#" + stackCanary
+      )
+      const privacyProbe = document.createElement("textarea")
+      privacyProbe.hidden = true
+      privacyProbe.value = privacyCanary
+      document.body.append(privacyProbe)
+      window.__liaPrivacyProbeError = new Error(stackCanary)
+
+      const debugReport = await window.LiaLLM?.debugReport({ print: false })
+      const debugReportJson = JSON.stringify(debugReport)
+      const debugReportClone = JSON.parse(debugReportJson)
+      const debugReportIsSerializable =
+        debugReportClone?.schemaVersion === 1 &&
+        Array.isArray(debugReportClone?.findings) &&
+        Array.isArray(debugReportClone?.events)
+      const debugReportIsPrivate =
+        !debugReportJson.includes(privacyCanary) &&
+        !debugReportJson.includes(tokenCanary) &&
+        !debugReportJson.includes(stackCanary) &&
+        debugReport?.privacy?.studentContentLogged === false &&
+        debugReport?.privacy?.responseBodiesLogged === false &&
+        debugReport?.privacy?.stacksLogged === false
+      privacyProbe.remove()
+      delete window.__liaPrivacyProbeError
+      history.replaceState(null, "", originalRelativeUrl)
+
+      await new Promise(resolve => setTimeout(resolve, 450))
+      const automaticDebugConsole = []
+      const capturedConsoleMethods = [
+        "error",
+        "warn",
+        "info",
+        "log",
+        "table",
+        "groupCollapsed",
+        "groupEnd"
+      ]
+      const originalConsoleMethods = Object.fromEntries(
+        capturedConsoleMethods.map(method => [method, console[method]])
+      )
+      for (const method of capturedConsoleMethods) {
+        console[method] = (...args) => {
+          automaticDebugConsole.push({ method, args })
+        }
+      }
+      try {
+        const syntheticFailure = {
+          phase: "error",
+          assessmentEngine: "compact",
+          modelId: "debug-smoke-model",
+          revision: "debug-smoke-revision",
+          device: "wasm",
+          dtype: "q8",
+          error: "Failed to fetch"
+        }
+        window.dispatchEvent(
+          new CustomEvent("lia-llm:status", { detail: syntheticFailure })
+        )
+        window.dispatchEvent(
+          new CustomEvent("lia-llm:status", { detail: syntheticFailure })
+        )
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          if (
+            automaticDebugConsole.some(call => call.method === "groupEnd")
+          ) {
+            break
+          }
+          await new Promise(resolve => setTimeout(resolve, 20))
+        }
+      } finally {
+        for (const method of capturedConsoleMethods) {
+          console[method] = originalConsoleMethods[method]
+        }
+        window.dispatchEvent(
+          new CustomEvent("lia-llm:status", { detail: initial })
+        )
+      }
+      const automaticDebugText = automaticDebugConsole
+        .flatMap(call => call.args)
+        .filter(value => typeof value === "string")
+        .join("\n")
+      const automaticDebugNotizIsDeduplicated =
+        automaticDebugConsole.filter(
+          call => call.method === "groupCollapsed"
+        ).length === 1 &&
+        automaticDebugConsole.filter(
+          call => call.method === "groupEnd"
+        ).length === 1 &&
+        (automaticDebugText.match(
+          /--- BEGIN LIA-LLM DEBUGNOTIZ ---/gu
+        ) ?? []).length === 1 &&
+        (automaticDebugText.match(
+          /--- END LIA-LLM DEBUGNOTIZ ---/gu
+        ) ?? []).length === 1
+
+      const automaticCacheDebugConsole = []
+      for (const method of capturedConsoleMethods) {
+        console[method] = (...args) => {
+          automaticCacheDebugConsole.push({ method, args })
+        }
+      }
+      try {
+        const syntheticReady = {
+          phase: "ready",
+          loadSource: "network",
+          assessmentEngine: "compact",
+          modelId: "debug-smoke-model",
+          revision: "debug-smoke-revision",
+          device: "wasm",
+          dtype: "q8"
+        }
+        window.dispatchEvent(
+          new CustomEvent("lia-llm:status", { detail: syntheticReady })
+        )
+        window.dispatchEvent(
+          new CustomEvent("lia-llm:status", { detail: syntheticReady })
+        )
+        for (let attempt = 0; attempt < 150; attempt += 1) {
+          if (
+            automaticCacheDebugConsole.some(
+              call => call.method === "groupEnd"
+            )
+          ) {
+            break
+          }
+          await new Promise(resolve => setTimeout(resolve, 20))
+        }
+      } finally {
+        for (const method of capturedConsoleMethods) {
+          console[method] = originalConsoleMethods[method]
+        }
+        window.dispatchEvent(
+          new CustomEvent("lia-llm:status", { detail: initial })
+        )
+      }
+      const automaticCacheDebugText = automaticCacheDebugConsole
+        .flatMap(call => call.args)
+        .filter(value => typeof value === "string")
+        .join("\n")
+      const automaticCacheDebugBlock = automaticCacheDebugText.match(
+        /--- BEGIN LIA-LLM DEBUGNOTIZ ---\n([\s\S]*?)\n--- END LIA-LLM DEBUGNOTIZ ---/u
+      )
+      let automaticCacheDebugReport = null
+      try {
+        automaticCacheDebugReport = automaticCacheDebugBlock
+          ? JSON.parse(automaticCacheDebugBlock[1])
+          : null
+      } catch {
+        automaticCacheDebugReport = null
+      }
+      const automaticCacheDebugNotizIsDeduplicated =
+        automaticCacheDebugConsole.filter(
+          call => call.method === "groupCollapsed"
+        ).length === 1 &&
+        automaticCacheDebugConsole.filter(
+          call => call.method === "groupEnd"
+        ).length === 1 &&
+        (automaticCacheDebugText.match(
+          /--- BEGIN LIA-LLM DEBUGNOTIZ ---/gu
+        ) ?? []).length === 1 &&
+        (automaticCacheDebugText.match(
+          /--- END LIA-LLM DEBUGNOTIZ ---/gu
+        ) ?? []).length === 1 &&
+        automaticCacheDebugReport?.outcome === "cache-incomplete" &&
+        automaticCacheDebugReport?.primaryCause === "cache-incomplete"
+
+      const debugReportsFromConsole = calls => {
+        const text = calls
+          .flatMap(call => call.args)
+          .filter(value => typeof value === "string")
+          .join("\n")
+        return Array.from(
+          text.matchAll(
+            /--- BEGIN LIA-LLM DEBUGNOTIZ ---\n([\s\S]*?)\n--- END LIA-LLM DEBUGNOTIZ ---/gu
+          ),
+          match => {
+            try {
+              return JSON.parse(match[1])
+            } catch {
+              return null
+            }
+          }
+        ).filter(Boolean)
+      }
+
+      const intentionalAbortConsole = []
+      const originalAbortFetch = window.fetch
+      let intentionalAbortFetches = 0
+      let intentionalAbortName = null
+      for (const method of capturedConsoleMethods) {
+        console[method] = (...args) => {
+          intentionalAbortConsole.push({ method, args })
+        }
+      }
+      window.fetch = (...args) => {
+        intentionalAbortFetches += 1
+        return originalAbortFetch(...args)
+      }
+      try {
+        const controller = new AbortController()
+        controller.abort()
+        await window.LiaLLM?.evaluate(
+          {
+            question: "Begründe die Aussage.",
+            reference: "Die Referenz enthält eine vollständige Begründung.",
+            answer: "Diese Antwort ist lang genug für den Abbruchtest."
+          },
+          { signal: controller.signal }
+        )
+      } catch (error) {
+        intentionalAbortName = error?.name ?? null
+      } finally {
+        await new Promise(resolve => setTimeout(resolve, 100))
+        window.fetch = originalAbortFetch
+        for (const method of capturedConsoleMethods) {
+          console[method] = originalConsoleMethods[method]
+        }
+      }
+      const intentionalAbortIsSilent =
+        intentionalAbortName === "AbortError" &&
+        intentionalAbortFetches === 0 &&
+        intentionalAbortConsole.every(
+          call =>
+            call.method !== "groupCollapsed" &&
+            call.method !== "groupEnd"
+        ) &&
+        debugReportsFromConsole(intentionalAbortConsole).length === 0
+
+      const staleTimerConsole = []
+      const onlineDescriptor = Object.getOwnPropertyDescriptor(
+        navigator,
+        "onLine"
+      )
+      const originalStaleFetch = window.fetch
+      let staleTimerFetches = 0
+      let staleRunReport = null
+      let postReplacementReports = []
+      Object.defineProperty(navigator, "onLine", {
+        configurable: true,
+        value: false
+      })
+      window.fetch = (...args) => {
+        staleTimerFetches += 1
+        return originalStaleFetch(...args)
+      }
+      for (const method of capturedConsoleMethods) {
+        console[method] = (...args) => {
+          staleTimerConsole.push({ method, args })
+        }
+      }
+      try {
+        await window.LiaLLM?.preload().catch(() => undefined)
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          if (staleTimerConsole.some(call => call.method === "groupEnd")) {
+            break
+          }
+          await new Promise(resolve => setTimeout(resolve, 20))
+        }
+        staleRunReport = debugReportsFromConsole(staleTimerConsole)[0] ?? null
+        staleTimerConsole.length = 0
+
+        const staleReady = {
+          phase: "ready",
+          loadSource: "network",
+          assessmentEngine: "compact",
+          modelId: "stale-debug-model",
+          revision: "stale-debug-revision",
+          device: "wasm",
+          dtype: "q8"
+        }
+        window.dispatchEvent(
+          new CustomEvent("lia-llm:status", { detail: staleReady })
+        )
+        await new Promise(resolve => setTimeout(resolve, 25))
+        await window.LiaLLM?.preload().catch(() => undefined)
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          if (staleTimerConsole.some(call => call.method === "groupEnd")) {
+            break
+          }
+          await new Promise(resolve => setTimeout(resolve, 20))
+        }
+        await new Promise(resolve => setTimeout(resolve, 450))
+        postReplacementReports =
+          debugReportsFromConsole(staleTimerConsole)
+      } finally {
+        window.fetch = originalStaleFetch
+        if (onlineDescriptor) {
+          Object.defineProperty(navigator, "onLine", onlineDescriptor)
+        } else {
+          delete navigator.onLine
+        }
+        for (const method of capturedConsoleMethods) {
+          console[method] = originalConsoleMethods[method]
+        }
+        window.dispatchEvent(
+          new CustomEvent("lia-llm:status", { detail: initial })
+        )
+      }
+      const replacementReport = postReplacementReports[0] ?? null
+      const staleReadyTimerIsIgnored =
+        staleTimerFetches === 0 &&
+        staleRunReport?.trigger === "load-error" &&
+        replacementReport?.trigger === "load-error" &&
+        staleRunReport?.runId !== replacementReport?.runId &&
+        postReplacementReports.length === 1 &&
+        postReplacementReports.every(
+          report =>
+            report.trigger !== "post-ready-cache-check" &&
+            report.runId !== staleRunReport?.runId
+        )
+
       const matches = Boolean(
         window.LiaLLM &&
-        window.LiaLLM.version === "0.5.1" &&
+        window.LiaLLM.version === "0.5.2" &&
         typeof window.LiaLLM.evaluate === "function" &&
+        typeof window.LiaLLM.debugReport === "function" &&
         typeof window.LiaLLM.feedbackForResult === "function" &&
         typeof window.LiaLLM.showFeedback === "function" &&
         typeof window.LiaLLM.showSolution === "function" &&
@@ -492,6 +812,12 @@
         cachedReadyIsHidden &&
         realDownloadIsVisible &&
         localOnnxRuntimeIsAvailable &&
+        debugReportIsSerializable &&
+        debugReportIsPrivate &&
+        automaticDebugNotizIsDeduplicated &&
+        automaticCacheDebugNotizIsDeduplicated &&
+        intentionalAbortIsSilent &&
+        staleReadyTimerIsIgnored &&
         consentDetail.handled === true &&
         consentWasVisible &&
         consentResponse === false &&
@@ -504,6 +830,27 @@
         matches,
         compactFeedbackHasCriteria: false,
         version: window.LiaLLM?.version,
+        debugReport,
+        debugReportIsSerializable,
+        debugReportIsPrivate,
+        automaticDebugNotizIsDeduplicated,
+        automaticDebugConsoleMethods: automaticDebugConsole.map(
+          call => call.method
+        ),
+        automaticCacheDebugNotizIsDeduplicated,
+        automaticCacheDebugReport,
+        automaticCacheDebugConsoleMethods: automaticCacheDebugConsole.map(
+          call => call.method
+        ),
+        intentionalAbortIsSilent,
+        intentionalAbortFetches,
+        staleReadyTimerIsIgnored,
+        staleTimerFetches,
+        staleRunId: staleRunReport?.runId,
+        replacementRunId: replacementReport?.runId,
+        postReplacementTriggers: postReplacementReports.map(
+          report => report.trigger
+        ),
         initial,
         named,
         positional,

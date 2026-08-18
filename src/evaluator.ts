@@ -23,6 +23,14 @@ import {
 } from "./model-config.ts"
 import { unavailableLanguageAnalysis } from "./language-analysis.ts"
 import {
+  beginDebugLoad,
+  instrumentDebugFetch,
+  recordDebugActivity,
+  recordDebugCache,
+  recordDebugFailure,
+  recordDebugRetry,
+} from "./debug-diagnostics.ts"
+import {
   aggregateCriteria,
   classifyCriterion,
   evaluationAnswerContexts,
@@ -299,10 +307,18 @@ interface RuntimeAssetCacheInfo {
 }
 
 export async function openRuntimeAssetCache(): Promise<Cache | null> {
-  if (typeof caches === "undefined") return null
+  if (typeof caches === "undefined") {
+    recordDebugCache("compact", "runtime-open", "unsupported")
+    return null
+  }
   try {
-    return await caches.open(RUNTIME_ASSET_CACHE_KEY)
-  } catch {
+    const cache = await caches.open(RUNTIME_ASSET_CACHE_KEY)
+    recordDebugCache("compact", "runtime-open", "ok", {
+      cacheName: RUNTIME_ASSET_CACHE_KEY,
+    })
+    return cache
+  } catch (error) {
+    recordDebugCache("compact", "runtime-open", "error", { error })
     return null
   }
 }
@@ -375,7 +391,10 @@ async function readCachedRuntimeAsset(
   if (!cache) return null
   try {
     const response = await cache.match(url)
-    if (!response?.ok) return null
+    if (!response?.ok) {
+      recordDebugCache("compact", "runtime-match", "miss", { url })
+      return null
+    }
     const bytes = await response.arrayBuffer()
     const validation = await validateRuntimeAsset(filename, bytes)
     const asset = RUNTIME_ASSETS.find(
@@ -388,10 +407,22 @@ async function readCachedRuntimeAsset(
         response.headers.get("X-Lia-LLM-Runtime-Cache") === "verified" &&
         response.headers.get("X-Lia-LLM-SHA256") === asset.sha256)
     ) {
+      recordDebugCache("compact", "runtime-match", "hit", {
+        url,
+        details: { bytes: bytes.byteLength, validation },
+      })
       return bytes
     }
-    await cache.delete(url)
-  } catch {
+    recordDebugCache("compact", "runtime-match", "corrupt", {
+      url,
+      details: { bytes: bytes.byteLength, validation },
+    })
+    const deleted = await cache.delete(url)
+    recordDebugCache("compact", "runtime-delete", deleted ? "ok" : "miss", {
+      url,
+    })
+  } catch (error) {
+    recordDebugCache("compact", "runtime-match", "error", { url, error })
     // A broken or unavailable cache must not block online loading.
   }
   return null
@@ -417,7 +448,12 @@ async function cacheRuntimeAsset(
         },
       }),
     )
-  } catch {
+    recordDebugCache("compact", "runtime-put", "ok", {
+      url,
+      details: { bytes: bytes.byteLength },
+    })
+  } catch (error) {
+    recordDebugCache("compact", "runtime-put", "error", { url, error })
     // CacheStorage is best effort. The current online run can still continue.
   }
 }
@@ -441,8 +477,23 @@ export async function loadRuntimeAsset(
   const bytes = await response.arrayBuffer()
   const validation = await validateRuntimeAsset(asset.filename, bytes)
   if (validation === "invalid") {
+    recordDebugFailure(
+      "compact",
+      {
+        url,
+        expectedBytes: asset.byteLength,
+        error: new Error(asset.label + " failed integrity validation"),
+      },
+      "runtime-integrity",
+    )
+  }
+  if (validation === "invalid") {
     throw new Error(`${asset.label} enthielt kein gültiges ONNX-Artefakt`)
   }
+  recordDebugCache("compact", "runtime-validate", validation, {
+    url,
+    details: { expected: asset.byteLength, received: bytes.byteLength },
+  })
   if (validation === "verified") {
     await cacheRuntimeAsset(cache, url, bytes, asset)
   }
@@ -452,6 +503,7 @@ export async function loadRuntimeAsset(
 async function getRuntimeAssetCacheInfo(): Promise<RuntimeAssetCacheInfo> {
   const filesTotal = RUNTIME_ASSETS.length
   if (typeof caches === "undefined") {
+    recordDebugCache("compact", "runtime-cache-probe", "unsupported")
     return { supported: false, filesCached: 0, filesTotal, allCached: false }
   }
   try {
@@ -473,6 +525,7 @@ async function getRuntimeAssetCacheInfo(): Promise<RuntimeAssetCacheInfo> {
       allCached: filesCached === filesTotal,
     }
   } catch (error) {
+    recordDebugCache("compact", "runtime-cache-probe", "error", { error })
     return {
       supported: false,
       filesCached: 0,
@@ -920,13 +973,21 @@ export class SemanticEvaluator {
       throw new Error("Dieser Browser stellt keine Download-Schnittstelle bereit.")
     }
     const previousFetch = env.fetch
-    const session = new ResilientFetchSession(globalThis.fetch.bind(globalThis), {
-      onRetry: ({ attempt }) => {
+    const diagnosticFetch = instrumentDebugFetch(
+      "compact",
+      globalThis.fetch.bind(globalThis),
+    )
+    const session = new ResilientFetchSession(diagnosticFetch, {
+      onActivity: (activity) => recordDebugActivity("compact", activity),
+      onRetry: (retry) => {
+        const { attempt } = retry
+        recordDebugRetry("compact", retry)
         emit<ModelProgress>("lia-llm:progress", {
           status: "retry",
           message: `Netzwerkunterbrechung – Teil-Download wird erneut versucht (${attempt}/4).`,
         })
       },
+      onFailure: (failure) => recordDebugFailure("compact", failure),
     })
     this.fetchSession = session
     env.fetch = session.fetch
@@ -1002,9 +1063,13 @@ export class SemanticEvaluator {
     }
   }
 
-  async preload(cacheInfo?: ModelCacheInfo): Promise<RuntimeStatus> {
+  async preload(
+    cacheInfo?: ModelCacheInfo,
+    diagnosticRunStarted = false,
+  ): Promise<RuntimeStatus> {
     if (this.runtime) return this.getStatus()
     if (!this.loadPromise) {
+      if (!diagnosticRunStarted) beginDebugLoad("compact")
       this.loadPromise = (async () => {
         const cache = cacheInfo ?? (await this.getCacheInfo())
         this.loadSource = cache.cached ? "cache" : "network"
@@ -1243,6 +1308,7 @@ export class SemanticEvaluator {
 
   async getCacheInfo(): Promise<ModelCacheInfo> {
     if (typeof caches === "undefined") {
+      recordDebugCache("compact", "model-cache-probe", "unsupported")
       return {
         supported: false,
         cached: false,
@@ -1267,6 +1333,19 @@ export class SemanticEvaluator {
         getRuntimeAssetCacheInfo(),
       ])
       const files = result.files ?? []
+      recordDebugCache(
+        "compact",
+        "model-cache-probe",
+        result.allCached && runtimeCache.allCached ? "hit" : "partial",
+        {
+          details: {
+            modelFilesCached: files.filter((file) => file.cached).length,
+            modelFilesTotal: files.length,
+            runtimeFilesCached: runtimeCache.filesCached,
+            runtimeFilesTotal: runtimeCache.filesTotal,
+          },
+        },
+      )
       return {
         supported: runtimeCache.supported,
         cached: result.allCached && runtimeCache.allCached,
@@ -1278,6 +1357,7 @@ export class SemanticEvaluator {
         error: runtimeCache.error,
       }
     } catch (error) {
+      recordDebugCache("compact", "model-cache-probe", "error", { error })
       return {
         supported: !usesDefaultCache,
         cached: false,

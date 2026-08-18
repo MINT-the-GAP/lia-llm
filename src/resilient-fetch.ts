@@ -19,6 +19,12 @@ export interface DownloadRetry {
   error: unknown
 }
 
+export interface DownloadFailure {
+  url: string
+  expectedBytes?: number
+  error: unknown
+}
+
 export interface ResilientFetchOptions {
   chunkSizeBytes?: number
   stallTimeoutMs?: number
@@ -26,6 +32,7 @@ export interface ResilientFetchOptions {
   shouldChunk?(request: Request): boolean
   onActivity?(activity: DownloadActivity): void
   onRetry?(retry: DownloadRetry): void
+  onFailure?(failure: DownloadFailure): void
 }
 
 interface RangeResponse {
@@ -249,6 +256,7 @@ export class ResilientFetchSession {
   private readonly shouldChunk: (request: Request) => boolean
   private readonly onActivity?: (activity: DownloadActivity) => void
   private readonly onRetry?: (retry: DownloadRetry) => void
+  private readonly onFailure?: (failure: DownloadFailure) => void
 
   constructor(baseFetch: FetchLike, options: ResilientFetchOptions = {}) {
     this.baseFetch = baseFetch
@@ -267,10 +275,19 @@ export class ResilientFetchSession {
     this.shouldChunk = options.shouldChunk ?? shouldChunkModelRequest
     this.onActivity = options.onActivity
     this.onRetry = options.onRetry
+    this.onFailure = options.onFailure
   }
 
   readonly fetch: FetchLike = async (input, init) => {
     return this.fetchRequest(input, init)
+  }
+
+  private reportFailure(failure: DownloadFailure): void {
+    try {
+      this.onFailure?.(failure)
+    } catch {
+      // Diagnostic observers must never affect the download.
+    }
   }
 
   async fetchExact(
@@ -293,9 +310,18 @@ export class ResilientFetchSession {
     const signal = combinedSignal([original.signal, this.controller.signal])
     const request = new Request(original, { signal })
     throwIfAborted(signal)
-    return this.shouldChunk(request)
-      ? this.fetchChunked(request, expectedByteLength)
-      : this.fetchDirect(request, expectedByteLength)
+    try {
+      return await (this.shouldChunk(request)
+        ? this.fetchChunked(request, expectedByteLength)
+        : this.fetchDirect(request, expectedByteLength))
+    } catch (error) {
+      this.reportFailure({
+        url: request.url,
+        expectedBytes: expectedByteLength,
+        error,
+      })
+      throw error
+    }
   }
 
   abort(reason = "Der Modell-Download wurde beendet."): void {
@@ -789,6 +815,11 @@ export class ResilientFetchSession {
         } catch (error) {
           finished = true
           void fullObject?.reader.cancel(error).catch(() => undefined)
+          this.reportFailure({
+            url: request.url,
+            expectedBytes: expectedByteLength ?? first.total,
+            error,
+          })
           controller.error(error)
         }
       },

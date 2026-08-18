@@ -31,6 +31,17 @@ import {
 import { formatResult } from "../src/format.ts"
 import { decideModelDownload } from "../src/download-policy.ts"
 import {
+  beginDebugLoad,
+  classifyDebugFindings,
+  createDebugReport,
+  recordDebugCache,
+  recordDebugFailure,
+  recordDebugPolicy,
+  recordDebugRetry,
+  registerDebugDiagnostics,
+  sanitizeDebugText,
+} from "../src/debug-diagnostics.ts"
+import {
   EvaluationInputError,
   feedbackForError,
   feedbackForResult,
@@ -70,6 +81,9 @@ import {
 import type {
   Criterion,
   CriterionResult,
+  DebugEnvironment,
+  DebugStorageSummary,
+  DebugTraceEvent,
   EvaluationProgressPhase,
   EvaluationRequest,
   EvaluationResult,
@@ -209,6 +223,975 @@ async function withGlobalFetch<T>(
     }
   }
 }
+
+const DEBUG_ENVIRONMENT: DebugEnvironment = {
+  origin: "https://liascript.github.io",
+  browser: "Test Browser",
+  platform: "Test OS",
+  mobile: false,
+  online: true,
+  saveData: false,
+  connectionType: "wifi",
+  secureContext: true,
+  topLevel: true,
+  cacheStorage: true,
+  storageManager: true,
+  serviceWorkerControlled: false,
+  webAssembly: true,
+  webGpu: false,
+  crossOriginIsolated: false,
+}
+
+const DEBUG_STORAGE: DebugStorageSummary = {
+  persisted: false,
+  usageMiB: 12,
+  quotaMiB: 512,
+  remainingMiB: 500,
+  usagePercent: 2.3,
+  cache: null,
+}
+
+function debugEvent(
+  event: Omit<DebugTraceEvent, "sequence" | "elapsedMs">,
+  sequence = 1,
+): DebugTraceEvent {
+  return { sequence, elapsedMs: sequence, ...event }
+}
+
+function debugFindingCodes(
+  events: readonly DebugTraceEvent[],
+  environment: DebugEnvironment = DEBUG_ENVIRONMENT,
+  storage: DebugStorageSummary = DEBUG_STORAGE,
+): string[] {
+  return classifyDebugFindings(events, environment, storage, null).map(
+    (finding) => finding.code,
+  )
+}
+
+test("debug diagnostics classify network, proxy, size, and integrity failures", () => {
+  const cases: Array<{
+    code: string
+    event: DebugTraceEvent
+    environment?: DebugEnvironment
+  }> = [
+    {
+      code: "http-forbidden",
+      event: debugEvent({ kind: "fetch-response", httpStatus: 403 }),
+    },
+    {
+      code: "proxy-auth",
+      event: debugEvent({ kind: "fetch-response", httpStatus: 407 }),
+    },
+    {
+      code: "asset-not-found",
+      event: debugEvent({ kind: "fetch-response", httpStatus: 404 }),
+    },
+    {
+      code: "upstream-error",
+      event: debugEvent({ kind: "fetch-response", httpStatus: 502 }),
+    },
+    {
+      code: "http-timeout",
+      event: debugEvent({ kind: "fetch-response", httpStatus: 408 }),
+    },
+    {
+      code: "http-retry-later",
+      event: debugEvent({ kind: "fetch-response", httpStatus: 425 }),
+    },
+    {
+      code: "http-retry-later",
+      event: debugEvent({ kind: "fetch-response", httpStatus: 429 }),
+    },
+    {
+      code: "network-blocked",
+      event: debugEvent({
+        kind: "failure",
+        errorName: "TypeError",
+        message: "Failed to fetch",
+      }),
+    },
+    {
+      code: "offline",
+      environment: { ...DEBUG_ENVIRONMENT, online: false },
+      event: debugEvent({
+        kind: "failure",
+        errorName: "TypeError",
+        message: "Failed to fetch",
+      }),
+    },
+    {
+      code: "download-size-mismatch",
+      event: debugEvent({
+        kind: "failure",
+        message: "Zu viele Download-Daten: 47389 statt 17570 Bytes empfangen.",
+      }),
+    },
+    {
+      code: "integrity-failed",
+      event: debugEvent({
+        kind: "failure",
+        message: "SHA-256 integrity hash mismatch",
+      }),
+    },
+    {
+      code: "range-response-invalid",
+      event: debugEvent({
+        kind: "failure",
+        message: "HTTP 200 statt 206 für die Range-Anfrage erhalten.",
+      }),
+    },
+    {
+      code: "range-response-invalid",
+      event: debugEvent({
+        kind: "failure",
+        message: "Byte-Download unerwartet beendet.",
+      }),
+    },
+    {
+      code: "download-truncated",
+      event: debugEvent({
+        kind: "failure",
+        message: "Leere Download-Antwort erhalten.",
+      }),
+    },
+    {
+      code: "download-truncated",
+      event: debugEvent({
+        kind: "failure",
+        message: "Leere Voll-Download-Antwort erhalten.",
+      }),
+    },
+  ]
+
+  for (const item of cases) {
+    assert.equal(
+      debugFindingCodes(
+        [item.event],
+        item.environment ?? DEBUG_ENVIRONMENT,
+      ).includes(item.code),
+      true,
+      item.code,
+    )
+  }
+})
+
+test("debug diagnostics classify runtime startup failures without hiding a network cause", () => {
+  const runtime = (
+    error: string,
+    assessmentEngine: "compact" | "quality" = "compact",
+  ): RuntimeStatus => ({
+    phase: "error",
+    assessmentEngine,
+    modelId: "runtime-test-model",
+    revision: "runtime-test-revision",
+    device: assessmentEngine === "quality" ? "webgpu" : "wasm",
+    dtype: assessmentEngine === "quality" ? "q4f16" : "q8",
+    error,
+  })
+  const cases: Array<{ code: string; status: RuntimeStatus }> = [
+    {
+      code: "onnx-wasm-runtime-failed",
+      status: runtime(
+        "ONNX Runtime could not instantiate the WebAssembly execution provider.",
+      ),
+    },
+    {
+      code: "webgpu-runtime-failed",
+      status: runtime(
+        "WebGPU requestAdapter failed before requestDevice.",
+        "quality",
+      ),
+    },
+    {
+      code: "runtime-csp-blocked",
+      status: runtime(
+        "Refused to compile WebAssembly because Content Security Policy script-src does not allow wasm-unsafe-eval.",
+      ),
+    },
+  ]
+
+  for (const item of cases) {
+    const findings = classifyDebugFindings(
+      [],
+      DEBUG_ENVIRONMENT,
+      DEBUG_STORAGE,
+      item.status,
+    )
+    assert.equal(
+      findings.some((finding) => finding.code === item.code),
+      true,
+      item.code,
+    )
+    assert.equal(
+      findings.some((finding) => finding.code === "unknown"),
+      false,
+      item.code,
+    )
+  }
+
+  const networkAndRuntime = classifyDebugFindings(
+    [
+      debugEvent({
+        kind: "failure",
+        errorName: "TypeError",
+        message: "Failed to fetch",
+      }),
+    ],
+    DEBUG_ENVIRONMENT,
+    DEBUG_STORAGE,
+    runtime("ONNX Runtime failed to instantiate WebAssembly."),
+  )
+  assert.equal(
+    networkAndRuntime.find((finding) => finding.severity === "error")?.code,
+    "network-blocked",
+  )
+  assert.equal(
+    networkAndRuntime.some(
+      (finding) => finding.code === "onnx-wasm-runtime-failed",
+    ),
+    true,
+  )
+})
+
+test("a later success recovers 429 and 503 only for the same requested asset and run", () => {
+  for (const status of [429, 503]) {
+    const runId = "compact-http-recovery-" + status
+    const requested = {
+      requestedHost: "models.example.test",
+      requestedArtifact: "model.onnx",
+    }
+    const recovered = classifyDebugFindings(
+      [
+        debugEvent({
+          kind: "fetch-response",
+          runId,
+          host: "gateway.example.test",
+          artifact: "retry",
+          httpStatus: status,
+          details: requested,
+        }),
+        debugEvent(
+          {
+            kind: "fetch-response",
+            runId,
+            host: "cdn.example.test",
+            artifact: "redirected-model.onnx",
+            httpStatus: 200,
+            details: requested,
+          },
+          2,
+        ),
+      ],
+      DEBUG_ENVIRONMENT,
+      DEBUG_STORAGE,
+      null,
+    )
+    assert.equal(
+      recovered.some((finding) => finding.severity === "error"),
+      false,
+      "HTTP " + status,
+    )
+  }
+
+  const differentAsset = classifyDebugFindings(
+    [
+      debugEvent({
+        kind: "fetch-response",
+        runId: "compact-http-mismatch",
+        httpStatus: 429,
+        details: {
+          requestedHost: "models.example.test",
+          requestedArtifact: "first.onnx",
+        },
+      }),
+      debugEvent(
+        {
+          kind: "fetch-response",
+          runId: "compact-http-mismatch",
+          httpStatus: 200,
+          details: {
+            requestedHost: "models.example.test",
+            requestedArtifact: "second.onnx",
+          },
+        },
+        2,
+      ),
+    ],
+    DEBUG_ENVIRONMENT,
+    DEBUG_STORAGE,
+    null,
+  )
+  assert.equal(
+    differentAsset.find((finding) => finding.severity === "error")?.code,
+    "http-retry-later",
+  )
+})
+
+test("debug diagnostics distinguish cache quota, access, corruption, and absence", () => {
+  const quota = debugEvent({
+    kind: "cache",
+    stage: "put",
+    outcome: "failed",
+    errorName: "QuotaExceededError",
+  })
+  const denied = debugEvent({
+    kind: "cache",
+    stage: "open",
+    outcome: "failed",
+    errorName: "SecurityError",
+  })
+  const corrupt = debugEvent({
+    kind: "cache",
+    stage: "read",
+    outcome: "invalid-integrity",
+    artifact: "model.onnx",
+  })
+
+  assert.deepEqual(
+    debugFindingCodes([quota, denied, corrupt]).filter((code) =>
+      code.startsWith("cache-"),
+    ),
+    ["cache-quota", "cache-access-denied", "cache-corrupt"],
+  )
+  assert.equal(
+    debugFindingCodes([], {
+      ...DEBUG_ENVIRONMENT,
+      cacheStorage: false,
+    }).includes("cache-unsupported"),
+    true,
+  )
+})
+
+test("debug diagnostics treat decoded gzip length as information, not corruption", () => {
+  const events = [
+    debugEvent({
+      kind: "fetch-response",
+      host: "raw.githubusercontent.com",
+      artifact: "ort-runtime.mjs",
+      httpStatus: 200,
+      details: { contentLength: "17570" },
+    }),
+    debugEvent(
+      {
+        kind: "fetch-activity",
+        host: "raw.githubusercontent.com",
+        artifact: "ort-runtime.mjs",
+        loaded: 47389,
+        expected: 47389,
+      },
+      2,
+    ),
+  ]
+  const findings = classifyDebugFindings(
+    events,
+    DEBUG_ENVIRONMENT,
+    DEBUG_STORAGE,
+    null,
+  )
+
+  assert.deepEqual(findings.map((finding) => finding.code), [
+    "decoded-transfer-length",
+  ])
+  assert.equal(findings[0]?.severity, "info")
+  assert.deepEqual(JSON.parse(JSON.stringify(findings)), findings)
+})
+
+test("a recovered retry stays informational and never becomes the primary error", async () => {
+  const runId = beginDebugLoad("compact")
+  recordDebugRetry("compact", {
+    url: "https://example.test/model.onnx",
+    attempt: 2,
+    error: new TypeError("Failed to fetch"),
+  })
+  const report = await withCacheStorage(
+    new RuntimeCacheStorageStub().asCacheStorage(),
+    () =>
+      createDebugReport(
+        {
+          version: "0.5.2",
+          getStatus: () => ({
+            phase: "ready",
+            loadSource: "network",
+            assessmentEngine: "compact",
+            modelId: "test-model",
+            revision: "test-revision",
+            device: "wasm",
+            dtype: "q8",
+          }),
+          getCacheInfo: async () => ({
+            supported: true,
+            cached: true,
+            downloadCached: true,
+            filesCached: 6,
+            filesTotal: 6,
+            estimatedBytes: 100,
+            persistent: true,
+          }),
+        },
+        { print: false },
+      ),
+  )
+
+  assert.equal(report.runId, runId)
+  assert.equal(report.outcome, "ready")
+  assert.equal(report.primaryCause, "network-retry-recovered")
+  assert.equal(
+    report.findings.some((finding) => finding.severity === "error"),
+    false,
+  )
+  assert.equal(
+    report.events.some((event) => event.kind === "fetch-retry"),
+    true,
+  )
+})
+
+test("one diagnostic run preserves its load, policy, and cache evidence", async () => {
+  const runId = beginDebugLoad("compact")
+  const cacheInfo: ModelCacheInfo = {
+    supported: true,
+    cached: false,
+    downloadCached: false,
+    filesCached: 1,
+    filesTotal: 6,
+    estimatedBytes: 100,
+    persistent: false,
+  }
+  recordDebugPolicy(
+    "compact",
+    "auto",
+    cacheInfo,
+    { online: true, saveData: false, connectionType: "wifi" },
+  )
+  recordDebugCache("compact", "runtime-match", "miss", {
+    url: "https://example.test/runtime.wasm",
+  })
+  const report = await createDebugReport(
+    {
+      version: "0.5.2",
+      getStatus: () => ({
+        phase: "loading",
+        loadSource: "network",
+        assessmentEngine: "compact",
+        modelId: "test-model",
+        revision: "test-revision",
+        device: "wasm",
+        dtype: "q8",
+      }),
+      getCacheInfo: async () => cacheInfo,
+    },
+    { print: false },
+  )
+
+  assert.equal(report.runId, runId)
+  assert.equal(
+    report.events.filter((event) => event.kind === "load-start").length,
+    1,
+  )
+  assert.equal(
+    report.events.some(
+      (event) => event.kind === "policy" && event.runId === runId,
+    ),
+    true,
+  )
+  assert.equal(
+    report.events.some(
+      (event) => event.kind === "cache" && event.runId === runId,
+    ),
+    true,
+  )
+  assert.equal(
+    report.events.every(
+      (event) => event.engine === undefined || event.runId === runId,
+    ),
+    true,
+  )
+})
+
+test("interleaved compact and quality reports keep engine and run evidence isolated", async () => {
+  const compactRun = beginDebugLoad("compact")
+  recordDebugFailure(
+    "compact",
+    {
+      url: "https://compact.example.test/model.onnx",
+      error: new TypeError("Failed to fetch"),
+    },
+    "download",
+  )
+  const qualityRun = beginDebugLoad("quality")
+  recordDebugCache("quality", "model-cache-probe", "partial", {
+    cacheName: "webllm/model",
+  })
+  const cacheInfo: ModelCacheInfo = {
+    supported: true,
+    cached: false,
+    downloadCached: false,
+    filesCached: 0,
+    filesTotal: 10,
+    estimatedBytes: 200,
+    engines: {
+      compact: {
+        supported: true,
+        cached: false,
+        downloadCached: false,
+        filesCached: 0,
+        filesTotal: 6,
+        estimatedBytes: 100,
+      },
+      quality: {
+        supported: true,
+        cached: false,
+        downloadCached: false,
+        filesCached: 0,
+        filesTotal: 4,
+        estimatedBytes: 100,
+      },
+    },
+  }
+  const api = {
+    version: "0.5.2",
+    getStatus: (): RuntimeStatus => ({
+      phase: "ready",
+      loadSource: "network",
+      assessmentEngine: "quality",
+      modelId: "quality-test",
+      revision: "quality-revision",
+      device: "webgpu",
+      dtype: "q4f16",
+    }),
+    getCacheInfo: async () => cacheInfo,
+  }
+
+  const [compact, quality] = await withCacheStorage(
+    new RuntimeCacheStorageStub().asCacheStorage(),
+    () =>
+      Promise.all([
+        createDebugReport(
+          api,
+          { print: false },
+          "load-error",
+          {
+            engine: "compact",
+            runId: compactRun,
+            status: {
+              phase: "error",
+              assessmentEngine: "compact",
+              modelId: "compact-test",
+              revision: "compact-revision",
+              device: "wasm",
+              dtype: "q8",
+              error: "Failed to fetch",
+            },
+          },
+        ),
+        createDebugReport(
+          api,
+          { print: false },
+          "post-ready-cache-check",
+          {
+            engine: "quality",
+            runId: qualityRun,
+            status: api.getStatus(),
+          },
+        ),
+      ]),
+  )
+
+  assert.equal(compact.runId, compactRun)
+  assert.equal(compact.runtime?.assessmentEngine, "compact")
+  assert.equal(compact.primaryCause, "network-blocked")
+  assert.equal(
+    compact.events.every(
+      (event) =>
+        event.engine === undefined ||
+        (event.engine === "compact" && event.runId === compactRun),
+    ),
+    true,
+  )
+  assert.equal(
+    compact.events.some((event) => event.engine === "quality"),
+    false,
+  )
+
+  assert.equal(quality.runId, qualityRun)
+  assert.equal(quality.runtime?.assessmentEngine, "quality")
+  assert.equal(quality.outcome, "cache-incomplete")
+  assert.equal(
+    quality.events.every(
+      (event) =>
+        event.engine === undefined ||
+        (event.engine === "quality" && event.runId === qualityRun),
+    ),
+    true,
+  )
+  assert.equal(
+    quality.events.some((event) => event.engine === "compact"),
+    false,
+  )
+})
+
+test("an intentional abort is informational and not a diagnostic error", async () => {
+  const runId = beginDebugLoad("compact")
+  const abort = new Error("Der Modell-Download wurde beendet.")
+  abort.name = "AbortError"
+  recordDebugFailure(
+    "compact",
+    {
+      url: "https://example.test/model.onnx",
+      error: abort,
+    },
+    "download",
+  )
+  const report = await withCacheStorage(
+    new RuntimeCacheStorageStub().asCacheStorage(),
+    () =>
+      createDebugReport(
+        {
+          version: "0.5.2",
+          getStatus: () => ({
+            phase: "error",
+            assessmentEngine: "compact",
+            modelId: "test-model",
+            revision: "test-revision",
+            device: "wasm",
+            dtype: "q8",
+            error: "AbortError",
+          }),
+          getCacheInfo: async () => ({
+            supported: true,
+            cached: false,
+            downloadCached: false,
+            filesCached: 0,
+            filesTotal: 6,
+            estimatedBytes: 100,
+          }),
+        },
+        { print: false },
+      ),
+  )
+
+  assert.equal(report.runId, runId)
+  assert.equal(report.primaryCause, "download-cancelled")
+  assert.equal(
+    report.findings.some((finding) => finding.severity === "error"),
+    false,
+  )
+  assert.equal(
+    report.findings.find(
+      (finding) => finding.code === "download-cancelled",
+    )?.severity,
+    "info",
+  )
+})
+
+test("debug text redacts URL credentials, query secrets, fragments, and bearer tokens", () => {
+  const queryCanary = "QUERY_SECRET_3a10"
+  const fragmentCanary = "FRAGMENT_SECRET_b627"
+  const bearerCanary = "BEARER_SECRET_8d09"
+  const sanitized = sanitizeDebugText(
+    "Download https://example.test/private/model.onnx?token=" +
+      queryCanary +
+      "#" +
+      fragmentCanary +
+      " failed with Bearer " +
+      bearerCanary,
+  )
+
+  assert.equal(sanitized.includes(queryCanary), false)
+  assert.equal(sanitized.includes(fragmentCanary), false)
+  assert.equal(sanitized.includes(bearerCanary), false)
+  assert.match(sanitized, /example\.test/u)
+  assert.match(sanitized, /model\.onnx/u)
+})
+
+test("debug reports are JSON serializable and never copy answers, URL secrets, or stacks", async () => {
+  const answerCanary = "STUDENT_ANSWER_SECRET_5f27"
+  const queryCanary = "REPORT_QUERY_SECRET_a91e"
+  const fragmentCanary = "REPORT_FRAGMENT_SECRET_62d4"
+  const stackCanary = "REPORT_STACK_SECRET_f881"
+  const cacheError = new Error(
+    "Cache inspection failed for " +
+      "https://cache.example.test/model.onnx?token=" +
+      queryCanary +
+      "#" +
+      fragmentCanary,
+  ) as Error & { answer?: string }
+  cacheError.answer = answerCanary
+  cacheError.stack = "Error: safe message\n    at " + stackCanary
+  const unsafeStatus = {
+    phase: "error",
+    assessmentEngine: "compact",
+    modelId:
+      "https://models.example.test/private/model?token=" +
+      queryCanary +
+      "#" +
+      fragmentCanary,
+    revision:
+      "https://models.example.test/revision?signature=" +
+      queryCanary +
+      "#" +
+      fragmentCanary,
+    device: "wasm",
+    dtype: "q8",
+    error:
+      "Runtime failed at https://runtime.example.test/file.wasm?key=" +
+      queryCanary +
+      "#" +
+      fragmentCanary,
+    answer: answerCanary,
+  } as RuntimeStatus & { answer: string }
+  const consoleMethods = [
+    "error",
+    "warn",
+    "info",
+    "log",
+    "table",
+    "groupCollapsed",
+    "groupEnd",
+  ] as const
+  const diagnosticConsole = console as unknown as Record<
+    string,
+    (...args: unknown[]) => void
+  >
+  const originalConsole = Object.fromEntries(
+    consoleMethods.map((method) => [method, diagnosticConsole[method]]),
+  )
+  const consoleCalls: unknown[][] = []
+  let report
+  try {
+    for (const method of consoleMethods) {
+      diagnosticConsole[method] = (...args: unknown[]) => {
+        consoleCalls.push(args)
+      }
+    }
+    report = await createDebugReport(
+      {
+        version: "0.5.2",
+        getStatus: () => unsafeStatus,
+        getCacheInfo: async () => {
+          throw cacheError
+        },
+      },
+      { print: true },
+    )
+  } finally {
+    for (const method of consoleMethods) {
+      diagnosticConsole[method] = originalConsole[method]!
+    }
+  }
+  const serialized = JSON.stringify(report)
+  const serializedConsole = JSON.stringify(consoleCalls)
+  const parsed = JSON.parse(serialized)
+
+  assert.equal(parsed.schemaVersion, 1)
+  assert.equal(parsed.libraryVersion, "0.5.2")
+  assert.equal(Array.isArray(parsed.findings), true)
+  assert.equal(Array.isArray(parsed.events), true)
+  assert.equal(serialized.includes(answerCanary), false)
+  assert.equal(serialized.includes(queryCanary), false)
+  assert.equal(serialized.includes(fragmentCanary), false)
+  assert.equal(serialized.includes(stackCanary), false)
+  assert.equal(serializedConsole.includes(answerCanary), false)
+  assert.equal(serializedConsole.includes(queryCanary), false)
+  assert.equal(serializedConsole.includes(fragmentCanary), false)
+  assert.equal(serializedConsole.includes(stackCanary), false)
+  assert.equal("answer" in parsed.runtime, false)
+  assert.deepEqual(parsed.privacy, {
+    localOnly: true,
+    studentContentLogged: false,
+    responseBodiesLogged: false,
+    stacksLogged: false,
+    urlPolicy: "origin-host-and-artifact-only",
+  })
+})
+
+test("hanging storage probes time out together and print one automatic storage warning", async () => {
+  const never = new Promise<never>(() => undefined)
+  const status: RuntimeStatus = {
+    phase: "ready",
+    loadSource: "network",
+    assessmentEngine: "compact",
+    modelId: "storage-timeout-model",
+    revision: "storage-timeout-revision",
+    device: "wasm",
+    dtype: "q8",
+  }
+  const preflightCache: ModelCacheInfo = {
+    supported: true,
+    cached: false,
+    downloadCached: false,
+    filesCached: 0,
+    filesTotal: 6,
+    estimatedBytes: 100,
+  }
+  let cacheInfoCalls = 0
+  let persistedCalls = 0
+  let estimateCalls = 0
+  const api = {
+    version: "0.5.2",
+    getStatus: () => status,
+    getCacheInfo: () => {
+      cacheInfoCalls += 1
+      return never
+    },
+  }
+  const navigatorObject = globalThis.navigator
+  const storageDescriptor = Object.getOwnPropertyDescriptor(
+    navigatorObject,
+    "storage",
+  )
+  const cachesDescriptor = Object.getOwnPropertyDescriptor(globalThis, "caches")
+  const addEventListenerDescriptor = Object.getOwnPropertyDescriptor(
+    globalThis,
+    "addEventListener",
+  )
+  const consoleMethods = [
+    "error",
+    "warn",
+    "info",
+    "log",
+    "table",
+    "groupCollapsed",
+    "groupEnd",
+  ] as const
+  const diagnosticConsole = console as unknown as Record<
+    string,
+    (...args: unknown[]) => void
+  >
+  const originalConsole = Object.fromEntries(
+    consoleMethods.map((method) => [method, diagnosticConsole[method]]),
+  )
+  const consoleCalls: Array<{ method: string; args: unknown[] }> = []
+  let statusListener: ((event: Event) => void) | null = null
+  let notePrinted!: () => void
+  const printed = new Promise<void>((resolve) => {
+    notePrinted = resolve
+  })
+  let elapsedMs = Number.POSITIVE_INFINITY
+
+  Object.defineProperty(navigatorObject, "storage", {
+    configurable: true,
+    value: {
+      persisted: () => {
+        persistedCalls += 1
+        return never
+      },
+      estimate: () => {
+        estimateCalls += 1
+        return never
+      },
+    },
+  })
+  Object.defineProperty(globalThis, "caches", {
+    configurable: true,
+    value: new RuntimeCacheStorageStub().asCacheStorage(),
+  })
+  Object.defineProperty(globalThis, "addEventListener", {
+    configurable: true,
+    value: (
+      type: string,
+      listener: EventListenerOrEventListenerObject,
+    ): void => {
+      if (type !== "lia-llm:status") return
+      statusListener = typeof listener === "function"
+        ? listener
+        : (event) => listener.handleEvent(event)
+    },
+  })
+  for (const method of consoleMethods) {
+    diagnosticConsole[method] = (...args: unknown[]) => {
+      consoleCalls.push({ method, args })
+      if (method === "groupEnd") notePrinted()
+    }
+  }
+
+  try {
+    registerDebugDiagnostics(api as never)
+    assert.notEqual(statusListener, null)
+    const runId = beginDebugLoad("compact")
+    recordDebugPolicy(
+      "compact",
+      "download",
+      preflightCache,
+      { online: true, saveData: false, connectionType: "wifi" },
+    )
+    const startedAt = performance.now()
+    statusListener?.({ detail: status } as unknown as Event)
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        printed,
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error("automatic storage DebugNotiz timed out")),
+            8_000,
+          )
+        }),
+      ])
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout)
+    }
+    elapsedMs = performance.now() - startedAt
+    assert.match(runId, /^compact-/u)
+  } finally {
+    for (const method of consoleMethods) {
+      diagnosticConsole[method] = originalConsole[method]!
+    }
+    if (storageDescriptor) {
+      Object.defineProperty(navigatorObject, "storage", storageDescriptor)
+    } else {
+      Reflect.deleteProperty(navigatorObject, "storage")
+    }
+    if (cachesDescriptor) {
+      Object.defineProperty(globalThis, "caches", cachesDescriptor)
+    } else {
+      Reflect.deleteProperty(globalThis, "caches")
+    }
+    if (addEventListenerDescriptor) {
+      Object.defineProperty(
+        globalThis,
+        "addEventListener",
+        addEventListenerDescriptor,
+      )
+    } else {
+      Reflect.deleteProperty(globalThis, "addEventListener")
+    }
+  }
+
+  const consoleText = consoleCalls
+    .flatMap((call) => call.args)
+    .filter((value): value is string => typeof value === "string")
+    .join("\n")
+  const block = consoleText.match(
+    /--- BEGIN LIA-LLM DEBUGNOTIZ ---\n([\s\S]*?)\n--- END LIA-LLM DEBUGNOTIZ ---/u,
+  )
+  const report = block ? JSON.parse(block[1]!) : null
+
+  assert.equal(cacheInfoCalls, 1)
+  assert.equal(persistedCalls, 1)
+  assert.equal(estimateCalls, 1)
+  assert.equal(elapsedMs >= 4_900, true, "probes must really time out")
+  assert.equal(elapsedMs < 8_000, true, "probes must time out in parallel")
+  assert.equal(
+    consoleCalls.filter((call) => call.method === "groupCollapsed").length,
+    1,
+  )
+  assert.equal(
+    consoleCalls.filter((call) => call.method === "groupEnd").length,
+    1,
+  )
+  assert.equal(report?.trigger, "post-ready-cache-check")
+  assert.equal(report?.outcome, "ready")
+  assert.equal(report?.primaryCause, "storage-inspection-failed")
+  assert.equal(
+    report?.findings.some(
+      (finding: { code?: string }) => finding.code === "cache-incomplete",
+    ),
+    false,
+  )
+  assert.match(report?.storage?.error ?? "", /Cacheprüfung/u)
+  assert.match(report?.storage?.error ?? "", /Persistenzprüfung/u)
+  assert.match(report?.storage?.error ?? "", /Speicherquotenprüfung/u)
+})
 
 test("parseCriteria accepts a compact separator syntax", () => {
   assert.deepEqual(parseCriteria("Energieumwandlung || Stoffbilanz\nSauerstoff"), [
@@ -2950,17 +3933,17 @@ test("formatResult hides criterion details by default but keeps them available",
   assert.match(detailed, /Bestätigung:/u)
 })
 
-test("the public version remains pinned exactly to 0.5.1", () => {
+test("the public version remains pinned exactly to 0.5.2", () => {
   const packageJson = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   ) as { version?: string }
   const entry = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8")
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8")
 
-  assert.equal(packageJson.version, "0.5.1")
-  assert.match(entry, /const VERSION = "0\.5\.1"/u)
-  assert.match(readme, /^version:\s+0\.5\.1$/mu)
-  assert.match(readme, /^script:\s+\.\/dist\/index\.js\?v=0\.5\.1$/mu)
+  assert.equal(packageJson.version, "0.5.2")
+  assert.match(entry, /const VERSION = "0\.5\.2"/u)
+  assert.match(readme, /^version:\s+0\.5\.2$/mu)
+  assert.match(readme, /^script:\s+\.\/dist\/index\.js\?v=0\.5\.2$/mu)
 })
 
 test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper", () => {
@@ -3695,6 +4678,11 @@ test("resilient fetch preserves a terminal 404 without repeated requests", async
 test("resilient fetch does not retry a terminal 404 for a later range", async () => {
   const payload = Uint8Array.from([0, 1, 2, 3, 4, 5])
   let calls = 0
+  const failures: Array<{
+    url: string
+    expectedBytes?: number
+    error: unknown
+  }> = []
   const baseFetch = async (input: RequestInfo | URL): Promise<Response> => {
     const request = input instanceof Request ? input : new Request(input)
     calls += 1
@@ -3716,11 +4704,16 @@ test("resilient fetch does not retry a terminal 404 for a later range", async ()
     chunkSizeBytes: 4,
     retryDelaysMs: [0, 0, 0, 0],
     stallTimeoutMs: 1_000,
+    onFailure: (failure) => failures.push(failure),
   })
 
   const response = await session.fetch("https://example.test/model.onnx")
   await assert.rejects(response.arrayBuffer(), /HTTP 404/u)
   assert.equal(calls, 2)
+  assert.equal(failures.length, 1)
+  assert.equal(failures[0].url, "https://example.test/model.onnx")
+  assert.equal(failures[0].expectedBytes, payload.byteLength)
+  assert.match(String(failures[0].error), /HTTP 404/u)
 })
 
 test("quiz textarea keeps all arrow keys inside the answer field", () => {

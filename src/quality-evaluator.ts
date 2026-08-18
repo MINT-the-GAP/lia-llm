@@ -1,6 +1,14 @@
 import type { MLCEngine } from "@mlc-ai/web-llm"
 
 import * as webLlm from "./generated/webllm.js"
+import {
+  beginDebugLoad,
+  instrumentDebugFetch,
+  recordDebugActivity,
+  recordDebugCache,
+  recordDebugFailure,
+  recordDebugRetry,
+} from "./debug-diagnostics.ts"
 
 import {
   createQualityAppConfig,
@@ -645,13 +653,21 @@ export class QualityEvaluator {
       throw new Error("Dieser Browser unterst\u00fctzt keine Modell-Downloads.")
     }
 
-    const session = new ResilientFetchSession(globalThis.fetch.bind(globalThis), {
-      onRetry: ({ attempt }) => {
+    const diagnosticFetch = instrumentDebugFetch(
+      "quality",
+      globalThis.fetch.bind(globalThis),
+    )
+    const session = new ResilientFetchSession(diagnosticFetch, {
+      onActivity: (activity) => recordDebugActivity("quality", activity),
+      onRetry: (retry) => {
+        const { attempt } = retry
+        recordDebugRetry("quality", retry)
         emit<ModelProgress>("lia-llm:progress", {
           status: "loading",
           message: `Unterbrochener Download wird fortgesetzt (Versuch ${attempt}).`,
         })
       },
+      onFailure: (failure) => recordDebugFailure("quality", failure),
     })
     this.fetchSession = session
 
@@ -697,9 +713,13 @@ export class QualityEvaluator {
     }
   }
 
-  async preload(cacheInfo?: ModelCacheInfo): Promise<RuntimeStatus> {
+  async preload(
+    cacheInfo?: ModelCacheInfo,
+    diagnosticRunStarted = false,
+  ): Promise<RuntimeStatus> {
     if (this.engine) return this.getStatus()
     if (!this.loadPromise) {
+      if (!diagnosticRunStarted) beginDebugLoad("quality")
       this.loadPromise = (async () => {
         const cache = cacheInfo ?? (await this.getCacheInfo())
         this.loadSource = cache.cached ? "cache" : "network"
@@ -988,6 +1008,7 @@ export class QualityEvaluator {
 
   async getCacheInfo(): Promise<ModelCacheInfo> {
     if (typeof caches === "undefined") {
+      recordDebugCache("quality", "model-cache-probe", "unsupported")
       return {
         supported: false,
         cached: false,
@@ -1053,6 +1074,14 @@ export class QualityEvaluator {
         wasmCached,
       ]
       const filesCached = cacheParts.filter(Boolean).length
+      recordDebugCache(
+        "quality",
+        "model-cache-probe",
+        filesCached === cacheParts.length ? "hit" : "partial",
+        {
+          details: { filesCached, filesTotal: cacheParts.length },
+        },
+      )
       return {
         supported: true,
         cached: filesCached === cacheParts.length,
@@ -1062,6 +1091,7 @@ export class QualityEvaluator {
         estimatedBytes: QUALITY_MODEL_ESTIMATED_BYTES,
       }
     } catch (error) {
+      recordDebugCache("quality", "model-cache-probe", "error", { error })
       return {
         supported: true,
         cached: false,

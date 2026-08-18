@@ -3,6 +3,10 @@ import {
   showActivity,
 } from "./activity-element.ts"
 import { AutomaticEvaluator } from "./automatic-evaluator.ts"
+import {
+  createDebugReport,
+  registerDebugDiagnostics,
+} from "./debug-diagnostics.ts"
 import { SemanticEvaluator } from "./evaluator.ts"
 import { registerFeedbackElement, showFeedback } from "./feedback-element.ts"
 import { formatResult } from "./format.ts"
@@ -24,7 +28,7 @@ import {
 } from "./solution-element.ts"
 import type { LiaLLMApi } from "./types.ts"
 
-const VERSION = "0.5.1"
+const VERSION = "0.5.2"
 
 interface LiaLLMGlobal {
   LiaLLM?: LiaLLMApi
@@ -43,6 +47,15 @@ if (!api) {
     evaluate: (request, options) => evaluator.evaluate(request, options),
     getStatus: () => evaluator.getStatus(),
     getCacheInfo: () => evaluator.getCacheInfo(),
+    debugReport: (options) =>
+      createDebugReport(
+        {
+          version: VERSION,
+          getStatus: () => evaluator.getStatus(),
+          getCacheInfo: () => evaluator.getCacheInfo(),
+        },
+        options,
+      ),
     clearCache: () => evaluator.clearCache(),
     parseCriteria,
     parseMacroOptions,
@@ -58,11 +71,13 @@ if (!api) {
   console.warn(`lia-llm ${api.version} ist bereits geladen; ${VERSION} wird nicht zusätzlich initialisiert.`)
 }
 
-registerLoadOverlay(api)
+const activeApi = api as LiaLLMApi
+registerDebugDiagnostics(activeApi)
+registerLoadOverlay(activeApi)
 registerQuizTextareas()
 registerActivityElement()
 registerQuizPresenceElement(() => {
-  void api.preload().catch(() => undefined)
+  void activeApi.preload().catch(() => undefined)
 })
 registerFeedbackElement()
 registerSolutionElement()

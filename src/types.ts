@@ -317,6 +317,112 @@ export interface ResultFormatOptions {
   showCriteria?: boolean
 }
 
+export type DebugFindingSeverity = "info" | "warning" | "error"
+export type DebugFindingConfidence = "high" | "medium" | "low"
+export type DebugReportTrigger =
+  | "manual"
+  | "load-error"
+  | "post-ready-cache-check"
+
+export interface DebugFinding {
+  code: string
+  severity: DebugFindingSeverity
+  confidence: DebugFindingConfidence
+  title: string
+  analysis: string
+  action?: string
+  evidence: string[]
+}
+
+export interface DebugTraceEvent {
+  sequence: number
+  elapsedMs: number
+  /** Identifies the concrete load attempt this event belongs to. */
+  runId?: string
+  kind:
+    | "load-start"
+    | "policy"
+    | "persistence"
+    | "cache"
+    | "fetch-start"
+    | "fetch-response"
+    | "fetch-attempt-error"
+    | "fetch-activity"
+    | "fetch-retry"
+    | "failure"
+    | "status"
+  engine?: AssessmentEngine
+  stage?: string
+  artifact?: string
+  host?: string
+  method?: string
+  transport?: "direct" | "range" | "unknown"
+  attempt?: number
+  httpStatus?: number
+  loaded?: number
+  expected?: number
+  durationMs?: number
+  outcome?: string
+  errorName?: string
+  message?: string
+  details?: Record<string, string | number | boolean | null>
+}
+
+export interface DebugEnvironment {
+  origin: string | null
+  browser: string
+  platform: string
+  mobile: boolean | null
+  online: boolean | null
+  saveData: boolean | null
+  connectionType: string | null
+  secureContext: boolean
+  topLevel: boolean | null
+  cacheStorage: boolean
+  storageManager: boolean
+  serviceWorkerControlled: boolean
+  webAssembly: boolean
+  webGpu: boolean
+  crossOriginIsolated: boolean
+}
+
+export interface DebugStorageSummary {
+  persisted: boolean | null
+  usageMiB: number | null
+  quotaMiB: number | null
+  remainingMiB: number | null
+  usagePercent: number | null
+  cache: ModelCacheInfo | null
+  error?: string
+}
+
+export interface LiaLLMDebugReport {
+  schemaVersion: 1
+  libraryVersion: string
+  generatedAt: string
+  runId: string
+  trigger: DebugReportTrigger
+  outcome: "ready" | "failed" | "cache-incomplete" | "unknown"
+  summary: string
+  primaryCause: string
+  runtime: RuntimeStatus | null
+  environment: DebugEnvironment
+  storage: DebugStorageSummary
+  findings: DebugFinding[]
+  events: DebugTraceEvent[]
+  privacy: {
+    localOnly: true
+    studentContentLogged: false
+    responseBodiesLogged: false
+    stacksLogged: false
+    urlPolicy: "origin-host-and-artifact-only"
+  }
+}
+
+export interface DebugReportOptions {
+  print?: boolean
+}
+
 export interface LiaLLMApi {
   readonly version: string
   configure(config: Partial<RuntimeConfig>): RuntimeStatus
@@ -327,6 +433,7 @@ export interface LiaLLMApi {
   ): Promise<EvaluationResult>
   getStatus(): RuntimeStatus
   getCacheInfo(): Promise<ModelCacheInfo>
+  debugReport(options?: DebugReportOptions): Promise<LiaLLMDebugReport>
   clearCache(): Promise<number>
   parseMacroOptions(source: string): import("./macro-options.ts").LLMQuizMacroOptions
   parseCriteria(source: string | CriterionInput[] | undefined): CriterionInput[] | undefined

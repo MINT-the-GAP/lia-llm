@@ -5,6 +5,12 @@ import {
   requestPersistentStorage,
   type DownloadPolicyDecision,
 } from "./download-policy.ts"
+import {
+  beginDebugLoad,
+  recordDebugFailure,
+  recordDebugPersistence,
+  recordDebugPolicy,
+} from "./debug-diagnostics.ts"
 import { SemanticEvaluator } from "./evaluator.ts"
 import {
   normalizeLanguageAnalysisOptions,
@@ -271,11 +277,13 @@ export class AutomaticEvaluator {
     const generation = this.generation
     void requestPersistentStorage().then(
       (persistent) => {
+        recordDebugPersistence(persistent ? "granted" : "denied")
         if (generation === this.generation) {
           this.persistentStorage = persistent
         }
       },
-      () => {
+      (error) => {
+        recordDebugPersistence("error", error)
         if (generation === this.generation) {
           this.persistentStorage = false
         }
@@ -289,18 +297,28 @@ export class AutomaticEvaluator {
     cache: ModelCacheInfo,
   ): Promise<LoadAuthorization> {
     const downloadCached = cache.downloadCached ?? cache.cached
+    const network = captureNetworkSnapshot()
     const decision = decideModelDownload({
       engine,
       // Offline startup requires every runtime and metadata component, not
       // only the large model payload represented by downloadCached.
       cached: cache.cached,
-      network: captureNetworkSnapshot(),
+      network,
     })
+    recordDebugPolicy(engine, decision, cache, network)
     if (decision === "skip") return { allowed: false, decision }
 
     const allowed =
       decision === "auto" ||
       (await this.askForConsent(engine, status, cache))
+    if (decision === "consent") {
+      recordDebugPolicy(
+        engine,
+        allowed ? "consent-accepted" : "consent-denied",
+        cache,
+        network,
+      )
+    }
     if (allowed && !downloadCached) {
       this.requestPersistenceInBackground()
     }
@@ -316,6 +334,7 @@ export class AutomaticEvaluator {
 
     const generation = this.generation
     const preparation = (async () => {
+      beginDebugLoad("compact")
       const cache = await this.compactEvaluator.getCacheInfo()
       const authorization = await this.authorizeLoad(
         "compact",
@@ -323,6 +342,17 @@ export class AutomaticEvaluator {
         cache,
       )
       if (!authorization.allowed) {
+        recordDebugFailure(
+          "compact",
+          {
+            error: new Error(
+              authorization.decision === "skip"
+                ? "Download skipped while offline and cache is incomplete"
+                : "Download consent was not granted",
+            ),
+          },
+          "download-policy",
+        )
         if (authorization.decision === "skip") {
           throw new Error(
             "Das Kompaktmodell ist offline noch nicht vollständig im Browsercache verfügbar.",
@@ -333,7 +363,7 @@ export class AutomaticEvaluator {
       if (generation !== this.generation) {
         throw new Error("Das Laden des Kompaktmodells wurde beendet.")
       }
-      await this.compactEvaluator.preload(cache)
+      await this.compactEvaluator.preload(cache, true)
     })()
     this.compactPreparationPromise = preparation
 
@@ -375,6 +405,7 @@ export class AutomaticEvaluator {
       return false
     }
 
+    beginDebugLoad("quality")
     const cache = knownCache ?? (await this.getQualityCacheInfo())
     const authorization = await this.authorizeLoad(
       "quality",
@@ -386,7 +417,7 @@ export class AutomaticEvaluator {
       return false
     }
 
-    await this.qualityEvaluator.preload(cache)
+    await this.qualityEvaluator.preload(cache, true)
     if (generation !== this.generation) return false
 
     this.qualityReady = true

@@ -1,11 +1,11 @@
 <!--
 author:      MINT-the-GAP, Martin Lommatzsch
-version:     0.5.1
+version:     0.5.2
 language:    de
 narrator:    Deutsch Female
 comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
 repository:  https://github.com/MINT-the-GAP/lia-llm
-script:      ./dist/index.js?v=0.5.1
+script:      ./dist/index.js?v=0.5.2
 
 attribute:   [WebLLM](https://webllm.mlc.ai/docs/) by MLC is licensed under
              [Apache-2.0](https://github.com/mlc-ai/web-llm/blob/main/LICENSE), and
@@ -76,8 +76,8 @@ Promise.resolve()
     if (!window.LiaLLM) {
       throw new Error("lia-llm konnte nicht geladen werden.")
     }
-    if (window.LiaLLM.version !== "0.5.1") {
-      throw new Error(`lia-llm 0.5.1 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
+    if (window.LiaLLM.version !== "0.5.2") {
+      throw new Error(`lia-llm 0.5.2 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
     }
 
     const options = window.LiaLLM.parseMacroOptions(optionSource)
@@ -414,6 +414,35 @@ Ladezustand zu bleiben.
 Browser dürfen Persistenz ablehnen; ausdrücklich gelöschte Website-Daten, privater Modus,
 Speicherbereinigung oder eine andere Herkunft entfernen beziehungsweise trennen den Cache. Eine
 absolute, browserübergreifende Dauerhaftigkeit kann eine Webanwendung deshalb nicht garantieren.
+
+### DebugNotiz für Download- und Cachefehler
+
+Bei einem endgültigen Ladefehler schreibt lia-llm automatisch genau eine aufklappbare
+`[Lia-LLM DebugNotiz]` in die Entwicklerkonsole. Nach einem erfolgreichen Netzwerkdownload wird
+außerdem kontrolliert, ob Modell und Laufzeit wirklich im Browsercache angekommen sind; ein
+fehlgeschlagener Cache-Schreibvorgang erhält ebenfalls eine DebugNotiz. Der Bericht unterscheidet
+unter anderem Offlinebetrieb, HTTP- und Proxyfehler, blockierte Cross-Origin-Anfragen,
+Range-/Größenprobleme, beschädigte Artefakte, fehlenden oder gesperrten CacheStorage und zu wenig
+Speicherplatz. Wo der Browser mehrere Ursachen nicht unterscheiden kann, wird die Einordnung
+ausdrücklich als Vermutung gekennzeichnet.
+
+Der aktuelle Zustand kann jederzeit manuell geprüft werden:
+
+``` javascript
+await LiaLLM.debugReport()
+```
+
+Der Aufruf protokolliert die lesbare Analyse und liefert gleichzeitig ein reines JSON-Objekt
+zurück. In Edge oder Chrome lässt es sich beispielsweise direkt als Text kopieren:
+
+``` javascript
+copy(JSON.stringify(await LiaLLM.debugReport({ print: false }), null, 2))
+```
+
+Die DebugNotiz enthält Browser-, Netzwerk-, Speicher-, Cache- und Artefaktmetadaten, aber keine
+Aufgabenstellung, Musterlösung, Schülerantwort, Response-Bodies, URL-Queryparameter oder
+Zugangsdaten. Für eine Fehlermeldung bitte den vollständigen Block zwischen
+`BEGIN LIA-LLM DEBUGNOTIZ` und `END LIA-LLM DEBUGNOTIZ` mitsenden.
 
 Der reproduzierbare Cold-/Neustart-/Offline-Härtetest samt Schulnetzbedingungen ist in
 [`test/BROWSER-HARDENING.md`](test/BROWSER-HARDENING.md) dokumentiert.
