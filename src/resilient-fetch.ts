@@ -36,6 +36,18 @@ interface RangeResponse {
   total: number
 }
 
+interface FullObjectResponse {
+  kind: "full-object"
+  response: Response
+  total: number
+}
+
+function isFullObjectResponse(
+  response: RangeResponse | FullObjectResponse,
+): response is FullObjectResponse {
+  return "kind" in response && response.kind === "full-object"
+}
+
 const DIRECT_FALLBACK = Symbol("direct-fallback")
 
 class DownloadStalledError extends Error {
@@ -258,13 +270,32 @@ export class ResilientFetchSession {
   }
 
   readonly fetch: FetchLike = async (input, init) => {
+    return this.fetchRequest(input, init)
+  }
+
+  async fetchExact(
+    input: RequestInfo | URL,
+    expectedByteLength: number,
+    init?: RequestInit,
+  ): Promise<Response> {
+    if (!Number.isSafeInteger(expectedByteLength) || expectedByteLength < 0) {
+      throw new RangeError("Die erwartete Downloadgröße ist ungültig.")
+    }
+    return this.fetchRequest(input, init, expectedByteLength)
+  }
+
+  private async fetchRequest(
+    input: RequestInfo | URL,
+    init?: RequestInit,
+    expectedByteLength?: number,
+  ): Promise<Response> {
     const original = new Request(input, init)
     const signal = combinedSignal([original.signal, this.controller.signal])
     const request = new Request(original, { signal })
     throwIfAborted(signal)
     return this.shouldChunk(request)
-      ? this.fetchChunked(request)
-      : this.fetchDirect(request)
+      ? this.fetchChunked(request, expectedByteLength)
+      : this.fetchDirect(request, expectedByteLength)
   }
 
   abort(reason = "Der Modell-Download wurde beendet."): void {
@@ -345,8 +376,9 @@ export class ResilientFetchSession {
     request: Request,
     signal: AbortSignal,
     attemptController: AbortController,
+    expectedByteLength?: number,
   ): Promise<Response> {
-    const expected = expectedResponseBytes(response)
+    const expected = expectedByteLength ?? expectedResponseBytes(response)
     if (!response.body) {
       if (
         expected !== undefined &&
@@ -398,10 +430,19 @@ export class ResilientFetchSession {
       }
     }
 
-    return copyResponse(response, replayBody(chunks))
+    // Fetch exposes an already decoded body. A cross-origin proxy may still
+    // expose the compressed Content-Length while hiding Content-Encoding.
+    // The replayed response therefore describes the verified logical bytes.
+    const headers = new Headers(response.headers)
+    headers.delete("content-encoding")
+    headers.set("content-length", String(loaded))
+    return copyResponse(response, replayBody(chunks), headers)
   }
 
-  private async fetchDirect(request: Request): Promise<Response> {
+  private async fetchDirect(
+    request: Request,
+    expectedByteLength?: number,
+  ): Promise<Response> {
     return this.withRetries(
       request,
       async (attemptController, signal, finalAttempt) => {
@@ -420,6 +461,7 @@ export class ResilientFetchSession {
           attemptRequest,
           signal,
           attemptController,
+          response.ok ? expectedByteLength : undefined,
         )
       },
     )
@@ -480,7 +522,10 @@ export class ResilientFetchSession {
     request: Request,
     start: number,
     end: number,
-  ): Promise<RangeResponse | Response | typeof DIRECT_FALLBACK> {
+    expectedTotal?: number,
+  ): Promise<
+    RangeResponse | FullObjectResponse | Response | typeof DIRECT_FALLBACK
+  > {
     return this.withRetries(
       request,
       async (attemptController, signal, finalAttempt) => {
@@ -504,7 +549,22 @@ export class ResilientFetchSession {
               rangeRequest,
               signal,
               attemptController,
+              response.ok ? expectedTotal : undefined,
             )
+          }
+          if (response.status === 200 && expectedTotal !== undefined) {
+            const fullResponse = await this.bufferResponse(
+              response,
+              rangeRequest,
+              signal,
+              attemptController,
+              expectedTotal,
+            )
+            return {
+              kind: "full-object",
+              response: fullResponse,
+              total: expectedTotal,
+            }
           }
           void response.body?.cancel().catch(() => undefined)
           const message =
@@ -542,35 +602,158 @@ export class ResilientFetchSession {
     )
   }
 
-  private async fetchChunked(request: Request): Promise<Response> {
+  private async fetchChunked(
+    request: Request,
+    expectedByteLength?: number,
+  ): Promise<Response> {
     const first = await this.fetchRange(
       request,
       0,
       this.chunkSizeBytes - 1,
+      expectedByteLength,
     )
-    if (first === DIRECT_FALLBACK) return this.fetchDirect(request)
+    if (first === DIRECT_FALLBACK) {
+      return this.fetchDirect(request, expectedByteLength)
+    }
     if (first instanceof Response) return first
+    if (isFullObjectResponse(first)) return first.response
+    if (
+      expectedByteLength !== undefined &&
+      first.total !== expectedByteLength
+    ) {
+      throw new NonRetryableDownloadError(
+        "Unerwartete Downloadgröße: " +
+          first.total +
+          " statt " +
+          expectedByteLength +
+          " Bytes.",
+      )
+    }
 
     const streamController = new AbortController()
     const signal = combinedSignal([request.signal, streamController.signal])!
+    const retainPrefix = expectedByteLength !== undefined
     let offset = 0
     let firstChunk: Uint8Array | null = first.bytes
+    let emittedChunks: Uint8Array[] = []
+    let fullObject:
+      | {
+          reader: ReadableStreamDefaultReader<Uint8Array>
+          loaded: number
+          prefixChunkIndex: number
+          prefixByteIndex: number
+          skipUntil: number
+          total: number
+        }
+      | undefined
     let finished = false
+
+    const comparePrefix = (bytes: Uint8Array): boolean => {
+      if (!fullObject) return false
+      let index = 0
+      while (index < bytes.byteLength) {
+        const expected = emittedChunks[fullObject.prefixChunkIndex]
+        if (!expected) return false
+        const count = Math.min(
+          bytes.byteLength - index,
+          expected.byteLength - fullObject.prefixByteIndex,
+        )
+        for (let position = 0; position < count; position += 1) {
+          if (
+            bytes[index + position] !==
+            expected[fullObject.prefixByteIndex + position]
+          ) {
+            return false
+          }
+        }
+        index += count
+        fullObject.prefixByteIndex += count
+        if (fullObject.prefixByteIndex >= expected.byteLength) {
+          fullObject.prefixChunkIndex += 1
+          fullObject.prefixByteIndex = 0
+        }
+      }
+      return true
+    }
+
+    const pullFullObject = async (
+      controller: ReadableStreamDefaultController<Uint8Array>,
+    ): Promise<void> => {
+      if (!fullObject) return
+      const item = await fullObject.reader.read()
+      if (item.done) {
+        if (fullObject.loaded !== fullObject.total || offset !== fullObject.total) {
+          throw new Error(
+            "Unvollständiger Voll-Download: " +
+              fullObject.loaded +
+              " von " +
+              fullObject.total +
+              " Bytes empfangen.",
+          )
+        }
+        finished = true
+        emittedChunks = []
+        fullObject.reader.releaseLock()
+        controller.close()
+        return
+      }
+
+      const nextLoaded = fullObject.loaded + item.value.byteLength
+      if (nextLoaded > fullObject.total) {
+        throw new Error(
+          "Zu viele Daten im Voll-Download: " +
+            nextLoaded +
+            " statt " +
+            fullObject.total +
+            " Bytes empfangen.",
+        )
+      }
+      const prefixBytes = Math.max(
+        0,
+        Math.min(item.value.byteLength, fullObject.skipUntil - fullObject.loaded),
+      )
+      if (
+        prefixBytes > 0 &&
+        !comparePrefix(item.value.subarray(0, prefixBytes))
+      ) {
+        throw new NonRetryableDownloadError(
+          "Der Voll-Download stimmt nicht mit den bereits geladenen Bytes überein.",
+        )
+      }
+      fullObject.loaded = nextLoaded
+      if (fullObject.loaded >= fullObject.skipUntil) emittedChunks = []
+
+      const suffix = item.value.subarray(prefixBytes)
+      if (suffix.byteLength > 0) {
+        offset += suffix.byteLength
+        controller.enqueue(suffix)
+      }
+      this.reportActivity({
+        url: request.url,
+        loaded: Math.max(offset, fullObject.loaded),
+        total: fullObject.total,
+      })
+    }
+
     const stream = new ReadableStream<Uint8Array>({
       pull: async (controller) => {
         if (finished) return
         try {
           throwIfAborted(signal)
-          if (firstChunk) {
+          if (fullObject) {
+            await pullFullObject(controller)
+          } else if (firstChunk) {
             const bytes = firstChunk
             firstChunk = null
             offset = bytes.byteLength
+            if (retainPrefix) emittedChunks.push(bytes)
             controller.enqueue(bytes)
           } else if (offset < first.total) {
             const next = await this.fetchRange(
               new Request(request, { signal }),
               offset,
               Math.min(offset + this.chunkSizeBytes - 1, first.total - 1),
+              expectedByteLength,
             )
             if (
               next === DIRECT_FALLBACK ||
@@ -579,20 +762,40 @@ export class ResilientFetchSession {
             ) {
               throw new Error(`Der Server hat den Byte-Download unerwartet beendet.`)
             }
-            offset = next.end + 1
-            controller.enqueue(next.bytes)
+            if (isFullObjectResponse(next)) {
+              if (!next.response.body) {
+                throw new Error("Leere Voll-Download-Antwort für " + request.url)
+              }
+              fullObject = {
+                reader: next.response.body.getReader(),
+                loaded: 0,
+                prefixChunkIndex: 0,
+                prefixByteIndex: 0,
+                skipUntil: offset,
+                total: first.total,
+              }
+              await pullFullObject(controller)
+            } else {
+              offset = next.end + 1
+              if (retainPrefix) emittedChunks.push(next.bytes)
+              controller.enqueue(next.bytes)
+            }
           }
-          if (offset >= first.total) {
+          if (!fullObject && offset >= first.total) {
             finished = true
+            emittedChunks = []
             controller.close()
           }
         } catch (error) {
           finished = true
+          void fullObject?.reader.cancel(error).catch(() => undefined)
           controller.error(error)
         }
       },
       cancel: (reason) => {
         finished = true
+        emittedChunks = []
+        void fullObject?.reader.cancel(reason).catch(() => undefined)
         streamController.abort(reason)
       },
     })

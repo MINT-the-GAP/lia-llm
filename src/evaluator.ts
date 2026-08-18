@@ -431,7 +431,10 @@ export async function loadRuntimeAsset(
   const cached = await readCachedRuntimeAsset(cache, url, asset.filename)
   if (cached) return cached
 
-  const response = await session.fetch(url)
+  // Runtime assets have an immutable logical size and SHA-256. Supplying the
+  // logical size avoids comparing a browser-decoded body with a compressed
+  // Content-Length that a restrictive cross-origin proxy may expose.
+  const response = await session.fetchExact(url, asset.byteLength)
   if (!response.ok) {
     throw new Error(`${asset.label} ${response.status}`)
   }

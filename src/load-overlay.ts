@@ -7,10 +7,107 @@ import type {
 } from "./types.ts"
 
 const OVERLAY_ID = "lia-llm-load-overlay"
+const OVERLAY_HOST_TAG = "lia-llm-load-overlay-host"
 const READY_DELAY_MS = 900
 
 interface ManagedOverlay extends HTMLElement {
   __liaLLMLoadOverlayBound?: boolean
+}
+
+let managedOverlay: ManagedOverlay | null = null
+let registeredApi: LiaLLMApi | null = null
+
+function isVisibleOverlayHost(host: HTMLElement): boolean {
+  if (!host.isConnected) return false
+  let current: HTMLElement | null = host
+  while (current) {
+    if (current.hidden) return false
+    try {
+      const style = getComputedStyle(current)
+      if (style.display === "none" || style.visibility === "hidden") return false
+    } catch {
+      // A connected host is still a usable fallback in restricted contexts.
+    }
+    current = current.parentElement
+  }
+  return true
+}
+
+function preferredOverlayHost(): HTMLElement | null {
+  const hosts = Array.from(
+    document.querySelectorAll<HTMLElement>(OVERLAY_HOST_TAG),
+  ).filter((host) => host.isConnected)
+  return hosts.find(isVisibleOverlayHost) ?? hosts[0] ?? null
+}
+
+function existingOverlayInHost(): ManagedOverlay | null {
+  for (const host of document.querySelectorAll<HTMLElement>(OVERLAY_HOST_TAG)) {
+    const overlay = host.shadowRoot?.getElementById(OVERLAY_ID)
+    if (overlay instanceof HTMLElement) return overlay as ManagedOverlay
+  }
+  return null
+}
+
+function shadowForOverlayHost(host: HTMLElement): ShadowRoot | null {
+  if (host.shadowRoot) return host.shadowRoot
+  try {
+    return host.attachShadow({ mode: "open" })
+  } catch {
+    return null
+  }
+}
+
+function mountOverlayInAuthoredHost(overlay: ManagedOverlay): boolean {
+  const host = preferredOverlayHost()
+  if (!host) return false
+  const mount = shadowForOverlayHost(host)
+  if (!mount) return false
+  if (overlay.parentNode !== mount) mount.append(overlay)
+
+  try {
+    const theme = getComputedStyle(host)
+    const background = theme.backgroundColor
+    overlay.style.setProperty(
+      "--lia-llm-overlay-color",
+      theme.color || "CanvasText",
+    )
+    if (
+      background &&
+      background !== "transparent" &&
+      background !== "rgba(0, 0, 0, 0)"
+    ) {
+      overlay.style.setProperty("--lia-llm-overlay-bg", background)
+    }
+  } catch {
+    // The system colors in the shadow stylesheet remain a readable fallback.
+  }
+  return true
+}
+
+function registerOverlayHostElement(): void {
+  if (
+    typeof customElements === "undefined" ||
+    typeof HTMLElement === "undefined" ||
+    customElements.get(OVERLAY_HOST_TAG)
+  ) {
+    return
+  }
+
+  class LiaLLMLoadOverlayHostElement extends HTMLElement {
+    connectedCallback(): void {
+      queueMicrotask(() => {
+        if (this.isConnected && registeredApi) registerLoadOverlay(registeredApi)
+      })
+    }
+
+    disconnectedCallback(): void {
+      queueMicrotask(() => {
+        if (registeredApi) registerLoadOverlay(registeredApi)
+      })
+    }
+  }
+
+  customElements.define(OVERLAY_HOST_TAG, LiaLLMLoadOverlayHostElement)
 }
 
 function finiteNumber(value: unknown): value is number {
@@ -71,11 +168,20 @@ export function registerLoadOverlay(api: LiaLLMApi): void {
     return
   }
 
-  const mount = document.body ?? document.documentElement
-  let overlay = document.getElementById(OVERLAY_ID) as ManagedOverlay | null
+  registeredApi = api
+  registerOverlayHostElement()
+
+  const host = preferredOverlayHost()
+  if (!host) return
+
+  let overlay =
+    managedOverlay ??
+    existingOverlayInHost() ??
+    (document.getElementById(OVERLAY_ID) as ManagedOverlay | null)
 
   if (overlay?.__liaLLMLoadOverlayBound) {
-    if (overlay.parentNode !== mount) mount.appendChild(overlay)
+    managedOverlay = overlay
+    mountOverlayInAuthoredHost(overlay)
     return
   }
 
@@ -83,6 +189,7 @@ export function registerLoadOverlay(api: LiaLLMApi): void {
     overlay = document.createElement("div")
     overlay.id = OVERLAY_ID
   }
+  managedOverlay = overlay
 
   overlay.dataset.on = "0"
   overlay.dataset.indeterminate = "1"
@@ -192,25 +299,7 @@ export function registerLoadOverlay(api: LiaLLMApi): void {
     ".lia-llm-consent-download",
   )!
 
-  try {
-    const theme = getComputedStyle(mount)
-    const background = theme.backgroundColor
-    overlay.style.setProperty(
-      "--lia-llm-overlay-color",
-      theme.color || "CanvasText",
-    )
-    if (
-      background &&
-      background !== "transparent" &&
-      background !== "rgba(0, 0, 0, 0)"
-    ) {
-      overlay.style.setProperty("--lia-llm-overlay-bg", background)
-    }
-  } catch {
-    // The system colors above remain a readable fallback.
-  }
-
-  if (overlay.parentNode !== mount) mount.appendChild(overlay)
+  mountOverlayInAuthoredHost(overlay)
   overlay.__liaLLMLoadOverlayBound = true
 
   let currentStatus = api.getStatus()
@@ -225,6 +314,7 @@ export function registerLoadOverlay(api: LiaLLMApi): void {
   }
 
   const show = (busy: boolean): void => {
+    mountOverlayInAuthoredHost(overlay!)
     overlay!.dataset.on = "1"
     overlay!.setAttribute("aria-hidden", "false")
     overlay!.setAttribute("aria-busy", String(busy))

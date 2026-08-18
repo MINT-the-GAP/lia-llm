@@ -1,11 +1,11 @@
 <!--
 author:      MINT-the-GAP, Martin Lommatzsch
-version:     0.5.0
+version:     0.5.1
 language:    de
 narrator:    Deutsch Female
 comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
 repository:  https://github.com/MINT-the-GAP/lia-llm
-script:      ./dist/index.js
+script:      ./dist/index.js?v=0.5.1
 
 attribute:   [WebLLM](https://webllm.mlc.ai/docs/) by MLC is licensed under
              [Apache-2.0](https://github.com/mlc-ai/web-llm/blob/main/LICENSE), and
@@ -76,8 +76,8 @@ Promise.resolve()
     if (!window.LiaLLM) {
       throw new Error("lia-llm konnte nicht geladen werden.")
     }
-    if (window.LiaLLM.version !== "0.5.0") {
-      throw new Error(`lia-llm 0.5.0 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
+    if (window.LiaLLM.version !== "0.5.1") {
+      throw new Error(`lia-llm 0.5.1 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
     }
 
     const options = window.LiaLLM.parseMacroOptions(optionSource)
@@ -130,6 +130,7 @@ Promise.resolve()
 
 "LIA: wait"
 </script>
+<lia-llm-load-overlay-host></lia-llm-load-overlay-host>
 <lia-llm-textarea-host hidden></lia-llm-textarea-host>
 <lia-llm-quiz-use hidden></lia-llm-quiz-use>
 <lia-llm-activity id="lia-llm-activity-@0" hidden></lia-llm-activity>

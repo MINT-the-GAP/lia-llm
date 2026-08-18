@@ -51,6 +51,10 @@
     data-elm-owned-host
     hidden
   >elm-owned-placeholder</lia-llm-activity>
+  <lia-llm-load-overlay-host
+    id="load-overlay-host"
+    data-elm-owned-host
+  >elm-owned-placeholder</lia-llm-load-overlay-host>
   <script>
   window.__liaCalibration = []
   window.__liaCalibrationExpected = 1
@@ -316,7 +320,13 @@
       area?.dispatchEvent(letter)
 
       const cacheInfo = await window.LiaLLM?.getCacheInfo()
-      const overlay = document.getElementById("lia-llm-load-overlay")
+      const overlayHost = document.getElementById("load-overlay-host")
+      const overlay = overlayHost?.shadowRoot?.getElementById(
+        "lia-llm-load-overlay"
+      )
+      const overlayLivesOnlyInShadow =
+        overlay?.getRootNode() === overlayHost?.shadowRoot &&
+        document.body.querySelector(":scope > #lia-llm-load-overlay") === null
       window.dispatchEvent(
         new CustomEvent("lia-llm:status", {
           detail: {
@@ -432,7 +442,7 @@
 
       const matches = Boolean(
         window.LiaLLM &&
-        window.LiaLLM.version === "0.5.0" &&
+        window.LiaLLM.version === "0.5.1" &&
         typeof window.LiaLLM.evaluate === "function" &&
         typeof window.LiaLLM.feedbackForResult === "function" &&
         typeof window.LiaLLM.showFeedback === "function" &&
@@ -477,6 +487,7 @@
         staleRunCannotHideCurrent &&
         activitiesStayIsolated &&
         activityClears &&
+        overlayLivesOnlyInShadow &&
         cachedActivationIsHidden &&
         cachedReadyIsHidden &&
         realDownloadIsVisible &&
@@ -502,6 +513,7 @@
         textareaValidationIsVisible,
         textareaSyncsParagraphs,
         elmManagedLightDomIsUntouched,
+        overlayLivesOnlyInShadow,
         solutionStartedHidden,
         solutionBecameVisible,
         solutionHidesWhenCleared,

@@ -1717,6 +1717,50 @@ test("verified runtime download is cached and reused without network", async () 
   assert.equal(cache.putCalls, 1)
 })
 
+test("runtime loading validates decoded bytes despite a compressed proxy length", async () => {
+  const asset = RUNTIME_ASSETS[0]
+  const source = exactArrayBuffer(
+    readFileSync(
+      new URL("../dist/ort-wasm-simd-threaded.asyncify.mjs", import.meta.url),
+    ),
+  )
+  const cache = new MemoryRuntimeCache()
+  let calls = 0
+  const session = new ResilientFetchSession(
+    async () => {
+      calls += 1
+      return new Response(source.slice(0), {
+        status: 200,
+        // This is the compressed transfer size seen at the school. The Fetch
+        // body has already been expanded to the immutable 47,389 logical bytes.
+        headers: { "content-length": "17570" },
+      })
+    },
+    { retryDelaysMs: [0], stallTimeoutMs: 1_000 },
+  )
+
+  const loaded = await loadRuntimeAsset(session, cache.asCache(), asset)
+  assert.equal(loaded.byteLength, asset.byteLength)
+  assert.equal(calls, 1)
+  assert.equal(cache.putCalls, 1)
+})
+
+test("fetchExact still rejects an incomplete decoded body", async () => {
+  const session = new ResilientFetchSession(
+    async () =>
+      new Response(Uint8Array.from({ length: 9 }, (_value, index) => index), {
+        status: 200,
+        headers: { "content-length": "5" },
+      }),
+    { retryDelaysMs: [0], stallTimeoutMs: 1_000 },
+  )
+
+  await assert.rejects(
+    session.fetchExact("https://example.test/runtime.mjs", 10),
+    /9 von 10 Bytes/u,
+  )
+})
+
 test("runtime loading remains online-capable when cache open or put fails", async () => {
   const asset = RUNTIME_ASSETS[0]
   const source = exactArrayBuffer(
@@ -2906,16 +2950,17 @@ test("formatResult hides criterion details by default but keeps them available",
   assert.match(detailed, /Bestätigung:/u)
 })
 
-test("the public version remains pinned exactly to 0.5.0", () => {
+test("the public version remains pinned exactly to 0.5.1", () => {
   const packageJson = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   ) as { version?: string }
   const entry = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8")
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8")
 
-  assert.equal(packageJson.version, "0.5.0")
-  assert.match(entry, /const VERSION = "0\.5\.0"/u)
-  assert.match(readme, /^version:\s+0\.5\.0$/mu)
+  assert.equal(packageJson.version, "0.5.1")
+  assert.match(entry, /const VERSION = "0\.5\.1"/u)
+  assert.match(readme, /^version:\s+0\.5\.1$/mu)
+  assert.match(readme, /^script:\s+\.\/dist\/index\.js\?v=0\.5\.1$/mu)
 })
 
 test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper", () => {
@@ -2965,6 +3010,10 @@ test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper
   assert.match(readme, /languageAnalysis:/u)
   assert.match(readme, /spelling: options\.rechtschreibung/u)
   assert.match(readme, /syntax: options\.satzbau/u)
+  assert.match(
+    readme,
+    /<lia-llm-load-overlay-host><\/lia-llm-load-overlay-host>/u,
+  )
   assert.match(
     readme,
     /operator=erklaeren;Rechtschreibung=1;Satzbau=1,`Erkläre, warum/u,
@@ -3446,6 +3495,158 @@ test("resilient fetch retries a truncated 200 response when a proxy ignores rang
   const response = await session.fetch("https://example.test/model.onnx")
   assert.deepEqual(new Uint8Array(await response.arrayBuffer()), payload)
   assert.deepEqual(requestedRanges, ["bytes=0-3", "bytes=0-3"])
+})
+
+test("resilient fetch recovers when a proxy ignores a resumed range", async () => {
+  const payload = Uint8Array.from({ length: 10 }, (_value, index) => index + 20)
+  const requestedRanges: Array<string | null> = []
+
+  const baseFetch = async (input: RequestInfo | URL): Promise<Response> => {
+    const request = input instanceof Request ? input : new Request(input)
+    const rangeHeader = request.headers.get("range")
+    requestedRanges.push(rangeHeader)
+    if (requestedRanges.length === 1) {
+      return new Response(payload.slice(0, 4), {
+        status: 206,
+        headers: {
+          "content-length": "4",
+          "content-range": "bytes 0-3/10",
+        },
+      })
+    }
+    return new Response(payload.slice(0), {
+      status: 200,
+      // Simulate a compressed transport length whose encoding header was
+      // hidden by CORS/a school proxy. The Fetch body is already decoded.
+      headers: { "content-length": "6" },
+    })
+  }
+  const session = new ResilientFetchSession(baseFetch, {
+    chunkSizeBytes: 4,
+    retryDelaysMs: [0],
+    stallTimeoutMs: 1_000,
+  })
+
+  const response = await session.fetchExact(
+    "https://example.test/model.onnx",
+    payload.byteLength,
+  )
+  assert.deepEqual(new Uint8Array(await response.arrayBuffer()), payload)
+  assert.deepEqual(requestedRanges, ["bytes=0-3", "bytes=4-7"])
+})
+
+test("generic resilient fetch rejects a full response for a resumed range", async () => {
+  const payload = Uint8Array.from({ length: 10 }, (_value, index) => index + 25)
+  const requestedRanges: Array<string | null> = []
+
+  const baseFetch = async (input: RequestInfo | URL): Promise<Response> => {
+    const request = input instanceof Request ? input : new Request(input)
+    requestedRanges.push(request.headers.get("range"))
+    if (requestedRanges.length === 1) {
+      return new Response(payload.slice(0, 4), {
+        status: 206,
+        headers: {
+          "content-length": "4",
+          "content-range": "bytes 0-3/10",
+        },
+      })
+    }
+    return new Response(payload.slice(0), {
+      status: 200,
+      headers: { "content-length": String(payload.byteLength) },
+    })
+  }
+  const session = new ResilientFetchSession(baseFetch, {
+    chunkSizeBytes: 4,
+    retryDelaysMs: [0],
+    stallTimeoutMs: 1_000,
+  })
+
+  const response = await session.fetch("https://example.test/model.onnx")
+  await assert.rejects(
+    response.arrayBuffer(),
+    /HTTP 200 statt eines Byte-Bereichs/u,
+  )
+  assert.deepEqual(requestedRanges, ["bytes=0-3", "bytes=4-7"])
+})
+
+test("resilient fetch rejects a changed full object after a resumed range", async () => {
+  const payload = Uint8Array.from({ length: 10 }, (_value, index) => index + 30)
+  let calls = 0
+
+  const baseFetch = async (): Promise<Response> => {
+    calls += 1
+    if (calls === 1) {
+      return new Response(payload.slice(0, 4), {
+        status: 206,
+        headers: {
+          "content-length": "4",
+          "content-range": "bytes 0-3/10",
+        },
+      })
+    }
+    const changed = payload.slice(0)
+    changed[0] ^= 0xff
+    return new Response(changed, {
+      status: 200,
+      headers: { "content-length": String(changed.byteLength) },
+    })
+  }
+  const session = new ResilientFetchSession(baseFetch, {
+    chunkSizeBytes: 4,
+    retryDelaysMs: [0],
+    stallTimeoutMs: 1_000,
+  })
+
+  const response = await session.fetchExact(
+    "https://example.test/model.onnx",
+    payload.byteLength,
+  )
+  await assert.rejects(response.arrayBuffer(), /bereits geladenen Bytes/u)
+  assert.equal(calls, 2)
+})
+
+test("resilient fetch retries a truncated full object for a resumed range", async () => {
+  const payload = Uint8Array.from({ length: 10 }, (_value, index) => index + 40)
+  const requestedRanges: Array<string | null> = []
+
+  const baseFetch = async (input: RequestInfo | URL): Promise<Response> => {
+    const request = input instanceof Request ? input : new Request(input)
+    const rangeHeader = request.headers.get("range")
+    requestedRanges.push(rangeHeader)
+    if (requestedRanges.length === 1) {
+      return new Response(payload.slice(0, 4), {
+        status: 206,
+        headers: {
+          "content-length": "4",
+          "content-range": "bytes 0-3/10",
+        },
+      })
+    }
+    return new Response(
+      requestedRanges.length === 2 ? payload.slice(0, 9) : payload.slice(0),
+      {
+        status: 200,
+        headers: { "content-length": String(payload.byteLength) },
+      },
+    )
+  }
+  const session = new ResilientFetchSession(baseFetch, {
+    chunkSizeBytes: 4,
+    retryDelaysMs: [0, 0],
+    stallTimeoutMs: 1_000,
+  })
+
+  const response = await session.fetchExact(
+    "https://example.test/model.onnx",
+    payload.byteLength,
+  )
+  assert.deepEqual(new Uint8Array(await response.arrayBuffer()), payload)
+  assert.deepEqual(requestedRanges, [
+    "bytes=0-3",
+    "bytes=4-7",
+    "bytes=4-7",
+  ])
 })
 
 test("resilient fetch retries a truncated direct runtime file", async () => {
