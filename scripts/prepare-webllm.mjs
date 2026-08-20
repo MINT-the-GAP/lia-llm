@@ -22,7 +22,7 @@ if (!originalSource.includes(cacheAddCall)) {
 // Cache.add() fetches internally and therefore cannot use our retrying,
 // range-based downloader. Keep WebLLM's cache layout, but route the network
 // request through the optional LiaLLM hook before Cache.put() consumes it.
-const bundledSource = originalSource.replace(
+let bundledSource = originalSource.replace(
   cacheAddCall,
   [
     "const artifactFetch = globalThis.__liaLlmArtifactFetch || fetch;",
@@ -32,6 +32,35 @@ const bundledSource = originalSource.replace(
     "}",
     "yield this.cache.put(request, response);",
   ].join("\n                            "),
+)
+
+// WebLLM 0.2.84 leaves interruptSignal set after a non-streaming
+// chat-completion is interrupted. The next request then exits before
+// _generate() can reset the flag. Reset it when the request releases its
+// model lock so a bounded Thinking attempt cannot poison later assessments.
+const chatCompletionFinally = [
+  "                return response;",
+  "            }",
+  "            finally {",
+  "                yield lock.release();",
+  "            }",
+  "        });",
+  "    }",
+  "    completion(request) {",
+].join("\n")
+const chatCompletionFinallyMatches = bundledSource
+  .split(chatCompletionFinally).length - 1
+if (chatCompletionFinallyMatches !== 1) {
+  throw new Error(
+    "Der erwartete WebLLM-ChatCompletion-Cleanup wurde nicht eindeutig gefunden.",
+  )
+}
+bundledSource = bundledSource.replace(
+  chatCompletionFinally,
+  chatCompletionFinally.replace(
+    "            finally {\n                yield lock.release();",
+    "            finally {\n                this.interruptSignal = false;\n                yield lock.release();",
+  ),
 )
 
 await mkdir(generatedDirectory, { recursive: true })

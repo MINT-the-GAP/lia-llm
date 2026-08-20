@@ -1,11 +1,31 @@
 import type { AppConfig, ModelRecord } from "@mlc-ai/web-llm"
 
-export const QUALITY_MODEL_ID = "Qwen3-4B-q4f16_1-MLC"
+export const QUALITY_MODEL_ID = "Qwen3-1.7B-q4f16_1-MLC"
 export const QUALITY_MODEL_REVISION =
-  "a5c9fab855e3ccbdfed2e7e69683d75f30332161"
+  "80b3abcec6c3b3f5355dc0cc99cc4fb578f192bc"
 export const QUALITY_MODEL_LIB_REVISION =
   "025bcaf3780fa8254f5e5efd3bfea0a5397248f4"
-export const QUALITY_MODEL_ESTIMATED_BYTES = 2_280_000_000
+export const QUALITY_MODEL_ESTIMATED_BYTES = 984_000_000
+export const LEGACY_QUALITY_CACHE_TARGETS = [
+  {
+    modelUrl:
+      "https://huggingface.co/mlc-ai/Qwen3-0.6B-q4f16_1-MLC/resolve/" +
+      "8c14ce481d4c692769976ad52afea453a102df19/",
+    modelLibUrl:
+      "https://raw.githubusercontent.com/mlc-ai/binary-mlc-llm-libs/" +
+      QUALITY_MODEL_LIB_REVISION +
+      "/web-llm-models/v0_2_84/base/Qwen3-0.6B-q4f16_1_cs1k-webgpu.wasm",
+  },
+  {
+    modelUrl:
+      "https://huggingface.co/mlc-ai/Qwen3-4B-q4f16_1-MLC/resolve/" +
+      "a5c9fab855e3ccbdfed2e7e69683d75f30332161/",
+    modelLibUrl:
+      "https://raw.githubusercontent.com/mlc-ai/binary-mlc-llm-libs/" +
+      QUALITY_MODEL_LIB_REVISION +
+      "/web-llm-models/v0_2_84/base/Qwen3-4B-q4f16_1_cs1k-webgpu.wasm",
+  },
+] as const
 
 function pinnedModelLib(source: string): string {
   const url = new URL(source)

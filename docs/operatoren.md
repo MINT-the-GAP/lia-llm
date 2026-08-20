@@ -99,9 +99,11 @@ bildet dieselbe Reihenfolge direkt ab, ohne diese Zahlen als konfigurierbare Sco
 - Der echte Aufgabenwortlaut wird zusammen mit dem expliziten Operator ausgewertet. Aus dem
   Operatorverb allein werden weder Gegenstand und Umfang der Aufgabe noch Zahlen, Kriterien oder
   eine Perspektive erfunden.
-- Das Kompaktmodell prüft den Fachinhalt vor, entscheidet aber nicht endgültig über die
-  Operatorerfüllung. Ein inhaltlicher Kompakt-Pass wird bei gesetztem Operator durch das
-  Qualitätsmodell überprüft.
+- Im dokumentierten Operator-Makropfad prüft das Kompaktmodell den Fachinhalt vor, entscheidet aber
+  nicht endgültig über die Operatorerfüllung. Ein inhaltlicher Kompakt-Pass wird dort durch das
+  Qualitätsmodell überprüft. Nur ein direkter API-Aufruf mit ausdrücklich gesetztem
+  `assessmentEngine: "compact"` bleibt vollständig bei Compact und stuft einen solchen Befund
+  konservativ zu `uncertain` herab.
 - Meldet das Qualitätsmodell `operator-not-met`, ist der Befund unabhängig von einer
   anteiligen Bestehensgrenze blockierend.
 - Zu `operator-not-met` muss das Modell eine Kriteriums-ID aus dem aktiven Profil
@@ -131,8 +133,11 @@ in einer Aufgabe sind ebenfalls noch nicht Teil des Makrovertrags.
 `npm run test:browser-operators` führt für jedes aktive Profil einen Positiv- und einen
 gezielten Gegenfall mit dem WebGPU-Qualitätsmodell aus. Der Lauf prüft zusätzlich kanonische
 Operator-ID, Quality-Engine und den erwarteten Fehlercode der Gegenfälle. Wegen des derzeit etwa
-2,28 GB großen Modell-Downloads und der WebGPU-Abhängigkeit gehört diese Kalibrierung bewusst nicht
-zum hardwareunabhängigen `npm run check`.
+984 MB großen Quality-Modell-Downloads und der WebGPU-Abhängigkeit gehört diese Kalibrierung
+bewusst nicht zum hardwareunabhängigen `npm run check`. In einem vollständig neuen Profil beträgt
+die konfigurierte Schätzung für Quality- und Kompaktmodell zusammen 1.362.614.439 B
+(ca. 1.299,5 MiB). Compact bleibt der sichere Standard; Qwen3-1.7B ist eine optionale
+Quality-Engine und benötigt eine eigene Freigabe für das konkrete Browser-/GPU-System.
 
 ## Neue Operatoren ergänzen
 

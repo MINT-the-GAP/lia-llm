@@ -173,6 +173,10 @@ export interface EvaluationProgress {
 
 export interface EvaluationOptions {
   signal?: AbortSignal
+  /** Maximum wall-clock time for an adaptive Qwen thinking pass. Zero disables it. */
+  maxThinkingTimeMs?: number
+  /** Maximum generated tokens shared by thinking content and the final JSON result. */
+  maxThinkingTokens?: number
   onProgress?(progress: EvaluationProgress): void
 }
 
@@ -253,9 +257,12 @@ export interface EvaluationResult {
   model: {
     id: string
     revision: string
-    device: RuntimeDevice
-    dtype: RuntimeDType
-    task: "natural-language-inference" | "generative-assessment"
+    device: RuntimeDevice | "none"
+    dtype: RuntimeDType | "none"
+    task:
+      | "natural-language-inference"
+      | "generative-assessment"
+      | "deterministic-guard"
   }
   notice: string
 }

@@ -1,6 +1,6 @@
 {
   "name": "lia-llm",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "private": true,
   "description": "Local semantic assessment for open-ended LiaScript questions",
   "license": "MIT",
@@ -17,6 +17,7 @@
     "test:browser-hardening": "node test/run-browser-hardening.mjs",
     "test:browser-model": "node test/run-browser-calibration.mjs",
     "test:browser-operators": "node test/run-browser-calibration.mjs test/browser-operator-calibration.html webgpu",
+    "test:browser-adversarial": "node test/run-browser-calibration.mjs test/browser-adversarial-calibration.html webgpu",
     "check": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {

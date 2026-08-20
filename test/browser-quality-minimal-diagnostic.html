@@ -1,0 +1,125 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>lia-llm minimal Quality diagnostic</title>
+<script src="../dist/index.js"></script>
+<pre id="output">waiting for diagnostic runner</pre>
+<script>
+const QUALITY_MODEL_ID = 'Qwen3-1.7B-q4f16_1-MLC'
+const QUALITY_MODEL_REVISION = '80b3abcec6c3b3f5355dc0cc99cc4fb578f192bc'
+
+function serializeError(value, seen = new WeakSet()) {
+  if (value === null || typeof value !== 'object') return String(value)
+  if (seen.has(value)) return '[circular]'
+  seen.add(value)
+  const serialized = {
+    name: value.name,
+    message: value.message,
+    stack: value.stack
+  }
+  if ('cause' in value) serialized.cause = serializeError(value.cause, seen)
+  for (const key of Object.getOwnPropertyNames(value)) {
+    if (key in serialized || key === 'cause') continue
+    try {
+      const item = value[key]
+      serialized[key] =
+        item && typeof item === 'object' ? serializeError(item, seen) : item
+    } catch (error) {
+      serialized[key] = `[unreadable: ${String(error)}]`
+    }
+  }
+  return serialized
+}
+
+window.__liaDiagnosticStart = false
+window.__liaCalibrationDone = false
+window.__liaCalibration = []
+window.__liaCalibrationExpected = 1
+window.__liaPageDiagnostics = []
+
+window.addEventListener('error', event => {
+  window.__liaPageDiagnostics.push({
+    type: 'error',
+    message: event.message,
+    filename: event.filename,
+    lineno: event.lineno,
+    colno: event.colno,
+    error: event.error ? serializeError(event.error) : null
+  })
+})
+window.addEventListener('unhandledrejection', event => {
+  window.__liaPageDiagnostics.push({
+    type: 'unhandledrejection',
+    reason: serializeError(event.reason)
+  })
+})
+window.addEventListener('lia-llm:download-consent', event => {
+  if (!event.detail || typeof event.detail.respond !== 'function') return
+  event.detail.handled = true
+  event.detail.respond(true)
+})
+
+;(async () => {
+  while (!window.__liaDiagnosticStart) {
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  const started = performance.now()
+  try {
+    const result = await window.LiaLLM.evaluate(
+      {
+        assessmentEngine: 'quality',
+        question: 'Warum schwimmt Eis auf fluessigem Wasser?',
+        reference:
+          'Beim Gefrieren bildet Wasser durch Wasserstoffbruecken eine offene Kristallstruktur. ' +
+          'Bei gleicher Masse nimmt das Eis dadurch mehr Volumen ein, besitzt eine geringere ' +
+          'Dichte als fluessiges Wasser und schwimmt deshalb.',
+        answer:
+          'Beim Uebergang in den festen Zustand halten die Bindungen die Wasserteilchen in einem ' +
+          'weitmaschigen raeumlichen Geruest. Dieselbe Masse beansprucht dadurch mehr Platz als ' +
+          'vorher. In einem gleich grossen Volumen steckt somit weniger Masse als in der ' +
+          'umgebenden Fluessigkeit. Das verdraengte Wasser kann das feste Stueck daher tragen, ' +
+          'sodass es an der Oberflaeche bleibt.',
+        criterionThreshold: 0.66,
+        contradictionThreshold: 0.65
+      },
+      {
+        maxThinkingTimeMs: 15_000,
+        maxThinkingTokens: 512,
+        onProgress: event => console.info('lia-quality-progress', event)
+      }
+    )
+    const exactQualityModel =
+      result.model.id === QUALITY_MODEL_ID &&
+      result.model.revision === QUALITY_MODEL_REVISION &&
+      result.model.task === 'generative-assessment' &&
+      result.model.device === 'webgpu'
+    window.__liaCalibration.push({
+      case: 1,
+      id: 'normal-deep-paraphrase',
+      expected: true,
+      matches: result.passed === true && exactQualityModel,
+      compactFeedbackHasCriteria: false,
+      wallClockDurationMs: Number((performance.now() - started).toFixed(1)),
+      result,
+      pageDiagnostics: window.__liaPageDiagnostics,
+      debugReport: await window.LiaLLM.debugReport({ print: false })
+    })
+  } catch (error) {
+    window.__liaCalibrationError = JSON.stringify({
+      caught: serializeError(error),
+      pageDiagnostics: window.__liaPageDiagnostics,
+      debugReport: await window.LiaLLM.debugReport({ print: false })
+    })
+  } finally {
+    document.querySelector('#output').textContent = JSON.stringify(
+      {
+        results: window.__liaCalibration,
+        error: window.__liaCalibrationError ?? null,
+        pageDiagnostics: window.__liaPageDiagnostics
+      },
+      null,
+      2
+    )
+    window.__liaCalibrationDone = true
+  }
+})()
+</script>

@@ -16,8 +16,15 @@ import {
   normalizeLanguageAnalysisOptions,
   unavailableLanguageAnalysis,
 } from "./language-analysis.ts"
-import { QualityEvaluator } from "./quality-evaluator.ts"
+import {
+  createAssessmentManipulationResult,
+  isFatalQualityEngineError,
+  isQualityOutputError,
+  isRecoverableQualityRequestError,
+  QualityEvaluator,
+} from "./quality-evaluator.ts"
 import { normalizeRequest } from "./scoring.ts"
+import { normalizeThinkingLimits } from "./thinking-config.ts"
 import type {
   AssessmentEngine,
   EvaluationOptions,
@@ -38,6 +45,41 @@ interface EvaluationRun {
   generation: number
   requestSignal?: AbortSignal
   lifecycleSignal: AbortSignal
+}
+
+interface AutomaticEvaluatorTimings {
+  uncachedQualityWaitMs: number
+  cachedQualityWaitMs: number
+}
+
+const DEFAULT_AUTOMATIC_EVALUATOR_TIMINGS: AutomaticEvaluatorTimings = {
+  uncachedQualityWaitMs: 30_000,
+  cachedQualityWaitMs: 180_000,
+}
+
+type ForegroundWaitResult<T> =
+  | { timedOut: false; value: T }
+  | { timedOut: true }
+
+function positiveWaitMs(name: string, value: number): number {
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+    throw new Error(`${name} muss eine positive ganze Millisekundenzahl sein.`)
+  }
+  return value
+}
+
+function explicitlyRequestsThinking(options?: EvaluationOptions): boolean {
+  if (
+    options?.maxThinkingTimeMs === undefined &&
+    options?.maxThinkingTokens === undefined
+  ) return false
+  return normalizeThinkingLimits(options).maxTimeMs > 0
+}
+
+function requestedAssessmentEngine(value: unknown): AssessmentEngine | undefined {
+  if (value === undefined) return undefined
+  if (value === "compact" || value === "quality") return value
+  throw new Error('assessmentEngine erwartet "compact" oder "quality".')
 }
 
 function abortError(): Error {
@@ -84,6 +126,54 @@ function waitForRun<T>(promise: Promise<T>, run: EvaluationRun): Promise<T> {
       (error: unknown) => finish(() => reject(error)),
     )
   })
+}
+
+async function waitForRunWithTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  run: EvaluationRun,
+): Promise<ForegroundWaitResult<T>> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<ForegroundWaitResult<T>>((resolve) => {
+    timer = setTimeout(() => resolve({ timedOut: true }), timeoutMs)
+  })
+  const completion = promise.then<ForegroundWaitResult<T>>((value) => ({
+    timedOut: false,
+    value,
+  }))
+  try {
+    return await waitForRun(Promise.race([completion, timeout]), run)
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+function linkRunSignals(run: EvaluationRun): {
+  signal: AbortSignal
+  dispose(): void
+} {
+  const controller = new AbortController()
+  const signals = [...new Set(
+    [run.requestSignal, run.lifecycleSignal].filter(
+      (signal): signal is AbortSignal => Boolean(signal),
+    ),
+  )]
+  const onAbort = (): void => controller.abort()
+  for (const signal of signals) {
+    if (signal.aborted) {
+      controller.abort()
+      break
+    }
+    signal.addEventListener("abort", onAbort, { once: true })
+  }
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      for (const signal of signals) {
+        signal.removeEventListener("abort", onAbort)
+      }
+    },
+  }
 }
 
 function snapshotRequest(request: EvaluationRequest): EvaluationRequest {
@@ -184,13 +274,27 @@ export class AutomaticEvaluator {
   private compactUnloadPromise: Promise<void> | null = null
   private clearPromise: Promise<number> | null = null
   private readonly consentControllers = new Set<AbortController>()
+  private readonly timings: AutomaticEvaluatorTimings
 
   constructor(
     compactEvaluator = new SemanticEvaluator(),
     qualityEvaluator = new QualityEvaluator(),
+    timings: Partial<AutomaticEvaluatorTimings> = {},
   ) {
     this.compactEvaluator = compactEvaluator
     this.qualityEvaluator = qualityEvaluator
+    this.timings = {
+      uncachedQualityWaitMs: positiveWaitMs(
+        "uncachedQualityWaitMs",
+        timings.uncachedQualityWaitMs ??
+          DEFAULT_AUTOMATIC_EVALUATOR_TIMINGS.uncachedQualityWaitMs,
+      ),
+      cachedQualityWaitMs: positiveWaitMs(
+        "cachedQualityWaitMs",
+        timings.cachedQualityWaitMs ??
+          DEFAULT_AUTOMATIC_EVALUATOR_TIMINGS.cachedQualityWaitMs,
+      ),
+    }
   }
 
   configure(config: Partial<RuntimeConfig>): RuntimeStatus {
@@ -396,6 +500,21 @@ export class AutomaticEvaluator {
     emitStatus(this.compactEvaluator.getStatus())
   }
 
+  private async waitForQualityUpgradeInForeground(
+    upgrade: Promise<boolean>,
+    cache: ModelCacheInfo | undefined,
+    run: EvaluationRun,
+  ): Promise<boolean> {
+    const timeoutMs = cache?.cached
+      ? this.timings.cachedQualityWaitMs
+      : this.timings.uncachedQualityWaitMs
+    const result = await waitForRunWithTimeout(upgrade, timeoutMs, run)
+    if (!result.timedOut) return result.value
+
+    this.markQualityDegraded(run.generation)
+    return false
+  }
+
   private async upgradeQuality(
     generation: number,
     knownCache?: ModelCacheInfo,
@@ -434,11 +553,16 @@ export class AutomaticEvaluator {
     if (this.qualityUpgradePromise) return this.qualityUpgradePromise
 
     const generation = this.generation
-    const upgrade = this.upgradeQuality(generation, knownCache).catch(() => {
+    const upgrade = this.upgradeQuality(generation, knownCache).catch((error: unknown) => {
       if (generation === this.generation) {
-        this.qualityReady = false
         this.qualityCacheInfoPromise = null
-        emitStatus(this.compactEvaluator.getStatus())
+        if (isFatalQualityEngineError(error)) {
+          this.markQualityDegraded(generation)
+        } else {
+          this.qualityReady = false
+          this.qualityDegraded = false
+          emitStatus(this.compactEvaluator.getStatus())
+        }
       }
       return false
     })
@@ -488,6 +612,7 @@ export class AutomaticEvaluator {
     const languageOnly =
       compactFallback?.passed === true &&
       !request.operator?.trim() &&
+      !explicitlyRequestsThinking(options) &&
       normalizeLanguageAnalysisOptions(request.languageAnalysis) !== undefined
     const fallback = async (): Promise<EvaluationResult> => {
       assertRunActive(run)
@@ -520,10 +645,15 @@ export class AutomaticEvaluator {
           ? "Sprachstatistik wird erstellt …"
           : "Antwort wird gründlich geprüft …",
       })
+      const linkedSignal = linkRunSignals(run)
+      const qualityOptions: EvaluationOptions = {
+        ...options,
+        signal: linkedSignal.signal,
+      }
       try {
         if (languageOnly && compactFallback) {
           const languageAnalysis = await waitForRun(
-            this.qualityEvaluator.evaluateLanguage(request),
+            this.qualityEvaluator.evaluateLanguage(request, qualityOptions),
             run,
           )
           return withLanguageAnalysisFallback(request, {
@@ -534,12 +664,21 @@ export class AutomaticEvaluator {
         }
         return withLanguageAnalysisFallback(
           request,
-          await waitForRun(this.qualityEvaluator.evaluate(request), run),
+          await waitForRun(
+            this.qualityEvaluator.evaluate(request, qualityOptions),
+            run,
+          ),
         )
       } catch (error) {
         if (isAbortError(error)) throw error
+        if (
+          isQualityOutputError(error) ||
+          isRecoverableQualityRequestError(error)
+        ) return fallback()
         this.markQualityDegraded(generation)
         return fallback()
+      } finally {
+        linkedSignal.dispose()
       }
     }
     const evaluation = this.qualityEvaluationQueue.then(
@@ -556,27 +695,8 @@ export class AutomaticEvaluator {
   async preload(): Promise<RuntimeStatus> {
     await this.waitForClear()
     const generation = this.generation
-    let qualityCache: ModelCacheInfo | undefined
-    try {
-      qualityCache = await this.getQualityCacheInfo()
-    } catch {
-      // Der Kompaktpfad bleibt auch bei einer fehlgeschlagenen Cacheprobe nutzbar.
-    }
-    if (generation !== this.generation) throw abortError()
-
-    if (
-      qualityCache &&
-      qualityPayloadCached(qualityCache) &&
-      supportsQualityRuntime()
-    ) {
-      const available = await this.startQualityUpgrade(qualityCache)
-      if (generation !== this.generation) throw abortError()
-      if (available) return this.qualityEvaluator.getStatus()
-    }
-
     await this.ensureCompact()
     if (generation !== this.generation) throw abortError()
-    void this.startQualityUpgrade(qualityCache)
     return this.compactEvaluator.getStatus()
   }
 
@@ -585,29 +705,47 @@ export class AutomaticEvaluator {
     options?: EvaluationOptions,
   ): Promise<EvaluationResult> {
     const request = snapshotRequest(originalRequest)
+    const requestedEngine = requestedAssessmentEngine(request.assessmentEngine)
+    const evaluationOptions = options ? { ...options } : undefined
     const normalized = normalizeRequest(request)
-    const requiresQuality =
+    const deterministicResult = createAssessmentManipulationResult(normalized)
+    if (deterministicResult) {
+      if (evaluationOptions?.signal?.aborted) throw abortError()
+      return deterministicResult
+    }
+    const advancedQualityFeature =
       normalized.operator !== undefined ||
-      normalized.languageAnalysis !== undefined
+      normalized.languageAnalysis !== undefined ||
+      explicitlyRequestsThinking(evaluationOptions)
+    const useQuality =
+      requestedEngine === "quality" ||
+      (requestedEngine === undefined && advancedQualityFeature)
     await this.waitForClear()
     const run: EvaluationRun = {
       generation: this.generation,
-      requestSignal: options?.signal,
+      requestSignal: evaluationOptions?.signal,
       lifecycleSignal: this.lifecycleController.signal,
     }
     assertRunActive(run)
 
-    this.reportProgress(options, run, {
+    this.reportProgress(evaluationOptions, run, {
       phase: "selecting-model",
-      engine: this.qualityReady ? "quality" : "compact",
+      engine: useQuality && this.qualityReady ? "quality" : "compact",
       message: "Passendes Modell wird ausgewählt …",
     })
+
+    if (!useQuality) {
+      return operatorSafeCompactResult(
+        request,
+        await this.evaluateCompact(request, evaluationOptions, run),
+      )
+    }
 
     if (
       this.qualityReady &&
       !this.qualityDegraded
     ) {
-      return this.evaluateQualityWithFallback(request, options, run)
+      return this.evaluateQualityWithFallback(request, evaluationOptions, run)
     }
 
     let qualityCache: ModelCacheInfo | undefined
@@ -619,7 +757,7 @@ export class AutomaticEvaluator {
     assertRunActive(run)
 
     if (this.qualityReady && !this.qualityDegraded) {
-      return this.evaluateQualityWithFallback(request, options, run)
+      return this.evaluateQualityWithFallback(request, evaluationOptions, run)
     }
 
     if (
@@ -628,42 +766,46 @@ export class AutomaticEvaluator {
       supportsQualityRuntime() &&
       !this.qualityDegraded
     ) {
-      this.reportProgress(options, run, {
+      this.reportProgress(evaluationOptions, run, {
         phase: "preparing-quality",
         engine: "quality",
         message: "Qualitätsprüfung wird vorbereitet …",
       })
-      const qualityAvailable = await waitForRun(
+      const qualityAvailable = await this.waitForQualityUpgradeInForeground(
         this.startQualityUpgrade(qualityCache),
+        qualityCache,
         run,
       )
       assertRunActive(run)
       if (qualityAvailable) {
-        return this.evaluateQualityWithFallback(request, options, run)
+        return this.evaluateQualityWithFallback(request, evaluationOptions, run)
       }
     }
 
     const compactResult = operatorSafeCompactResult(
       request,
-      await this.evaluateCompact(request, options, run),
+      await this.evaluateCompact(request, evaluationOptions, run),
     )
     assertRunActive(run)
     const qualityUpgrade = this.startQualityUpgrade(qualityCache)
-    if (compactResult.passed && !requiresQuality) return compactResult
 
-    this.reportProgress(options, run, {
+    this.reportProgress(evaluationOptions, run, {
       phase: "preparing-quality",
       engine: "quality",
       message: "Qualitätsprüfung wird vorbereitet …",
     })
-    const qualityAvailable = await waitForRun(qualityUpgrade, run)
+    const qualityAvailable = await this.waitForQualityUpgradeInForeground(
+      qualityUpgrade,
+      qualityCache,
+      run,
+    )
     assertRunActive(run)
     if (!qualityAvailable || run.generation !== this.generation) {
       return compactResult
     }
     return this.evaluateQualityWithFallback(
       request,
-      options,
+      evaluationOptions,
       run,
       compactResult,
     )

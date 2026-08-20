@@ -309,6 +309,17 @@ function splitLongChunk(value: string): string[] {
   return chunks
 }
 
+function limitOrderedChunks(chunks: readonly string[]): string[] {
+  const unique = [...new Set(chunks.filter(Boolean))]
+  if (unique.length <= MAX_CHUNKS) return unique
+
+  return Array.from({ length: MAX_CHUNKS }, (_, index) =>
+    unique[
+      Math.round((index * (unique.length - 1)) / (MAX_CHUNKS - 1))
+    ]!,
+  )
+}
+
 export function chunkAnswer(answer: string): string[] {
   const normalized = normalizeAnswerText(answer)
   const paragraphs = normalized
@@ -323,11 +334,15 @@ export function chunkAnswer(answer: string): string[] {
       .filter((part) => part.length >= 4),
   )
 
-  const candidates =
-    normalized.length <= MAX_CHUNK_CHARACTERS
-      ? [normalizeText(normalized), ...paragraphChunks, ...sentences]
-      : [...paragraphChunks, ...sentences]
-  return [...new Set(candidates)].slice(0, MAX_CHUNKS)
+  if (normalized.length > MAX_CHUNK_CHARACTERS) {
+    return limitOrderedChunks(splitLongChunk(normalizeText(normalized)))
+  }
+
+  return limitOrderedChunks([
+    normalizeText(normalized),
+    ...paragraphChunks,
+    ...sentences,
+  ])
 }
 
 export function evaluationAnswerContexts(
@@ -336,7 +351,8 @@ export function evaluationAnswerContexts(
 ): string[] {
   const normalized = normalizeAnswerText(answer)
   if (!normalized) return []
-  return [normalized]
+  if (normalized.length <= MAX_CHUNK_CHARACTERS) return [normalized]
+  return chunkAnswer(normalized)
 }
 
 function decisive(

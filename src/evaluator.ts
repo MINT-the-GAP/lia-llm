@@ -1125,9 +1125,9 @@ export class SemanticEvaluator {
     const runtime = this.runtime
     if (!runtime) throw new Error("Das NLI-Modell ist nicht verfügbar.")
 
-    const results: NliEvidence[] = []
-    for (let offset = 0; offset < pairs.length; offset += this.config.batchSize) {
-      const batch = pairs.slice(offset, offset + this.config.batchSize)
+    const classifyBatch = async (
+      batch: readonly NliPair[],
+    ): Promise<NliEvidence[]> => {
       const premises = batch.map((pair) => pair.premise)
       const hypotheses = batch.map((pair) => pair.hypothesis)
       const inputs = runtime.tokenizer(premises, {
@@ -1139,9 +1139,22 @@ export class SemanticEvaluator {
       const sequenceLength = inputDimensions[inputDimensions.length - 1] ?? 0
       if (sequenceLength > MAX_NLI_SEQUENCE_LENGTH) {
         disposeInputs(inputs)
-        throw new Error(
-          `Ein vollständiges Antwort-Musterlösungs-Paar umfasst ${sequenceLength} Tokens; unterstützt werden höchstens ${MAX_NLI_SEQUENCE_LENGTH}. Bitte Antwort oder Musterlösung kürzen.`,
-        )
+        if (batch.length === 1) {
+          const pair = batch[0]!
+          return [{
+            text: pair.premise,
+            hypothesis: pair.hypothesis,
+            entailment: 0,
+            neutral: 1,
+            contradiction: 0,
+          }]
+        }
+
+        const splitResults: NliEvidence[] = []
+        for (const pair of batch) {
+          splitResults.push(...await classifyBatch([pair]))
+        }
+        return splitResults
       }
 
       let output: SequenceClassifierOutput | null = null
@@ -1149,7 +1162,7 @@ export class SemanticEvaluator {
         const currentOutput = await runtime.model(inputs)
         output = currentOutput
         const rows = toLogitRows(currentOutput.logits, batch.length)
-        rows.forEach((row, index) => {
+        return rows.map((row, index) => {
           const probabilities = Array.from(softmax(row))
           if (probabilities.length !== 3) {
             throw new Error(
@@ -1157,18 +1170,24 @@ export class SemanticEvaluator {
             )
           }
           const pair = batch[index]!
-          results.push({
+          return {
             text: pair.premise,
             hypothesis: pair.hypothesis,
             entailment: probabilities[runtime.labels.entailment]!,
             neutral: probabilities[runtime.labels.neutral]!,
             contradiction: probabilities[runtime.labels.contradiction]!,
-          })
+          }
         })
       } finally {
         output?.logits.dispose()
         disposeInputs(inputs)
       }
+    }
+
+    const results: NliEvidence[] = []
+    for (let offset = 0; offset < pairs.length; offset += this.config.batchSize) {
+      const batch = pairs.slice(offset, offset + this.config.batchSize)
+      results.push(...await classifyBatch(batch))
     }
 
     return results

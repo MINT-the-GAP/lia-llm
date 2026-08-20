@@ -118,6 +118,31 @@
       const language = window.LiaLLM?.parseMacroOptions(
         "0.66;solution=1;feedback=1;operator=erklaeren;Rechtschreibung=1;Satzbau=1"
       )
+      const thinking = window.LiaLLM?.parseMacroOptions(
+        "0.66;maxthinkingtime=20s;maxthinkingtokens=high"
+      )
+      const extremeThinking = window.LiaLLM?.parseMacroOptions(
+        "0.66;maxthinkingtokens=extreme"
+      )
+      const explicitCompact = window.LiaLLM?.parseMacroOptions(
+        "0.66;assessmentengine=compact"
+      )
+      const explicitQuality = window.LiaLLM?.parseMacroOptions(
+        "0.66;assessmentengine=QUALITY"
+      )
+      const compactThinkingDisabled = window.LiaLLM?.parseMacroOptions(
+        "0.66;assessmentengine=compact;maxthinkingtime=0s"
+      )
+      let compactAdvancedRejected = false
+      try {
+        window.LiaLLM?.parseMacroOptions(
+          "0.66;assessmentengine=compact;operator=erklaeren"
+        )
+      } catch (error) {
+        compactAdvancedRejected =
+          error instanceof Error &&
+          error.message.includes("assessmentengine=quality")
+      }
       const solution = document.getElementById("solution-probe")
       const solutionContent = () =>
         solution?.shadowRoot?.querySelector(".lia-llm-solution-content")
@@ -402,8 +427,8 @@
       const consentDetail = {
         id: "browser-consent-probe",
         engine: "quality",
-        modelName: "Qwen3-4B Test",
-        estimatedBytes: 2280000000,
+        modelName: "Qwen3-1.7B Test",
+        estimatedBytes: 984000000,
         handled: false,
         respond: value => {
           consentResponse = value
@@ -496,11 +521,11 @@
       try {
         const syntheticFailure = {
           phase: "error",
-          assessmentEngine: "compact",
+          assessmentEngine: "quality",
           modelId: "debug-smoke-model",
           revision: "debug-smoke-revision",
-          device: "wasm",
-          dtype: "q8",
+          device: "webgpu",
+          dtype: "q4f16",
           error: "Failed to fetch"
         }
         window.dispatchEvent(
@@ -522,9 +547,54 @@
           console[method] = originalConsoleMethods[method]
         }
         window.dispatchEvent(
-          new CustomEvent("lia-llm:status", { detail: initial })
+          new CustomEvent("lia-llm:status", {
+            detail: {
+              ...initial,
+              phase: "ready",
+              loadSource: "cache"
+            }
+          })
         )
       }
+      const manualFailureReport = await window.LiaLLM?.debugReport({
+        print: false
+      })
+      const manualDebugKeepsQualityFailure =
+        manualFailureReport?.runtime?.assessmentEngine === "quality" &&
+        manualFailureReport?.runtime?.phase === "error" &&
+        manualFailureReport?.outcome === "failed" &&
+        manualFailureReport?.events.some(
+          event =>
+            event.kind === "status" &&
+            event.engine === "quality" &&
+            event.outcome === "error" &&
+            event.runId === manualFailureReport.runId
+        ) &&
+        manualFailureReport?.events.every(
+          event =>
+            event.engine === undefined ||
+            (event.engine === "quality" &&
+              event.runId === manualFailureReport.runId)
+        )
+      window.dispatchEvent(
+        new CustomEvent("lia-llm:status", {
+          detail: {
+            phase: "idle",
+            assessmentEngine: "quality",
+            modelId: "debug-smoke-model",
+            revision: "debug-smoke-revision",
+            device: "webgpu",
+            dtype: "q4f16"
+          }
+        })
+      )
+      const resolvedFailureReport = await window.LiaLLM?.debugReport({
+        print: false
+      })
+      const manualDebugClearsResolvedQuality =
+        resolvedFailureReport?.runtime?.assessmentEngine === "compact" &&
+        resolvedFailureReport?.runtime?.phase === initial.phase &&
+        resolvedFailureReport?.outcome === "unknown"
       const automaticDebugText = automaticDebugConsole
         .flatMap(call => call.args)
         .filter(value => typeof value === "string")
@@ -761,7 +831,7 @@
 
       const matches = Boolean(
         window.LiaLLM &&
-        window.LiaLLM.version === "0.5.2" &&
+        window.LiaLLM.version === "0.6.0" &&
         typeof window.LiaLLM.evaluate === "function" &&
         typeof window.LiaLLM.debugReport === "function" &&
         typeof window.LiaLLM.feedbackForResult === "function" &&
@@ -779,6 +849,13 @@
         JSON.stringify(named) === JSON.stringify(positional) &&
         language?.rechtschreibung === true &&
         language?.satzbau === true &&
+        thinking?.maxThinkingTimeMs === 20_000 &&
+        thinking?.maxThinkingTokens === 768 &&
+        extremeThinking?.maxThinkingTokens === 2_048 &&
+        explicitCompact?.assessmentEngine === "compact" &&
+        explicitQuality?.assessmentEngine === "quality" &&
+        compactThinkingDisabled?.maxThinkingTimeMs === 0 &&
+        compactAdvancedRejected &&
         area instanceof HTMLTextAreaElement &&
         textareaLivesOnlyInShadow &&
         textareaAriaStaysInsideShadow &&
@@ -815,6 +892,8 @@
         debugReportIsSerializable &&
         debugReportIsPrivate &&
         automaticDebugNotizIsDeduplicated &&
+        manualDebugKeepsQualityFailure &&
+        manualDebugClearsResolvedQuality &&
         automaticCacheDebugNotizIsDeduplicated &&
         intentionalAbortIsSilent &&
         staleReadyTimerIsIgnored &&
@@ -822,9 +901,9 @@
         consentWasVisible &&
         consentResponse === false &&
         overlay?.dataset.consent === "0" &&
-        cacheInfo?.estimatedBytes === 2658614439 &&
+        cacheInfo?.estimatedBytes === 1362614439 &&
         cacheInfo?.engines?.compact?.estimatedBytes === 378614439 &&
-        cacheInfo?.engines?.quality?.estimatedBytes === 2280000000
+        cacheInfo?.engines?.quality?.estimatedBytes === 984000000
       )
       window.__liaCalibration.push({
         matches,
@@ -834,6 +913,8 @@
         debugReportIsSerializable,
         debugReportIsPrivate,
         automaticDebugNotizIsDeduplicated,
+        manualDebugKeepsQualityFailure,
+        manualDebugClearsResolvedQuality,
         automaticDebugConsoleMethods: automaticDebugConsole.map(
           call => call.method
         ),

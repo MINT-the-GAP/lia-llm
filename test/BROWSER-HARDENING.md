@@ -128,7 +128,7 @@ Testhost: Windows 10 Pro, Version `10.0.19045`, x64, Node.js `v24.14.0`.
 
 | Browser | Klasse | Version | Reportstart (UTC) | Cold | Neustart/Offline | gemessene Origin-Nutzung | Ergebnis |
 | --- | --- | --- | --- | ---: | ---: | ---: | --- |
-| Microsoft Edge | A | `151.0.4129.86` | `2026-08-17T11:35:03.242Z` | im älteren PASS-Report noch nicht separat erfasst | im älteren PASS-Report noch nicht separat erfasst | 378.621.184 B | PASS |
+| Microsoft Edge | A | `151.0.4129.93` | `2026-08-19T20:07:27.440Z` | 143.099 ms | 3.987 ms | 378.621.184 B | PASS |
 | Google Chrome | A | `151.0.7922.138` | `2026-08-17T12:07:00.113Z` | 133.491 ms | 3.671 ms | 378.621.184 B | PASS |
 | Playwright Chromium | B | `151.0.7922.34` | `2026-08-17T12:07:00.113Z` | 129.093 ms | 3.446 ms | 378.621.184 B | PASS |
 | Playwright Firefox | B | `153.0` | `2026-08-17T13:01:21.039Z` | 123.963 ms | 17.466 ms | 350.504.241 B | PASS |
@@ -160,7 +160,7 @@ ausbleibender Abschluss blockiert Modellladen oder Inferenz.
 Zusätzlich prüfen die Standard-Kompakt-Registry und der Quality-Cache-Probe nur
 bekannte Cache-Schlüssel per `Cache.match`. Diese Prüfungen sind netzfrei und
 starten insbesondere bei einem fehlenden Quality-Cache keinen Download. Der
-aktuelle Unitstand nach diesen Änderungen ist **85/85 bestanden**.
+entsprechende Unitstand ist durch die laufende Standardtestsuite abgedeckt.
 
 ### WebKit-Engine: FAIL, keine Safari-Zertifizierung
 
@@ -381,16 +381,45 @@ Die vorhandenen PASS-Reports erzwingen das Kompaktmodell. Ihre WebLLM-Caches
 `webllm/model`, `webllm/config` und `webllm/wasm` waren leer. Sie belegen daher
 nichts für das Quality-Modell.
 
-Das konfigurierte Quality-Modell ist `Qwen3-4B-q4f16_1-MLC` mit gepinnter
-Modellrevision `a5c9fab855e3ccbdfed2e7e69683d75f30332161` und gepinnter
-Modellbibliothek `025bcaf3780fa8254f5e5efd3bfea0a5397248f4`. Die konfigurierte
-Downloadschätzung beträgt 2.280.000.000 B. Es benötigt zusätzlich WebGPU,
-ausreichenden GPU-Speicher und erheblich mehr Origin-Quota; ein erfolgreicher
-WASM-Kompaktlauf sagt darüber nichts aus.
+Das konfigurierte, optionale Quality-Modell ist `Qwen3-1.7B-q4f16_1-MLC` mit gepinnter
+Modellrevision `80b3abcec6c3b3f5355dc0cc99cc4fb578f192bc` und gepinnter
+Modellbibliothek `025bcaf3780fa8254f5e5efd3bfea0a5397248f4`. Seine konfigurierte
+Downloadschätzung beträgt 984.000.000 B. Zusammen mit 378.614.439 B für das
+Kompaktmodell samt ONNX-Laufzeit ergibt das 1.362.614.439 B (ca. 1.299,5 MiB).
+Ein freies Origin-Speicherbudget von 2 GiB liegt damit deutlich über der konfigurierten
+Gesamtschätzung und lässt rechnerisch etwa 748,5 MiB Abstand. Das belegt jedoch weder ausreichenden
+GPU-Speicher noch ein stabiles WebGPU-Gerät. Compact bleibt der sichere Standard; Quality muss
+ausdrücklich oder über eine dokumentierte erweiterte Funktion gewählt werden.
 
-Eine Quality-Freigabe braucht pro Browser/OS-Paar denselben
-Cold→Neustart→Offline-Inferenz→Clear-Ablauf, muss aber nachweisen, dass wirklich
-Qwen und nicht der Kompakt-Fallback inferiert hat. Bis ein solcher separater Runner und
-die entsprechenden Realgeräte-Reports vorliegen, darf das Quality-Modell für
-keine der oben genannten Plattformen pauschal als offline- oder
-schulnetzgeeignet freigegeben werden.
+### Lokaler WebGPU-Stresstest
+
+Auf dem tatsächlich getesteten lokalen Host liefen Microsoft Edge 151 und eine NVIDIA GeForce
+RTX 2070 SUPER (Turing, 8 GB VRAM; gemeldetes maximales WebGPU-Pufferlimit ca. 2 GiB).
+Das nun konfigurierte Qwen3-1.7B reproduzierte in vier von vier warmen Minimalläufen dieselbe
+Fehlerkette:
+`DXGI_ERROR_DEVICE_HUNG` → verlorenes WebGPU-Gerät → `Object has already been disposed`.
+Modellcache und Plattenspeicher waren dabei vollständig beziehungsweise ausreichend. Der
+`disposed`-Fehler ist somit ein Folgefehler des verlorenen GPU-Geräts und kein Beleg für ein
+Quota- oder Downloadproblem.
+
+Die zwischenzeitlich geprüfte Variante Qwen3-0.6B blieb auf demselben Host im beobachteten Cold-
+und Warm-Lauf ohne Geräteverlust.
+Gemessen wurden ca. 143,4 s Modellinitialisierung und 2,86 s Generierung im Cold-Lauf sowie
+ca. 3,13 s Initialisierung und 1,36 s Generierung beim Warmstart. Der Cache wuchs um ungefähr
+336,2 MiB; WebLLM meldete rund 1.403,34 MB benötigten VRAM. Diese Werte sind Messungen dieses
+einen Systems und keine Mindestanforderungen oder Garantie für andere Rechner. Im semantischen
+Stresstest ohne vorgeschaltete deterministische Guards löste 0.6B jedoch nur 6 von 12 Fällen
+korrekt. Die Variante wurde deshalb als Bewertungsmodell verworfen und ist kein freigegebener
+Grader. Der deterministische Schutzpfad kann einzelne eindeutige Manipulationsversuche
+abweisen, ersetzt aber keine ausreichende semantische Modellleistung.
+
+Der reproduzierbare Inhalts-Stresstest wird nach einem aktuellen Build mit
+`npm run test:browser-adversarial` ausgeführt. Ein technisch erfolgreicher Lauf beweist nur die
+dort geprüften Fälle. Für die aktuelle 1.7B-Konfiguration liegt wegen des reproduzierten
+Geräteverlusts auf dem lokalen Testhost noch kein erfolgreicher Browser-Stresstest vor.
+
+Eine Quality-Freigabe braucht pro Browser/OS-Paar weiterhin denselben
+Cold→Neustart→Offline-Inferenz→Clear-Ablauf und muss nachweisen, dass wirklich Qwen statt des
+Kompakt-Fallbacks inferiert hat. Der lokale Stresstest lief nicht auf den Schulrechnern und ersetzt
+weder diesen Ablauf noch Tests im produktiven Schulnetz. Das Quality-Modell darf deshalb für keine
+der oben genannten Plattformen pauschal als offline- oder schulnetzgeeignet freigegeben werden.

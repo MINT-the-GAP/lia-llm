@@ -1,0 +1,231 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>direct WebLLM Qwen3 1.7B diagnostic</title>
+<pre id="output">waiting for diagnostic runner</pre>
+<script type="module">
+import * as webllm from '../src/generated/webllm.js'
+
+const MODEL_ID = 'Qwen3-1.7B-q4f16_1-MLC'
+const MODEL_REVISION = '80b3abcec6c3b3f5355dc0cc99cc4fb578f192bc'
+const MODEL_LIB_REVISION = '025bcaf3780fa8254f5e5efd3bfea0a5397248f4'
+
+function serializeError(value, seen = new WeakSet()) {
+  if (value === null || typeof value !== 'object') return String(value)
+  if (seen.has(value)) return '[circular]'
+  seen.add(value)
+  const serialized = {
+    name: value.name,
+    message: value.message,
+    stack: value.stack
+  }
+  if ('cause' in value) serialized.cause = serializeError(value.cause, seen)
+  for (const key of Object.getOwnPropertyNames(value)) {
+    if (key in serialized || key === 'cause') continue
+    try {
+      const item = value[key]
+      serialized[key] =
+        item && typeof item === 'object' ? serializeError(item, seen) : item
+    } catch (error) {
+      serialized[key] = `[unreadable: ${String(error)}]`
+    }
+  }
+  return serialized
+}
+
+async function matchingCacheSnapshot() {
+  const names = await caches.keys()
+  const entries = []
+  for (const name of names) {
+    const cache = await caches.open(name)
+    const requests = await cache.keys()
+    for (const request of requests) {
+      if (
+        request.url.includes(MODEL_ID) ||
+        request.url.includes('Qwen3-1.7B-q4f16_1_cs1k-webgpu.wasm')
+      ) {
+        entries.push({ cache: name, url: request.url })
+      }
+    }
+  }
+  return { cacheNames: names, matchingEntries: entries }
+}
+
+function pinnedAppConfig() {
+  const source = webllm.prebuiltAppConfig.model_list.find(
+    candidate => candidate.model_id === MODEL_ID
+  )
+  if (!source) throw new Error(`WebLLM does not contain ${MODEL_ID}`)
+  const modelLib = new URL(source.model_lib)
+  const mutablePrefix = '/mlc-ai/binary-mlc-llm-libs/main/'
+  if (!modelLib.pathname.startsWith(mutablePrefix)) {
+    throw new Error(`Unexpected model library URL: ${source.model_lib}`)
+  }
+  modelLib.pathname =
+    `/mlc-ai/binary-mlc-llm-libs/${MODEL_LIB_REVISION}/` +
+    modelLib.pathname.slice(mutablePrefix.length)
+  return {
+    cacheBackend: 'cache',
+    model_list: [
+      {
+        ...source,
+        model:
+          `https://huggingface.co/mlc-ai/${MODEL_ID}/resolve/` +
+          `${MODEL_REVISION}/`,
+        model_lib: modelLib.href
+      }
+    ]
+  }
+}
+
+window.__liaDiagnosticStart = false
+window.__liaCalibrationDone = false
+window.__liaCalibration = []
+window.__liaCalibrationExpected = 1
+window.__liaPageDiagnostics = []
+
+window.addEventListener('error', event => {
+  window.__liaPageDiagnostics.push({
+    type: 'error',
+    message: event.message,
+    filename: event.filename,
+    lineno: event.lineno,
+    colno: event.colno,
+    error: event.error ? serializeError(event.error) : null
+  })
+})
+window.addEventListener('unhandledrejection', event => {
+  window.__liaPageDiagnostics.push({
+    type: 'unhandledrejection',
+    reason: serializeError(event.reason)
+  })
+})
+
+;(async () => {
+  while (!window.__liaDiagnosticStart) {
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  let engine
+  const started = performance.now()
+  try {
+    const adapter = await navigator.gpu.requestAdapter()
+    if (!adapter) throw new Error('No WebGPU adapter')
+    const adapterInfo = adapter.info
+      ? {
+          vendor: adapter.info.vendor,
+          architecture: adapter.info.architecture,
+          device: adapter.info.device,
+          description: adapter.info.description,
+          isFallbackAdapter: adapter.info.isFallbackAdapter
+        }
+      : null
+    const adapterLimits = {
+      maxBufferSize: adapter.limits.maxBufferSize,
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      maxComputeWorkgroupStorageSize:
+        adapter.limits.maxComputeWorkgroupStorageSize
+    }
+    const cacheBefore = await matchingCacheSnapshot()
+    const storageBefore = await navigator.storage.estimate()
+    const initProgress = []
+    let lastProgress = -1
+    let lastText = ''
+    const loadStarted = performance.now()
+    engine = await webllm.CreateMLCEngine(MODEL_ID, {
+      appConfig: pinnedAppConfig(),
+      logLevel: 'INFO',
+      initProgressCallback: report => {
+        const percent = Math.round((report.progress ?? 0) * 100)
+        if (percent >= lastProgress + 5 || report.text !== lastText) {
+          initProgress.push({
+            elapsedMs: Number((performance.now() - loadStarted).toFixed(1)),
+            progress: report.progress,
+            text: report.text,
+            timeElapsed: report.timeElapsed
+          })
+          lastProgress = percent
+          lastText = report.text
+        }
+      }
+    })
+    const loadDurationMs = Number((performance.now() - loadStarted).toFixed(1))
+    const generationStarted = performance.now()
+    const completion = await engine.chat.completions.create({
+      messages: [
+        {
+          role: 'user',
+          content:
+            'Antworte genau mit einem kurzen deutschen Satz: Warum schwimmt Eis auf Wasser?'
+        }
+      ],
+      temperature: 0,
+      max_tokens: 48,
+      extra_body: { enable_thinking: false }
+    })
+    const generationDurationMs = Number(
+      (performance.now() - generationStarted).toFixed(1)
+    )
+    const content = completion.choices?.[0]?.message?.content ?? ''
+    const runtimeStats = await engine.runtimeStatsText(MODEL_ID)
+    const cacheAfter = await matchingCacheSnapshot()
+    const storageAfter = await navigator.storage.estimate()
+    window.__liaCalibration.push({
+      case: 1,
+      id: 'direct-webllm-qwen3-1.7b',
+      matches: content.trim().length > 0,
+      compactFeedbackHasCriteria: false,
+      modelId: MODEL_ID,
+      modelRevision: MODEL_REVISION,
+      modelLibRevision: MODEL_LIB_REVISION,
+      webllmVersion: '0.2.84',
+      loadWasWarm: cacheBefore.matchingEntries.length > 0,
+      loadDurationMs,
+      generationDurationMs,
+      wallClockDurationMs: Number((performance.now() - started).toFixed(1)),
+      output: content,
+      finishReason: completion.choices?.[0]?.finish_reason ?? null,
+      usage: completion.usage ?? null,
+      runtimeStats,
+      adapterInfo,
+      adapterLimits,
+      cacheBefore,
+      cacheAfter,
+      storageBefore,
+      storageAfter,
+      initProgress,
+      pageDiagnostics: window.__liaPageDiagnostics
+    })
+  } catch (error) {
+    window.__liaCalibrationError = JSON.stringify({
+      caught: serializeError(error),
+      pageDiagnostics: window.__liaPageDiagnostics,
+      modelId: MODEL_ID,
+      modelRevision: MODEL_REVISION,
+      modelLibRevision: MODEL_LIB_REVISION,
+      cache: await matchingCacheSnapshot(),
+      storage: await navigator.storage.estimate(),
+      wallClockDurationMs: Number((performance.now() - started).toFixed(1))
+    })
+  } finally {
+    if (engine) {
+      try {
+        await engine.unload()
+      } catch (error) {
+        window.__liaPageDiagnostics.push({
+          type: 'unload-error',
+          error: serializeError(error)
+        })
+      }
+    }
+    document.querySelector('#output').textContent = JSON.stringify(
+      {
+        results: window.__liaCalibration,
+        error: window.__liaCalibrationError ?? null,
+        pageDiagnostics: window.__liaPageDiagnostics
+      },
+      null,
+      2
+    )
+    window.__liaCalibrationDone = true
+  }
+})()
+</script>

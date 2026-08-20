@@ -12,12 +12,27 @@ const calibrationPage =
   process.env.LIA_LLM_CALIBRATION_PAGE ??
   "test/browser-holistic-calibration.html"
 const executionMode = process.argv[3]
+const captureBrowserDiagnostics =
+  process.env.LIA_LLM_CAPTURE_BROWSER_DIAGNOSTICS === "1"
 const useWebGpu =
   executionMode === "cpu"
     ? false
     : executionMode === "webgpu"
       ? true
       : process.env.LIA_LLM_WEBGPU !== "0"
+const configuredPort = process.env.LIA_LLM_CALIBRATION_PORT?.trim() ?? ""
+const calibrationPort = configuredPort === "" ? 0 : Number(configuredPort)
+if (
+  configuredPort !== "" &&
+  (!/^\d+$/u.test(configuredPort) ||
+    !Number.isInteger(calibrationPort) ||
+    calibrationPort < 0 ||
+    calibrationPort > 65_535)
+) {
+  throw new Error(
+    "LIA_LLM_CALIBRATION_PORT must be an integer between 0 and 65535.",
+  )
+}
 
 function browserMetadata(browserPath) {
   const executable = basename(browserPath).toLowerCase()
@@ -118,7 +133,7 @@ const server = createServer(async (request, response) => {
 
 await new Promise((resolve, reject) => {
   server.once("error", reject)
-  server.listen(0, "127.0.0.1", resolve)
+  server.listen(calibrationPort, "127.0.0.1", resolve)
 })
 const serverAddress = server.address()
 if (!serverAddress || typeof serverAddress === "string") {
@@ -221,6 +236,8 @@ try {
 
   let messageId = 0
   const pending = new Map()
+  const browserDiagnostics = []
+  let ignoredPausedExceptions = 0
   const rejectPending = (reason) => {
     for (const { reject } of pending.values()) reject(reason)
     pending.clear()
@@ -237,6 +254,109 @@ try {
   })
   socket.addEventListener("message", (event) => {
     const message = JSON.parse(event.data)
+    if (captureBrowserDiagnostics && message.method === "Runtime.consoleAPICalled") {
+      const diagnostic = {
+        method: message.method,
+        type: message.params?.type,
+        timestamp: message.params?.timestamp,
+        args: (message.params?.args ?? []).map((argument) => ({
+          type: argument.type,
+          subtype: argument.subtype,
+          value: argument.value,
+          unserializableValue: argument.unserializableValue,
+          description: argument.description,
+          preview: argument.preview,
+        })),
+        stackTrace: message.params?.stackTrace ?? null,
+      }
+      const containsEmbeddedDebugReport = diagnostic.args.some(
+        (argument) =>
+          typeof argument.value === "string" &&
+          argument.value.includes("--- BEGIN LIA-LLM DEBUGNOTIZ ---"),
+      )
+      const isProgress = diagnostic.args.some(
+        (argument) => argument.value === "lia-quality-progress",
+      )
+      const isErrorConsole = ["error", "warning", "assert"].includes(
+        diagnostic.type,
+      )
+      if (
+        !containsEmbeddedDebugReport &&
+        (isProgress || isErrorConsole)
+      ) {
+        browserDiagnostics.push(diagnostic)
+      }
+    }
+    if (captureBrowserDiagnostics && message.method === "Runtime.exceptionThrown") {
+      const details = message.params?.exceptionDetails
+      browserDiagnostics.push({
+        method: message.method,
+        timestamp: message.params?.timestamp,
+        exceptionDetails: details
+          ? {
+              exceptionId: details.exceptionId,
+              text: details.text,
+              lineNumber: details.lineNumber,
+              columnNumber: details.columnNumber,
+              scriptId: details.scriptId,
+              url: details.url,
+              stackTrace: details.stackTrace ?? null,
+              exception: details.exception
+                ? {
+                    className: details.exception.className,
+                    description: details.exception.description,
+                    value: details.exception.value,
+                  }
+                : null,
+            }
+          : null,
+      })
+    }
+    if (captureBrowserDiagnostics && message.method === "Log.entryAdded") {
+      browserDiagnostics.push({
+        method: message.method,
+        entry: message.params?.entry ?? null,
+      })
+    }
+    if (captureBrowserDiagnostics && message.method === "Debugger.paused") {
+      const pausedDiagnostic = {
+        method: message.method,
+        reason: message.params?.reason,
+        data: message.params?.data
+          ? {
+              type: message.params.data.type,
+              subtype: message.params.data.subtype,
+              className: message.params.data.className,
+              description: message.params.data.description,
+              value: message.params.data.value,
+              preview: message.params.data.preview,
+            }
+          : null,
+        asyncStackTrace: message.params?.asyncStackTrace ?? null,
+        callFrames: (message.params?.callFrames ?? []).map((frame) => ({
+          callFrameId: frame.callFrameId,
+          functionName: frame.functionName,
+          functionLocation: frame.functionLocation,
+          location: frame.location,
+          url: frame.url,
+        })),
+      }
+      if (
+        /disposed|device\s+(?:was\s+)?lost|DXGI|GrammarMatcher|QualityOutputError|validiertes JSON|finish_reason/iu.test(
+          pausedDiagnostic.data?.description ?? "",
+        )
+      ) {
+        browserDiagnostics.push(pausedDiagnostic)
+      } else {
+        ignoredPausedExceptions += 1
+      }
+      void command("Debugger.resume").catch((error) => {
+        browserDiagnostics.push({
+          method: "Debugger.resume.error",
+          error: error instanceof Error ? error.stack : String(error),
+        })
+      })
+    }
     if (!message.id || !pending.has(message.id)) return
     const { resolve, reject } = pending.get(message.id)
     pending.delete(message.id)
@@ -252,6 +372,37 @@ try {
     })
 
   await command("Runtime.enable")
+  if (captureBrowserDiagnostics) {
+    await command("Log.enable")
+    await command("Debugger.enable")
+    await command("Debugger.setAsyncCallStackDepth", { maxDepth: 32 })
+    await command("Debugger.setPauseOnExceptions", { state: "all" })
+  }
+  const diagnosticReadyDeadline = Date.now() + 30_000
+  let pageReady = false
+  while (Date.now() < diagnosticReadyDeadline) {
+    const ready = await command("Runtime.evaluate", {
+      expression:
+        "JSON.stringify({hasGate:Object.prototype.hasOwnProperty.call(window,'__liaDiagnosticStart'),gate:window.__liaDiagnosticStart,hasCalibration:Number.isInteger(window.__liaCalibrationExpected)})",
+      returnByValue: true,
+    })
+    const state = JSON.parse(ready.result.value)
+    if (state.hasGate) {
+      if (state.gate === false) {
+        await command("Runtime.evaluate", {
+          expression: "window.__liaDiagnosticStart = true",
+        })
+      }
+      pageReady = true
+      break
+    }
+    if (state.hasCalibration) {
+      pageReady = true
+      break
+    }
+    await delay(50)
+  }
+  if (!pageReady) throw new Error("Calibration page did not initialize")
   const deadline = Date.now() + (useWebGpu ? 30 : 15) * 60_000
   let lastCount = -1
   while (Date.now() < deadline) {
@@ -267,6 +418,11 @@ try {
     }
     if (state.done) {
       process.stdout.write(`${JSON.stringify(state, null, 2)}\n`)
+      if (captureBrowserDiagnostics) {
+        process.stdout.write(
+          `${JSON.stringify({ ignoredPausedExceptions, browserDiagnostics }, null, 2)}\n`,
+        )
+      }
       if (
         state.error ||
         state.total < 1 ||

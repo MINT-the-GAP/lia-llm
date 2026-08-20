@@ -32,7 +32,9 @@ interface DiagnosticState {
   activities: Map<string, DebugTraceEvent>
   cacheSnapshots: Partial<Record<AssessmentEngine, ModelCacheInfo>>
   latestStatuses: Partial<Record<AssessmentEngine, RuntimeStatus>>
-  lastErrorStatuses: Partial<Record<AssessmentEngine, RuntimeStatus>>
+  lastErrors: Partial<
+    Record<AssessmentEngine, AutomaticReportSnapshot & { sequence: number }>
+  >
   api: DiagnosticsApi | null
   registered: boolean
   printed: Set<string>
@@ -67,7 +69,7 @@ function createState(): DiagnosticState {
     activities: new Map(),
     cacheSnapshots: {},
     latestStatuses: {},
-    lastErrorStatuses: {},
+    lastErrors: {},
     api: null,
     registered: false,
     printed: new Set(),
@@ -120,25 +122,236 @@ export function sanitizeDebugText(value: unknown): string {
     : source
 }
 
-function normalizedError(error: unknown): { name: string; message: string } {
-  if (error instanceof Error || error instanceof DOMException) {
+const GENERIC_ERROR_NAME = "Error"
+const GENERIC_ERROR_MESSAGE = "Nicht klassifizierter technischer Fehler."
+
+const ALLOWED_ERROR_NAMES = new Map<string, string>([
+  ["error", "Error"],
+  ["typeerror", "TypeError"],
+  ["rangeerror", "RangeError"],
+  ["aborterror", "AbortError"],
+  ["timeouterror", "TimeoutError"],
+  ["quotaexceedederror", "QuotaExceededError"],
+  ["securityerror", "SecurityError"],
+  ["notallowederror", "NotAllowedError"],
+  ["invalidstateerror", "InvalidStateError"],
+  ["networkerror", "NetworkError"],
+  ["operationerror", "OperationError"],
+  ["dataerror", "DataError"],
+  ["compileerror", "CompileError"],
+  ["linkerror", "LinkError"],
+  ["contextwindowsizeexceedederror", "ContextWindowSizeExceededError"],
+])
+
+function rawDebugString(value: unknown): string {
+  try {
+    return String(value ?? "")
+  } catch {
+    return ""
+  }
+}
+
+function canonicalErrorSignature(
+  errorName: unknown,
+  errorMessage: unknown,
+): { name: string; message: string } {
+  const rawName = rawDebugString(errorName).trim()
+  const rawMessage = rawDebugString(errorMessage)
+  const haystack = rawName + " " + rawMessage
+
+  if (
+    rawName.toLowerCase() === "aborterror" ||
+    /\bAbortError\b|\b(?:operation|vorgang|download|request|anfrage)\s+(?:was\s+)?(?:aborted|cancelled|canceled|abgebrochen)\b/iu
+      .test(haystack)
+  ) {
     return {
-      name: sanitizeDebugText(error.name || "Error"),
-      message: sanitizeDebugText(error.message),
+      name: "AbortError",
+      message: "Der technische Vorgang wurde abgebrochen (AbortError).",
     }
   }
-  return { name: "Error", message: sanitizeDebugText(error) }
+  if (
+    /ContextWindow(?:SizeExceeded)?Error|Kontextfenster|prompt tokens exceed context window size|context(?:-|\s*)window[^.\n]{0,80}(?:exceed|limit|too (?:large|long)|overflow)/iu
+      .test(haystack)
+  ) {
+    return {
+      name: "ContextWindowSizeExceededError",
+      message: "Das Kontextfenster wurde ueberschritten (ContextWindowError).",
+    }
+  }
+  if (
+    /QuotaExceededError|quota(?:\s+exceeded)?|storage\s+(?:is\s+)?full|disk\s+(?:is\s+)?full|Speicher(?:platz)?(?:limit)?[^.\n]{0,80}\b(?:voll|erschoepft|erschöpft|ueberschritten|überschritten)/iu
+      .test(haystack)
+  ) {
+    return {
+      name: "QuotaExceededError",
+      message: "Die Speicherquote wurde ueberschritten (QuotaExceededError).",
+    }
+  }
+  if (/NotAllowedError/iu.test(haystack)) {
+    return {
+      name: "NotAllowedError",
+      message: "Der technische Zugriff wurde nicht erlaubt (NotAllowedError).",
+    }
+  }
+  if (/SecurityError/iu.test(haystack)) {
+    return {
+      name: "SecurityError",
+      message: "Der technische Zugriff wurde verweigert (SecurityError).",
+    }
+  }
+  if (/InvalidStateError/iu.test(haystack)) {
+    return {
+      name: "InvalidStateError",
+      message: "Der technische Vorgang ist in diesem Zustand nicht erlaubt (InvalidStateError).",
+    }
+  }
+  if (
+    /Content-Range|Byte-?Bereich|Byte-Download unerwartet beendet|Range-(?:Anfrage|Antwort)|HTTP 200 statt|bereits geladenen Bytes|Prefix/iu
+      .test(haystack)
+  ) {
+    return {
+      name: "NetworkError",
+      message: "Die Byte-Range- oder Content-Range-Antwort war ungueltig.",
+    }
+  }
+  if (
+    /TimeoutError|timed?\s*out|timeout|Zeit[^.\n]{0,40}(?:abgelaufen|ueberschritten|überschritten)|keine neuen Daten/iu
+      .test(haystack)
+  ) {
+    return {
+      name: "TimeoutError",
+      message: "Der technische Vorgang endete wegen einer Zeitueberschreitung (TimeoutError).",
+    }
+  }
+  if (
+    /zu wenig|unvollst|truncat|frueh[^.\n]{0,30}beendet|früh[^.\n]{0,30}beendet|vorzeitig|Leere (?:Voll-)?Download-Antwort/iu
+      .test(haystack)
+  ) {
+    return {
+      name: "NetworkError",
+      message: "Der Download war unvollstaendig oder vorzeitig beendet (truncated).",
+    }
+  }
+  if (/zu viele|size mismatch|Groesse|Größe|statt\s+\d+\s+Bytes/iu.test(haystack)) {
+    return {
+      name: "NetworkError",
+      message: "Die empfangene Dateigroesse stimmt nicht (size mismatch).",
+    }
+  }
+  if (
+    /integrity|sha-?256|hash mismatch|corrupt|kein gueltiges|kein gültiges|ungueltiges[^.\n]{0,30}Artefakt|ungültiges[^.\n]{0,30}Artefakt/iu
+      .test(haystack)
+  ) {
+    return {
+      name: "DataError",
+      message: "Die Integritaetspruefung des Artefakts ist fehlgeschlagen (integrity).",
+    }
+  }
+  const dxgi = haystack.match(
+    /DXGI_ERROR_DEVICE_(HUNG|REMOVED|RESET)/iu,
+  )?.[1]?.toUpperCase()
+  if (dxgi) {
+    return {
+      name: "OperationError",
+      message: "WebGPU device lost (DXGI_ERROR_DEVICE_" + dxgi + ").",
+    }
+  }
+  if (/VK_ERROR_DEVICE_LOST/iu.test(haystack)) {
+    return {
+      name: "OperationError",
+      message: "WebGPU device lost (VK_ERROR_DEVICE_LOST).",
+    }
+  }
+  if (/object has already been disposed|tensor has already been disposed|cannot pass deleted object/iu.test(haystack)) {
+    return {
+      name: "OperationError",
+      message: "Ein WebGPU-Objekt wurde bereits freigegeben (object disposed).",
+    }
+  }
+  if (/out of (?:gpu )?memory|\boom\b|memory allocation/iu.test(haystack)) {
+    return {
+      name: "OperationError",
+      message: "WebGPU hat nicht genug Geraetespeicher (out of memory).",
+    }
+  }
+  if (/WebGPU|requestAdapter|requestDevice|device[-_ ]?(?:was )?lost|gpu[^.\n]{0,40}(?:hang|lost)/iu.test(haystack)) {
+    return {
+      name: "OperationError",
+      message: "Die WebGPU-Laufzeit oder das GPU-Geraet ist ausgefallen (device lost).",
+    }
+  }
+  if (/Content Security Policy|Refused to|wasm-unsafe-eval|unsafe-eval|script-src|worker-src/iu.test(haystack)) {
+    return {
+      name: "SecurityError",
+      message: "Die Content Security Policy blockiert eine benoetigte Laufzeitfunktion.",
+    }
+  }
+  if (/ONNX|WASM|WebAssembly|InferenceSession|execution provider|backend|instantiate|CompileError|LinkError/iu.test(haystack)) {
+    return {
+      name: /CompileError/iu.test(haystack)
+        ? "CompileError"
+        : /LinkError/iu.test(haystack)
+          ? "LinkError"
+          : "OperationError",
+      message: "Die ONNX- oder WebAssembly-Laufzeit konnte nicht initialisiert werden.",
+    }
+  }
+  const httpStatus = haystack.match(
+    /\bHTTP(?:\s+status)?\s*[:=]?\s*([1-5]\d{2})\b/iu,
+  )?.[1]
+  if (httpStatus) {
+    return {
+      name: "NetworkError",
+      message: "HTTP " + httpStatus + ".",
+    }
+  }
+  if (/Failed to fetch|NetworkError|Load failed|network request failed|fetch failed/iu.test(haystack)) {
+    return {
+      name: rawName.toLowerCase() === "typeerror" ? "TypeError" : "NetworkError",
+      message: "Der Netzwerkabruf ist fehlgeschlagen (Failed to fetch).",
+    }
+  }
+
+  return {
+    name: ALLOWED_ERROR_NAMES.get(rawName.toLowerCase()) ?? GENERIC_ERROR_NAME,
+    message: GENERIC_ERROR_MESSAGE,
+  }
+}
+
+function normalizedError(error: unknown): { name: string; message: string } {
+  if (error !== null && typeof error === "object") {
+    let name: unknown = GENERIC_ERROR_NAME
+    let message: unknown = ""
+    try {
+      name = (error as { name?: unknown }).name ?? GENERIC_ERROR_NAME
+    } catch {
+      // Accessor-backed foreign errors can throw while being inspected.
+    }
+    try {
+      message = (error as { message?: unknown }).message ?? ""
+    } catch {
+      // Never serialize the object itself if its message cannot be inspected.
+    }
+    return canonicalErrorSignature(name, message)
+  }
+  return canonicalErrorSignature(GENERIC_ERROR_NAME, error)
+}
+
+function canonicalizeDebugEvent(event: DebugTraceEvent): DebugTraceEvent {
+  if (event.errorName === undefined && event.message === undefined) return event
+  const error = canonicalErrorSignature(event.errorName, event.message)
+  return { ...event, errorName: error.name, message: error.message }
 }
 
 function appendEvent(
   event: Omit<DebugTraceEvent, "sequence" | "elapsedMs">,
 ): DebugTraceEvent {
   const state = diagnosticState()
-  const complete: DebugTraceEvent = {
+  const complete = canonicalizeDebugEvent({
     ...event,
     sequence: ++state.sequence,
     elapsedMs: elapsedMs(),
-  }
+  })
   state.events.push(complete)
   if (state.events.length > MAX_EVENTS) {
     state.events.splice(0, state.events.length - MAX_EVENTS)
@@ -153,7 +366,7 @@ function runIdFor(engine: AssessmentEngine): string {
 
 export function beginDebugLoad(engine: AssessmentEngine): string {
   const state = diagnosticState()
-  delete state.lastErrorStatuses[engine]
+  delete state.lastErrors[engine]
   delete state.latestStatuses[engine]
   delete state.cacheSnapshots[engine]
   state.events = state.events.filter((event) => event.engine !== engine)
@@ -378,12 +591,14 @@ export function instrumentDebugFetch(
 
 function sanitizeCacheInfo(cache: ModelCacheInfo): ModelCacheInfo {
   const engines = cache.engines
-    ? Object.fromEntries(
-        Object.entries(cache.engines).map(([engine, value]) => [
-          engine,
-          value ? sanitizeCacheInfo(value) : value,
-        ]),
-      ) as ModelCacheInfo["engines"]
+    ? {
+        ...(cache.engines.compact
+          ? { compact: sanitizeCacheInfo(cache.engines.compact) }
+          : {}),
+        ...(cache.engines.quality
+          ? { quality: sanitizeCacheInfo(cache.engines.quality) }
+          : {}),
+      }
     : undefined
   return {
     supported: Boolean(cache.supported),
@@ -396,7 +611,38 @@ function sanitizeCacheInfo(cache: ModelCacheInfo): ModelCacheInfo {
       : 0,
     persistent: cache.persistent,
     engines,
-    error: cache.error ? sanitizeDebugText(cache.error) : undefined,
+    error: cache.error
+      ? canonicalErrorSignature(GENERIC_ERROR_NAME, cache.error).message
+      : undefined,
+  }
+}
+
+function canonicalStorageError(value: unknown): string {
+  const raw = rawDebugString(value)
+  const labels = [
+    ["Cachepr\u00fcfung", /Cachepr(?:\u00fc|ue)fung/iu],
+    ["Persistenzpr\u00fcfung", /Persistenzpr(?:\u00fc|ue)fung/iu],
+    ["Speicherquotenpr\u00fcfung", /Speicherquotenpr(?:\u00fc|ue)fung/iu],
+    ["StorageManager", /StorageManager/iu],
+  ] as const
+  const safeLabels = labels
+    .filter(([, pattern]) => pattern.test(raw))
+    .map(([label]) => label)
+  const error = canonicalErrorSignature(GENERIC_ERROR_NAME, raw).message
+  return safeLabels.length ? safeLabels.join("; ") + ": " + error : error
+}
+
+function sanitizeStorageSummary(
+  storage: DebugStorageSummary,
+): DebugStorageSummary {
+  return {
+    persisted: storage.persisted,
+    usageMiB: numberOrNull(storage.usageMiB),
+    quotaMiB: numberOrNull(storage.quotaMiB),
+    remainingMiB: numberOrNull(storage.remainingMiB),
+    usagePercent: numberOrNull(storage.usagePercent),
+    cache: storage.cache ? sanitizeCacheInfo(storage.cache) : null,
+    error: storage.error ? canonicalStorageError(storage.error) : undefined,
   }
 }
 
@@ -410,10 +656,15 @@ function roundMiB(value: number | null): number | null {
 
 type DiagnosticProbeResult<T> =
   | { ok: true; value: T }
-  | { ok: false; error: unknown }
+  | { ok: false; error: unknown; label: DiagnosticProbeLabel }
+
+type DiagnosticProbeLabel =
+  | "Cachepr\u00fcfung"
+  | "Persistenzpr\u00fcfung"
+  | "Speicherquotenpr\u00fcfung"
 
 async function runDiagnosticProbe<T>(
-  label: string,
+  label: DiagnosticProbeLabel,
   operation: () => Promise<T>,
 ): Promise<DiagnosticProbeResult<T>> {
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -431,7 +682,7 @@ async function runDiagnosticProbe<T>(
     const value = await Promise.race([operation(), timeout])
     return { ok: true, value }
   } catch (error) {
-    return { ok: false, error }
+    return { ok: false, error, label }
   } finally {
     if (timer !== undefined) clearTimeout(timer)
   }
@@ -522,9 +773,12 @@ async function captureStorage(
   let usage: number | null = null
   let quota: number | null = null
   const errors: string[] = []
-  const note = (error: unknown): void => {
+  const note = (
+    label: DiagnosticProbeLabel | "StorageManager",
+    error: unknown,
+  ): void => {
     const value = normalizedError(error)
-    errors.push(value.name + ": " + value.message)
+    errors.push(label + ": " + value.name + ": " + value.message)
   }
   let storage: StorageManager | undefined
   try {
@@ -532,7 +786,7 @@ async function captureStorage(
       ? undefined
       : navigator.storage
   } catch (error) {
-    note(error)
+    note("StorageManager", error)
   }
   const [cacheProbe, persistedProbe, estimateProbe] = await Promise.all([
     runDiagnosticProbe("Cachepr\u00fcfung", () => api.getCacheInfo()),
@@ -547,13 +801,13 @@ async function captureStorage(
     cache = sanitizeCacheInfo(cacheProbe.value)
     persisted = cache.persistent ?? null
   } else {
-    note(cacheProbe.error)
+    note(cacheProbe.label, cacheProbe.error)
   }
   if (persistedProbe) {
     if (persistedProbe.ok) {
       persisted = persistedProbe.value
     } else {
-      note(persistedProbe.error)
+      note(persistedProbe.label, persistedProbe.error)
     }
   }
   if (estimateProbe) {
@@ -561,7 +815,7 @@ async function captureStorage(
       usage = numberOrNull(estimateProbe.value.usage)
       quota = numberOrNull(estimateProbe.value.quota)
     } else {
-      note(estimateProbe.error)
+      note(estimateProbe.label, estimateProbe.error)
     }
   }
   const remaining =
@@ -592,7 +846,9 @@ function runtimeWithoutSensitiveError(
     revision: sanitizeDebugText(status.revision),
     device: status.device,
     dtype: status.dtype,
-    error: status.error ? sanitizeDebugText(status.error) : undefined,
+    error: status.error
+      ? canonicalErrorSignature(GENERIC_ERROR_NAME, status.error).message
+      : undefined,
   }
 }
 
@@ -623,6 +879,11 @@ function errorFinding(
   }
 }
 
+function isQuotaFailureText(value: string): boolean {
+  return /QuotaExceededError|quota(?:\s+exceeded)?|storage\s+(?:is\s+)?full|disk\s+(?:is\s+)?full|Speicher(?:platz)?(?:limit)?[^.]*\b(?:voll|ersch\u00f6pft|\u00fcberschritten)/iu
+    .test(value)
+}
+
 function cacheFindings(
   events: readonly DebugTraceEvent[],
   environment: DebugEnvironment,
@@ -632,7 +893,21 @@ function cacheFindings(
   const findings: DebugFinding[] = []
   const cacheEvents = events.filter((event) => event.kind === "cache")
   const quota = cacheEvents.find((event) =>
-    /quota/iu.test((event.errorName ?? "") + " " + (event.message ?? "")),
+    isQuotaFailureText((event.errorName ?? "") + " " + (event.message ?? "")),
+  )
+  const propagatedQuota = events.find((event) =>
+    event.kind === "failure" &&
+    isQuotaFailureText(
+      (event.errorName ?? "") + " " + (event.message ?? ""),
+    ),
+  )
+  const denied = cacheEvents.find((event) =>
+    /SecurityError|NotAllowedError|InvalidStateError/iu.test(
+      event.errorName ?? "",
+    ),
+  )
+  const corrupt = cacheEvents.find((event) =>
+    /corrupt|invalid|integrity/iu.test(event.outcome ?? ""),
   )
   if (quota) {
     findings.push(errorFinding(
@@ -643,11 +918,42 @@ function cacheFindings(
       "Speicherplatz und Browserrichtlinien pr\u00fcfen; danach erneut laden.",
     ))
   }
-  const denied = cacheEvents.find((event) =>
-    /SecurityError|NotAllowedError|InvalidStateError/iu.test(
-      event.errorName ?? "",
-    ),
-  )
+  const activeEngine = runtime?.assessmentEngine
+  const activeCache = activeEngine
+    ? storage.cache?.engines?.[activeEngine] ?? storage.cache
+    : null
+  const estimatedMiB = activeCache && activeCache.estimatedBytes > 0
+    ? roundMiB(activeCache.estimatedBytes)
+    : null
+  if (
+    !quota &&
+    !propagatedQuota &&
+    !denied &&
+    !corrupt &&
+    runtime?.phase === "error" &&
+    activeCache &&
+    activeCache.supported &&
+    !(activeCache.downloadCached ?? activeCache.cached) &&
+    estimatedMiB !== null &&
+    storage.remainingMiB !== null &&
+    activeCache.estimatedBytes > storage.remainingMiB * 1024 * 1024
+  ) {
+    findings.push({
+      code: "storage-capacity-insufficient",
+      severity: "error",
+      confidence: "medium",
+      title: "Die freie Browserquote reicht voraussichtlich nicht f\u00fcr das Modell.",
+      analysis:
+        "Die Modellgr\u00f6\u00dfe ist eine Gesamtsch\u00e4tzung; teilweise vorhandene Shards lassen sich aus der Cacheprobe nicht bytegenau abziehen.",
+      action:
+        "Speicherplatz freigeben oder ein kleineres Modell verwenden und den unvollst\u00e4ndigen Cache danach neu aufbauen.",
+      evidence: [
+        "Gesch\u00e4tzter Modellcache: " + estimatedMiB + " MiB.",
+        "Freie Origin-Quote: " + storage.remainingMiB + " MiB.",
+        "Cachedateien: " + activeCache.filesCached + "/" + activeCache.filesTotal + ".",
+      ],
+    })
+  }
   if (denied) {
     findings.push(errorFinding(
       "cache-access-denied",
@@ -657,9 +963,6 @@ function cacheFindings(
       "In einem normalen HTTPS-Profil testen und CacheStorage freigeben.",
     ))
   }
-  const corrupt = cacheEvents.find((event) =>
-    /corrupt|invalid|integrity/iu.test(event.outcome ?? ""),
-  )
   if (corrupt) {
     findings.push(errorFinding(
       "cache-corrupt",
@@ -680,10 +983,6 @@ function cacheFindings(
       evidence: ["globalThis.caches fehlt."],
     })
   }
-  const activeEngine = runtime?.assessmentEngine
-  const activeCache = activeEngine && storage.cache?.engines?.[activeEngine]
-    ? storage.cache.engines[activeEngine] ?? null
-    : storage.cache
   if (runtime?.phase === "ready" && activeCache && !activeCache.cached) {
     findings.push({
       code: "cache-incomplete",
@@ -819,6 +1118,24 @@ function failureFinding(
       evidence,
     }
   }
+  if (isQuotaFailureText(haystack)) {
+    return errorFinding(
+      "cache-quota",
+      "Der Browser konnte die Modelldaten wegen des Speicherlimits nicht sichern.",
+      "Der WebLLM-Start endet, wenn ein notwendiger Cacheeintrag nicht geschrieben werden kann.",
+      evidence,
+      "Speicherplatz freigeben oder ein kleineres Modell verwenden; danach den unvollst\u00e4ndigen Cache neu laden.",
+    )
+  }
+  if (/SecurityError|NotAllowedError|InvalidStateError/iu.test(haystack)) {
+    return errorFinding(
+      "access-denied",
+      "Der Browser hat einen benoetigten technischen Zugriff verweigert.",
+      "Eine Sicherheits- oder Berechtigungsregel hat den Vorgang beendet.",
+      evidence,
+      "Browserprofil, Frame-Sandbox und Schulrichtlinien pruefen.",
+    )
+  }
   if (event.stage === "download-policy") {
     return environment.online === false
       ? errorFinding(
@@ -887,6 +1204,35 @@ function failureFinding(
       "Proxy-/Antiviren-Umschreibung ausschalten und Cache neu aufbauen.",
     )
   }
+  if (/ContextWindowSizeExceededError|ContextWindowError|Kontextfenster/iu.test(haystack)) {
+    return errorFinding(
+      "context-window-exceeded",
+      "Die Anfrage war fuer das Kontextfenster des Modells zu lang.",
+      "Die lokale Modelllaufzeit konnte Eingabe und Ausgabe nicht gemeinsam im Kontextfenster verarbeiten.",
+      evidence,
+      "Antwort oder Kriterien kuerzen oder die Auswertung in kleinere Abschnitte teilen.",
+    )
+  }
+  if (
+    /WebGPU|device lost|DXGI_ERROR_DEVICE_|VK_ERROR_DEVICE_LOST|object disposed|out of memory/iu
+      .test(haystack)
+  ) {
+    return errorFinding(
+      "webgpu-runtime-failed",
+      "Die WebGPU-Laufzeit des Qualitaetsmodells ist ausgefallen.",
+      "Grafiktreiber, Geraetespeicher oder eine verwaltete Hardwarebeschleunigungs-Richtlinie koennen den Lauf beenden.",
+      evidence,
+      "WebGPU und Hardwarebeschleunigung pruefen oder beim Kompaktmodell bleiben.",
+      "medium",
+    )
+  }
+  const embeddedHttpStatus = event.message?.match(/^HTTP ([1-5]\d{2})\.$/u)
+  if (embeddedHttpStatus) {
+    return httpFinding({
+      ...event,
+      httpStatus: Number(embeddedHttpStatus[1]),
+    })
+  }
   if (/TypeError/iu.test(event.errorName ?? "") || /Failed to fetch|NetworkError|Load failed/iu.test(haystack)) {
     if (environment.online === false) {
       return errorFinding(
@@ -911,8 +1257,20 @@ function failureFinding(
 
 function runtimeFailureFinding(runtime: RuntimeStatus | null): DebugFinding | null {
   if (runtime?.phase !== "error" || !runtime.error) return null
-  const message = sanitizeDebugText(runtime.error)
+  const message = canonicalErrorSignature(
+    GENERIC_ERROR_NAME,
+    runtime.error,
+  ).message
   const evidence = [message]
+  if (/ContextWindowError|Kontextfenster/iu.test(message)) {
+    return errorFinding(
+      "context-window-exceeded",
+      "Die Anfrage war fuer das Kontextfenster des Modells zu lang.",
+      "Die lokale Modelllaufzeit konnte Eingabe und Ausgabe nicht gemeinsam im Kontextfenster verarbeiten.",
+      evidence,
+      "Antwort oder Kriterien kuerzen oder die Auswertung in kleinere Abschnitte teilen.",
+    )
+  }
   if (
     /Content Security Policy|Refused to|wasm-unsafe-eval|unsafe-eval|script-src|worker-src/iu
       .test(message)
@@ -926,7 +1284,7 @@ function runtimeFailureFinding(runtime: RuntimeStatus | null): DebugFinding | nu
     )
   }
   if (
-    /WebGPU|GPU|requestAdapter|requestDevice|device lost|VK_ERROR|adapter/iu
+    /WebGPU|GPU|requestAdapter|requestDevice|device lost|VK_ERROR|DXGI_ERROR_DEVICE_|adapter|object has already been disposed|cannot pass deleted object|out of (?:gpu )?memory/iu
       .test(message)
   ) {
     return errorFinding(
@@ -980,11 +1338,14 @@ function responseWasRecovered(
 }
 
 export function classifyDebugFindings(
-  events: readonly DebugTraceEvent[],
+  rawEvents: readonly DebugTraceEvent[],
   environment: DebugEnvironment,
-  storage: DebugStorageSummary,
-  runtime: RuntimeStatus | null,
+  rawStorage: DebugStorageSummary,
+  rawRuntime: RuntimeStatus | null,
 ): DebugFinding[] {
+  const events = rawEvents.map(canonicalizeDebugEvent)
+  const storage = sanitizeStorageSummary(rawStorage)
+  const runtime = runtimeWithoutSensitiveError(rawRuntime)
   const cache = cacheFindings(events, environment, storage, runtime)
   const findings: DebugFinding[] = []
   for (const event of events) {
@@ -1089,7 +1450,7 @@ export function classifyDebugFindings(
       "unknown",
       "Der Ladevorgang endete mit einem noch nicht klassifizierten Fehler.",
       "Die Ereignisfolge grenzt die Stelle ein, belegt aber keine eindeutige Ursache.",
-      [sanitizeDebugText(runtime.error ?? "Unbekannter Laufzeitfehler")],
+      [runtime.error ?? GENERIC_ERROR_MESSAGE],
       "Den vollst\u00e4ndigen DebugNotiz-Block weitergeben.",
       "low",
     ))
@@ -1159,10 +1520,21 @@ export async function createDebugReport(
 ): Promise<LiaLLMDebugReport> {
   const state = diagnosticState()
   state.api = api
+  const unresolvedError = trigger === "manual" && !automaticSnapshot
+    ? Object.values(state.lastErrors)
+        .filter(
+          (
+            value,
+          ): value is AutomaticReportSnapshot & { sequence: number } =>
+            value !== undefined,
+        )
+        .sort((left, right) => right.sequence - left.sequence)[0]
+    : undefined
+  const selectedSnapshot = automaticSnapshot ?? unresolvedError
   let runtime: RuntimeStatus | null = null
   try {
-    runtime = automaticSnapshot
-      ? runtimeWithoutSensitiveError(automaticSnapshot.status)
+    runtime = selectedSnapshot
+      ? runtimeWithoutSensitiveError(selectedSnapshot.status)
       : runtimeWithoutSensitiveError(api.getStatus())
   } catch (error) {
     const normalized = normalizedError(error)
@@ -1175,14 +1547,14 @@ export async function createDebugReport(
     })
   }
   const environment = captureEnvironment()
-  const engine = automaticSnapshot?.engine ?? runtime?.assessmentEngine
+  const engine = selectedSnapshot?.engine ?? runtime?.assessmentEngine
   const storage = await captureStorage(api)
   if (!storage.cache && engine && trigger === "load-error") {
     const previousCache = state.cacheSnapshots[engine]
     if (previousCache) storage.cache = sanitizeCacheInfo(previousCache)
   }
   const allEvents = reportEvents()
-  const runId = automaticSnapshot?.runId ??
+  const runId = selectedSnapshot?.runId ??
     (engine ? runIdFor(engine) : "manual-" + state.sequence)
   const runStart = allEvents.find((event) =>
     event.kind === "load-start" && event.runId === runId,
@@ -1391,7 +1763,7 @@ function scheduleAutomaticReport(
   if (!state.api || !state.registered) return
   const runId = runIdFor(engine)
   let status = observedStatus ??
-    state.lastErrorStatuses[engine] ??
+    state.lastErrors[engine]?.status ??
     state.latestStatuses[engine] ??
     null
   if (!status) {
@@ -1473,7 +1845,7 @@ export function registerDebugDiagnostics(api: LiaLLMApi): void {
     const status = rawStatus
     state.latestStatuses[status.assessmentEngine] = status
     const runId = runIdFor(status.assessmentEngine)
-    appendEvent({
+    const statusEvent = appendEvent({
       kind: "status",
       engine: status.assessmentEngine,
       runId,
@@ -1486,10 +1858,16 @@ export function registerDebugDiagnostics(api: LiaLLMApi): void {
       },
     })
     if (status.phase === "error") {
-      state.lastErrorStatuses[status.assessmentEngine] = status
+      state.lastErrors[status.assessmentEngine] = {
+        engine: status.assessmentEngine,
+        runId,
+        status,
+        sequence: statusEvent.sequence,
+      }
       scheduleAutomaticReport("load-error", status.assessmentEngine, status)
       return
     }
+    delete state.lastErrors[status.assessmentEngine]
     if (status.phase === "ready") {
       if (!state.checkedReadyRuns.has(runId)) {
         state.checkedReadyRuns.add(runId)
