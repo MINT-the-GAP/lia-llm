@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
 import { test } from "node:test"
 
+import { env } from "@huggingface/transformers"
 import * as webLlm from "../src/generated/webllm.js"
 import {
   aggregateCriteria,
@@ -21,8 +22,10 @@ import {
   RUNTIME_ASSET_CACHE_KEY,
   checkDefaultCompactModelCache,
   clearRuntimeAssetCache,
+  configureOnnxWasmProxy,
   defaultCompactModelCacheUrls,
   isValidRuntimeAsset,
+  isOnnxRuntimeEnvironmentError,
   finalizeCompactAssessment,
   loadRuntimeAsset,
   openRuntimeAssetCache,
@@ -3374,6 +3377,35 @@ test("quality diagnostics use a stable priority and keep style advisory", () => 
   )
 })
 
+test("the compact WASM runtime enables the ONNX worker proxy", () => {
+  const wasm = env.backends.onnx.wasm
+  assert.ok(wasm)
+  configureOnnxWasmProxy(true)
+  assert.equal(wasm.proxy, true)
+  assert.doesNotThrow(() => configureOnnxWasmProxy(true))
+  assert.throws(
+    () => configureOnnxWasmProxy(false),
+    /Seitensitzung.*neu geladen/iu,
+  )
+})
+
+test("worker and CSP failures never masquerade as corrupt model cache", () => {
+  for (const message of [
+    "Refused to create a worker because of the Content Security Policy worker-src directive.",
+    "Failed to construct 'Worker': Access to a blob: URL is denied.",
+    "previous call to initWasm() failed; worker not ready",
+    "WebAssembly.instantiate(): CompileError",
+  ]) {
+    assert.equal(isOnnxRuntimeEnvironmentError(new Error(message)), true)
+  }
+  assert.equal(
+    isOnnxRuntimeEnvironmentError(
+      new Error("Failed to load model because protobuf parsing failed."),
+    ),
+    false,
+  )
+})
+
 test("runtime asset base resolution survives LiaScript blob execution", () => {
   assert.equal(
     resolveRuntimeAssetBaseUrl(
@@ -6143,7 +6175,7 @@ test("formatResult hides criterion details by default but keeps them available",
   assert.match(detailed, /Bestätigung:/u)
 })
 
-test("the public version remains pinned exactly to 0.6.0", () => {
+test("the public version remains pinned exactly to 0.5.7", () => {
   const packageJson = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   ) as { version?: string }
@@ -6153,12 +6185,12 @@ test("the public version remains pinned exactly to 0.6.0", () => {
   const entry = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8")
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8")
 
-  assert.equal(packageJson.version, "0.6.0")
-  assert.equal(packageLock.version, "0.6.0")
-  assert.equal(packageLock.packages?.[""]?.version, "0.6.0")
-  assert.match(entry, /const VERSION = "0\.6\.0"/u)
-  assert.match(readme, /^version:\s+0\.6\.0$/mu)
-  assert.match(readme, /^script:\s+\.\/dist\/index\.js\?v=0\.6\.0$/mu)
+  assert.equal(packageJson.version, "0.5.7")
+  assert.equal(packageLock.version, "0.5.7")
+  assert.equal(packageLock.packages?.[""]?.version, "0.5.7")
+  assert.match(entry, /const VERSION = "0\.5\.7"/u)
+  assert.match(readme, /^version:\s+0\.5\.7$/mu)
+  assert.match(readme, /^script:\s+\.\/dist\/index\.js\?v=0\.5\.7$/mu)
 })
 
 test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper", () => {

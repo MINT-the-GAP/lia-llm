@@ -154,6 +154,55 @@
         return snapshot
       }
 
+      const UI_HEARTBEAT_INTERVAL_MS = 50
+      const UI_HEARTBEAT_LIMIT_MS = 1000
+
+      async function measureUiResponsiveness(action) {
+        let lastTick = performance.now()
+        let maxGapMs = 0
+        let samples = 0
+        let resolveNextSample = null
+        const timer = window.setInterval(() => {
+          const now = performance.now()
+          maxGapMs = Math.max(maxGapMs, now - lastTick)
+          lastTick = now
+          samples += 1
+          if (resolveNextSample) {
+            const resolve = resolveNextSample
+            resolveNextSample = null
+            resolve()
+          }
+        }, UI_HEARTBEAT_INTERVAL_MS)
+
+        try {
+          await new Promise((resolve) =>
+            window.setTimeout(resolve, UI_HEARTBEAT_INTERVAL_MS),
+          )
+          lastTick = performance.now()
+          maxGapMs = 0
+          samples = 0
+          const startedAt = performance.now()
+          const value = await action()
+          const durationMs = performance.now() - startedAt
+          await new Promise((resolve) => {
+            resolveNextSample = resolve
+          })
+          return {
+            value,
+            heartbeat: {
+              durationMs: Math.round(durationMs),
+              maxGapMs: Math.round(maxGapMs),
+              samples,
+              limitMs: UI_HEARTBEAT_LIMIT_MS,
+              responsive:
+                samples > 0 && maxGapMs <= UI_HEARTBEAT_LIMIT_MS,
+            },
+          }
+        } finally {
+          window.clearInterval(timer)
+        }
+      }
+
       window.runCacheHardening = async () => {
         if (!window.LiaLLM) throw new Error("LiaLLM API fehlt.")
         document.getElementById("status").textContent = "Modell wird geladen"
@@ -161,16 +210,22 @@
         const before = await window.LiaLLM.getCacheInfo()
         window.__liaLlmHardeningLog("cache-info-done")
         window.__liaLlmHardeningLog("preload-start")
-        const preloadStatus = await window.LiaLLM.preload()
+        const preloadMeasurement = await measureUiResponsiveness(() =>
+          window.LiaLLM.preload(),
+        )
+        const preloadStatus = preloadMeasurement.value
         window.__liaLlmHardeningLog("preload-done")
         window.__liaLlmHardeningLog("evaluate-start")
-        const result = await window.LiaLLM.evaluate({
-          question: "Warum schwimmt Eis auf Wasser?",
-          answer:
-            "Eis besitzt eine geringere Dichte als flüssiges Wasser und schwimmt deshalb.",
-          reference:
-            "Eis besitzt eine geringere Dichte als flüssiges Wasser und schwimmt deshalb.",
-        })
+        const evaluationMeasurement = await measureUiResponsiveness(() =>
+          window.LiaLLM.evaluate({
+            question: "Warum schwimmt Eis auf Wasser?",
+            answer:
+              "Eis besitzt eine geringere Dichte als flüssiges Wasser und schwimmt deshalb.",
+            reference:
+              "Eis besitzt eine geringere Dichte als flüssiges Wasser und schwimmt deshalb.",
+          }),
+        )
+        const result = evaluationMeasurement.value
         window.__liaLlmHardeningLog("evaluate-done")
         const after = await window.LiaLLM.getCacheInfo()
         const manifest = await cacheManifest()
@@ -181,6 +236,10 @@
           after: compactCache(after),
           preloadStatus,
           finalStatus: window.LiaLLM.getStatus(),
+          uiResponsiveness: {
+            preload: preloadMeasurement.heartbeat,
+            evaluation: evaluationMeasurement.heartbeat,
+          },
           result: {
             status: result.status,
             passed: result.passed,

@@ -1,6 +1,6 @@
 # Browser- und Schulnetz-Härtetest
 
-Stand dieser Evidenz: 17. August 2026. Dieses Dokument beschreibt den
+Stand dieser Evidenz: 20. August 2026. Dieses Dokument beschreibt den
 reproduzierbaren Freigabetest für Download, Cache, Browserneustart, echte
 Offline-Inferenz und Cache-Löschung. Die derzeitigen PASS-Nachweise gelten nur
 für das kompakte mDeBERTa-Modell mit ONNX Runtime/WASM. Das Quality-Modell wird
@@ -20,8 +20,9 @@ folgenden Punkte erfüllt:
 2. Modell und exakt passende ONNX-Runtime werden aus dem Netz geladen. Danach
    sind alle sechs Kompaktmodell-Einträge und genau zwei Runtime-Einträge
    (`.mjs` und `.wasm`) vorhanden.
-3. Mit dem geladenen Modell wird eine echte NLI-Inferenz ausgeführt; das
-   Testergebnis muss `passed=true` melden.
+3. Während Vorbereitung und echter NLI-Inferenz läuft ein 50-ms-UI-Heartbeat.
+   Kein gemessener Abstand darf 1.000 ms überschreiten; das Testergebnis muss
+   zusätzlich `passed=true` melden.
 4. Der Browserkontext und damit der zugehörige Browserprozess werden
    geschlossen.
 5. Derselbe Browser wird mit exakt demselben persistenten Profil neu gestartet.
@@ -35,7 +36,7 @@ folgenden Punkte erfüllt:
 8. Bei weiterhin gesperrtem externem Netz wird `clearCache()` ausgeführt. Danach
    dürfen weder Modell- noch versionierte Runtime-Einträge übrig sein.
 
-Kurzform: **Cold-Download → echte Inferenz → Browser schließen → gleiches
+Kurzform: **Cold-Download → UI-Heartbeat → echte Inferenz → Browser schließen → gleiches
 Profil → externes Netz vollständig sperren → Cache-Load → echte Inferenz →
 null externe Requests → Offline-Clear.** Ein Smoke-Test, ein bloßer Cache-Hit
 oder erfolgreiches Laden ohne Inferenz reicht nicht aus.
@@ -128,16 +129,22 @@ Testhost: Windows 10 Pro, Version `10.0.19045`, x64, Node.js `v24.14.0`.
 
 | Browser | Klasse | Version | Reportstart (UTC) | Cold | Neustart/Offline | gemessene Origin-Nutzung | Ergebnis |
 | --- | --- | --- | --- | ---: | ---: | ---: | --- |
-| Microsoft Edge | A | `151.0.4129.93` | `2026-08-19T20:07:27.440Z` | 143.099 ms | 3.987 ms | 378.621.184 B | PASS |
-| Google Chrome | A | `151.0.7922.138` | `2026-08-17T12:07:00.113Z` | 133.491 ms | 3.671 ms | 378.621.184 B | PASS |
-| Playwright Chromium | B | `151.0.7922.34` | `2026-08-17T12:07:00.113Z` | 129.093 ms | 3.446 ms | 378.621.184 B | PASS |
-| Playwright Firefox | B | `153.0` | `2026-08-17T13:01:21.039Z` | 123.963 ms | 17.466 ms | 350.504.241 B | PASS |
+| Microsoft Edge | A | `151.0.4129.93` | `2026-08-20T13:15:41.702Z` | 173.631 ms | 4.804 ms | 378.621.184 B | PASS |
+| Google Chrome | A | `151.0.7922.138` | `2026-08-17T12:07:00.113Z` | 133.491 ms | 3.671 ms | 378.621.184 B | Altstand; Heartbeat offen |
+| Playwright Chromium | B | `151.0.7922.34` | `2026-08-17T12:07:00.113Z` | 129.093 ms | 3.446 ms | 378.621.184 B | Altstand; Heartbeat offen |
+| Playwright Firefox | B | `153.0` | `2026-08-17T13:01:21.039Z` | 123.963 ms | 17.466 ms | 350.504.241 B | Altstand; Heartbeat offen |
 | Playwright WebKit | B | `26.5` | `2026-08-17T13:06:25.841Z` | 120.479 ms bis Timeout | nicht erreicht | kein vollständiger Modellcache | FAIL |
 
-Alle vier PASS-Läufe belegen `cached=false → cached=true`, sechs
-Transformers-Cacheeinträge, zwei geprüfte Runtime-Dateien, echte Cold- und
-Offline-Inferenz, `loadSource=cache`, null externe Warmstart-Versuche und die
-anschließende Löschung von acht Einträgen. Edge, Chrome und Chromium meldeten
+Der aktuelle Edge-Lauf belegt unter der dokumentierten Worker-/WASM-CSP
+zusätzlich den neuen UI-Heartbeat: Die größten Abstände betrugen 543 ms beim
+Cold-Preload, 68 ms bei der Cold-Inferenz, 529 ms beim Offline-Preload und 69 ms
+bei der Offline-Inferenz. Er belegt außerdem
+`cached=false → cached=true`, sechs Transformers-Cacheeinträge, zwei geprüfte
+Runtime-Dateien, `loadSource=cache`, null externe Warmstart-Versuche und die
+anschließende Löschung von acht Einträgen. Die drei älteren erfolgreichen Läufe
+belegen dieselben Cache- und Inferenzkriterien, wurden aber vor Einführung des
+Heartbeats aufgezeichnet und müssen für eine aktuelle UI-Freigabe wiederholt
+werden. Edge, Chrome und Chromium meldeten
 378.621.184 B Origin-Nutzung bei 11.116.039.424 B Quota. Firefox meldete
 350.504.241 B bei 10.737.418.240 B Quota. `navigator.storage.persisted()` war in
 allen vier PASS-Profilen `false`.
@@ -147,6 +154,7 @@ Die zugehörigen lokalen Reports sind:
 - `test-results/browser-hardening-2026-08-17T11-37-16-096Z.json`
 - `test-results/browser-hardening-2026-08-17T12-07-00-114Z.json`
 - `test-results/browser-hardening-2026-08-17T13-01-21-046Z.json`
+- `test-results/browser-hardening-2026-08-20T13-15-41-703Z.json`
 
 ### Behobener Firefox-Blocker
 
@@ -308,6 +316,11 @@ Falls ein Zielbrowser `'wasm-unsafe-eval'` nicht versteht, darf
 `'unsafe-eval'` nur nach einem konkreten Test und einer Sicherheitsabwägung als
 Fallback ergänzt werden. Die tatsächliche Viewer-/LMS-Policy kann außerdem
 weitere LiaScript-Abhängigkeiten benötigen.
+
+Der lokale Härtetest sendet selbst eine CSP mit `worker-src 'self' blob:`,
+`script-src ... blob: 'wasm-unsafe-eval'` und den benötigten `connect-src`-Zielen.
+Nur für das Inline-Testskript ergänzt die Fixture `'unsafe-inline'`; das ist
+keine Empfehlung für die produktive Kurs-CSP.
 
 Der Modellcache liegt in CacheStorage der aktuellen Origin, des Browserprofils
 und gegebenenfalls der Storage-Partition. In einem `sandbox`-Iframe muss

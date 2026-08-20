@@ -28,7 +28,7 @@ import {
 } from "./solution-element.ts"
 import type { LiaLLMApi } from "./types.ts"
 
-const VERSION = "0.6.0"
+const VERSION = "0.5.7"
 
 interface LiaLLMGlobal {
   LiaLLM?: LiaLLMApi

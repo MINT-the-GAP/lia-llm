@@ -32,6 +32,15 @@ const selectedIds = (
 const keepProfiles = process.env.LIA_LLM_KEEP_PROFILES === "1"
 const reportDirectory = path.join(projectRoot, "test-results")
 const runtimeCachePrefix = "lia-llm-ort-runtime-"
+const hardeningCsp = [
+  "default-src 'self'",
+  "connect-src 'self' https://liascript.github.io https://raw.githubusercontent.com https://storage.googleapis.com https://huggingface.co https://*.huggingface.co https://*.hf.co",
+  "worker-src 'self' blob:",
+  "script-src 'self' blob: 'unsafe-inline' 'wasm-unsafe-eval'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data:",
+  "object-src 'none'",
+].join("; ")
 
 const mimeTypes = new Map([
   [".html", "text/html; charset=utf-8"],
@@ -62,6 +71,7 @@ function startServer() {
     const size = statSync(target).size
     response.writeHead(200, {
       "Cache-Control": "no-store",
+      "Content-Security-Policy": hardeningCsp,
       "Content-Length": String(size),
       "Content-Type":
         mimeTypes.get(path.extname(target).toLowerCase()) ||
@@ -348,6 +358,19 @@ function assertPhase(candidate, cold, warm) {
   }
   if (warm.result.result?.passed !== true) {
     failures.push("Die Offline-Inferenz nach Browserneustart schlug fehl.")
+  }
+  for (const [phaseName, phase] of [
+    ["Cold-Run", cold],
+    ["Warmstart", warm],
+  ]) {
+    for (const operation of ["preload", "evaluation"]) {
+      const heartbeat = phase.result.uiResponsiveness?.[operation]
+      if (heartbeat?.responsive !== true) {
+        failures.push(
+          `${phaseName}/${operation}: UI-Heartbeat überschritt ${heartbeat?.limitMs ?? "den Grenzwert"} ms (Maximum ${heartbeat?.maxGapMs ?? "nicht gemessen"} ms).`,
+        )
+      }
+    }
   }
   if (warm.externalAttempts.length !== 0) {
     failures.push(

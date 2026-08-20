@@ -1,11 +1,11 @@
 <!--
 author:      MINT-the-GAP, Martin Lommatzsch
-version:     0.6.0
+version:     0.5.7
 language:    de
 narrator:    Deutsch Female
 comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
 repository:  https://github.com/MINT-the-GAP/lia-llm
-script:      ./dist/index.js?v=0.6.0
+script:      ./dist/index.js?v=0.5.7
 
 attribute:   [WebLLM](https://webllm.mlc.ai/docs/) by MLC is licensed under
              [Apache-2.0](https://github.com/mlc-ai/web-llm/blob/main/LICENSE), and
@@ -76,8 +76,8 @@ Promise.resolve()
     if (!window.LiaLLM) {
       throw new Error("lia-llm konnte nicht geladen werden.")
     }
-    if (window.LiaLLM.version !== "0.6.0") {
-      throw new Error(`lia-llm 0.6.0 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
+    if (window.LiaLLM.version !== "0.5.7") {
+      throw new Error(`lia-llm 0.5.7 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
     }
 
     const options = window.LiaLLM.parseMacroOptions(optionSource)
@@ -414,6 +414,11 @@ Schwelle liegen. Das stärkere Quality-Modell ist eine optionale Erweiterung:
 | Qualität (Opt-in) | Qwen3-1.7B über WebLLM | ca. 984 MB | stärkere generative Gesamtprüfung; benötigt WebGPU und ist ohne gerätespezifischen Test nicht für Schulrechner freigegeben |
 | sicherer Standard/Fallback | mDeBERTa-v3 NLI über Transformers.js | ca. 379 MB inklusive ONNX-Laufzeit | normale Engine ohne Quality-Opt-in; läuft bei Bedarf mit WASM |
 
+Beim standardmäßigen WASM-Start laufen ONNX-Sitzung und Inferenz des
+Kompaktmodells in einem Worker. Dadurch blockiert die automatische Vorbereitung nicht den
+LiaScript-UI-Thread. Einbettende Seiten müssen dafür die unter
+`test/BROWSER-HARDENING.md` dokumentierte `worker-src`-/Blob-CSP erlauben.
+
 Die konfigurierte Downloadschätzung beträgt 984.000.000 B für das Qualitätsmodell und
 378.614.439 B für Kompaktmodell samt ONNX-Laufzeit, zusammen also 1.362.614.439 B
 (ca. 1.362,6 MB beziehungsweise 1.299,5 MiB). Die im Schulrechner-Log gemeldeten 2.048 MiB
@@ -428,7 +433,7 @@ zwischenzeitlich geprüfte 0.6B-Variante blieb dort technisch stabil, bestand de
 Schutzregeln durchgeführten semantischen Stresstest aber nur in 6 von 12 Fällen. Sie wird daher
 nicht als Bewertungsmodell ausgeliefert.
 
-Beim Wechsel auf Version 0.6.0 entfernt das Template vor einem neuen Quality-Download
+Beim Wechsel auf Version 0.5.7 entfernt das Template vor einem neuen Quality-Download
 ausschließlich die exakt gepinnten ausgehenden Qwen3-0.6B- und alten Qwen3-4B-Artefakte. Das
 aktuelle Qwen3-1.7B sowie fremde WebLLM-Cacheeinträge bleiben erhalten.
 

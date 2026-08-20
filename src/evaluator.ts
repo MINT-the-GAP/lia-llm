@@ -285,6 +285,11 @@ const COMPACT_CACHE_ESTIMATED_BYTES =
   DEFAULT_MODEL_ESTIMATED_BYTES + RUNTIME_ASSET_ESTIMATED_BYTES
 
 let localOnnxRuntimePromise: Promise<void> | null = null
+let onnxWasmProxyMode: boolean | null = null
+
+class OnnxWasmProxyModeError extends Error {
+  override name = "OnnxWasmProxyModeError"
+}
 
 function runtimeAssetUrl(filename: string): string {
   return new URL(filename, runtimeAssetBaseUrl).href
@@ -296,6 +301,35 @@ function configureLocalOnnxRuntime(): void {
     mjs: runtimeAssetUrl(ORT_FACTORY_FILENAME),
     wasm: runtimeAssetUrl(ORT_WASM_FILENAME),
   }
+}
+
+export function configureOnnxWasmProxy(enabled: boolean): void {
+  if (!env.backends.onnx.wasm) return
+  if (onnxWasmProxyMode !== null && onnxWasmProxyMode !== enabled) {
+    throw new OnnxWasmProxyModeError(
+      "Der ONNX-Laufzeitmodus ist für diese Seitensitzung bereits festgelegt. Für einen Wechsel zwischen WebGPU und WASM-Worker muss die Seite neu geladen werden.",
+    )
+  }
+  // ONNX Runtime must choose proxy mode before its first session. Keep WebGPU
+  // outside the proxy worker because the worker only supports WASM.
+  env.backends.onnx.wasm.proxy = enabled
+  onnxWasmProxyMode = enabled
+}
+
+export function isOnnxRuntimeEnvironmentError(error: unknown): boolean {
+  if (error instanceof OnnxWasmProxyModeError) return true
+  return /Content Security Policy|\bCSP\b|worker-src|script-src|blob:|Failed to construct ['"]?Worker|SecurityError|worker not ready|initWasm|WebAssembly\.(?:compile|instantiate)|CompileError|LinkError|no available backend/iu.test(
+    errorMessage(error),
+  )
+}
+
+function requestedOnnxWasmProxyMode(config: RuntimeConfig): boolean | null {
+  if (config.device === "wasm") return true
+  const hasWebGpu =
+    typeof navigator !== "undefined" &&
+    "gpu" in (navigator as Navigator & { gpu?: unknown })
+  if (hasWebGpu) return false
+  return config.fallbackToWasm ? true : null
 }
 
 interface RuntimeAssetCacheInfo {
@@ -944,6 +978,17 @@ export class SemanticEvaluator {
       throw new Error("batchSize muss eine ganze Zahl zwischen 1 und 16 sein.")
     }
 
+    const requestedProxyMode = requestedOnnxWasmProxyMode(merged)
+    if (
+      requestedProxyMode !== null &&
+      onnxWasmProxyMode !== null &&
+      requestedProxyMode !== onnxWasmProxyMode
+    ) {
+      throw new OnnxWasmProxyModeError(
+        "Der ONNX-Laufzeitmodus ist für diese Seitensitzung bereits festgelegt. Für einen Wechsel zwischen WebGPU und WASM-Worker muss die Seite neu geladen werden.",
+      )
+    }
+
     this.config = merged
     this.lastError = undefined
     return this.getStatus()
@@ -992,6 +1037,8 @@ export class SemanticEvaluator {
     this.fetchSession = session
     env.fetch = session.fetch
     try {
+      const proxyMode = requestedOnnxWasmProxyMode(this.config)
+      if (proxyMode !== null) configureOnnxWasmProxy(proxyMode)
       await prepareLocalOnnxRuntime(session)
       return await this.loadRuntime()
     } finally {
@@ -1080,7 +1127,8 @@ export class SemanticEvaluator {
           if (
             !cache.cached ||
             isAbortError(error) ||
-            !env.backends.onnx.wasm?.wasmBinary
+            !env.backends.onnx.wasm?.wasmBinary ||
+            isOnnxRuntimeEnvironmentError(error)
           ) {
             throw error
           }
