@@ -449,6 +449,9 @@ Es gibt zwei bewusst getrennte Anzeigen:
   wartende Aufgabe zeigt dabei weiterhin ihren kleinen lokalen Arbeitsbalken. Dasselbe Dialogfeld
   bleibt für eine nötige Download-Zustimmung oder einen Ladefehler sichtbar.
 
+Das Dialogfeld übernimmt Text- und Hintergrundfarbe gemeinsam aus dem aktuellen LiaScript-Theme.
+Dadurch bleiben Fortschritt, Meldungen und Download-Schaltfläche auch im Darkmode kontrastreich.
+
 Ein normaler oder ausdrücklich mit `assessmentengine=compact` gestarteter Aufruf gibt seinen
 Kompaktbefund unmittelbar und endgültig aus – auch bei `failed` oder `uncertain`. Er startet weder
 einen Qwen-Download noch eine WebGPU-Initialisierung. Nur eine ausdrückliche

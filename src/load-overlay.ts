@@ -66,16 +66,35 @@ function mountOverlayInAuthoredHost(overlay: ManagedOverlay): boolean {
 
   try {
     const theme = getComputedStyle(host)
+    const themeColor = theme.getPropertyValue("--color-text").trim()
+    const themeBackground = theme
+      .getPropertyValue("--color-background")
+      .trim()
     const background = theme.backgroundColor
-    overlay.style.setProperty(
-      "--lia-llm-overlay-color",
-      theme.color || "CanvasText",
-    )
-    if (
+
+    // Keep foreground and surface colors paired. LiaScript exposes both as
+    // inherited RGB-channel tokens, including for its dark variant. Referring
+    // to the tokens also tracks theme changes while a download is running.
+    overlay.style.removeProperty("--lia-llm-overlay-color")
+    overlay.style.removeProperty("--lia-llm-overlay-bg")
+    if (themeColor && themeBackground) {
+      overlay.style.setProperty(
+        "--lia-llm-overlay-color",
+        "rgb(var(--color-text))",
+      )
+      overlay.style.setProperty(
+        "--lia-llm-overlay-bg",
+        "rgb(var(--color-background))",
+      )
+    } else if (
       background &&
       background !== "transparent" &&
       background !== "rgba(0, 0, 0, 0)"
     ) {
+      overlay.style.setProperty(
+        "--lia-llm-overlay-color",
+        theme.color || "CanvasText",
+      )
       overlay.style.setProperty("--lia-llm-overlay-bg", background)
     }
   } catch {
@@ -249,7 +268,8 @@ export function registerLoadOverlay(api: LiaLLMApi): void {
     "border-radius:999px;padding:7px 13px;background:transparent;color:inherit;",
     "cursor:pointer;font:inherit;font-weight:650}",
     "#lia-llm-load-overlay .lia-llm-consent-download{background:currentColor}",
-    "#lia-llm-load-overlay .lia-llm-consent-download span{color:Canvas}",
+    "#lia-llm-load-overlay .lia-llm-consent-download span{",
+    "color:var(--lia-llm-overlay-bg,Canvas)}",
     "@keyframes lia_llm_load_indeterminate{0%{transform:translateX(-120%)}",
     "100%{transform:translateX(320%)}}",
     "@media (prefers-reduced-motion:reduce){",

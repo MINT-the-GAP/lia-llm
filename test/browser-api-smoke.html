@@ -2,6 +2,14 @@
 <meta charset="utf-8">
 <title>lia-llm browser API smoke test</title>
 <style>
+  :root {
+    --color-background: 255, 255, 255;
+    --color-text: 75, 75, 75;
+  }
+  :root.lia-variant-dark {
+    --color-background: 50, 50, 50;
+    --color-text: 255, 255, 255;
+  }
   .lia-link { color: rgb(var(--color-highlight)); }
 </style>
 <body>
@@ -445,6 +453,23 @@
         overlay?.getAttribute("role") === "alertdialog" &&
         overlay?.querySelector(".lia-llm-consent-cancel")?.textContent ===
           "Beim kleinen Modell bleiben"
+      document.documentElement.classList.add("lia-variant-dark")
+      await new Promise(resolve => requestAnimationFrame(resolve))
+      const darkOverlayStyle = overlay ? getComputedStyle(overlay) : null
+      const consentDownload = overlay?.querySelector(
+        ".lia-llm-consent-download"
+      )
+      const consentDownloadLabel = consentDownload?.querySelector("span")
+      const darkConsentTracksTheme = Boolean(
+        darkOverlayStyle?.backgroundColor === "rgb(50, 50, 50)" &&
+        darkOverlayStyle?.color === "rgb(255, 255, 255)" &&
+        consentDownload &&
+        consentDownloadLabel &&
+        getComputedStyle(consentDownload).backgroundColor ===
+          "rgb(255, 255, 255)" &&
+        getComputedStyle(consentDownloadLabel).color === "rgb(50, 50, 50)"
+      )
+      document.documentElement.classList.remove("lia-variant-dark")
       overlay?.querySelector(".lia-llm-consent-cancel")?.click()
 
       const [ortFactoryResponse, ortWasmResponse] = await Promise.all([
@@ -899,6 +924,7 @@
         staleReadyTimerIsIgnored &&
         consentDetail.handled === true &&
         consentWasVisible &&
+        darkConsentTracksTheme &&
         consentResponse === false &&
         overlay?.dataset.consent === "0" &&
         cacheInfo?.estimatedBytes === 1362614439 &&
@@ -960,6 +986,7 @@
         cachedReadyIsHidden,
         realDownloadIsVisible,
         consentWasVisible,
+        darkConsentTracksTheme,
         consentResponse,
         cacheInfo
       })
