@@ -1,11 +1,11 @@
 <!--
 author:      MINT-the-GAP, Martin Lommatzsch
-version:     0.5.7
+version:     0.5.8
 language:    de
 narrator:    Deutsch Female
 comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
 repository:  https://github.com/MINT-the-GAP/lia-llm
-script:      ./dist/index.js?v=0.5.7
+script:      ./dist/index.js?v=0.5.8
 
 attribute:   [WebLLM](https://webllm.mlc.ai/docs/) by MLC is licensed under
              [Apache-2.0](https://github.com/mlc-ai/web-llm/blob/main/LICENSE), and
@@ -76,8 +76,8 @@ Promise.resolve()
     if (!window.LiaLLM) {
       throw new Error("lia-llm konnte nicht geladen werden.")
     }
-    if (window.LiaLLM.version !== "0.5.7") {
-      throw new Error(`lia-llm 0.5.7 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
+    if (window.LiaLLM.version !== "0.5.8") {
+      throw new Error(`lia-llm 0.5.8 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
     }
 
     const options = window.LiaLLM.parseMacroOptions(optionSource)
@@ -433,7 +433,7 @@ zwischenzeitlich geprüfte 0.6B-Variante blieb dort technisch stabil, bestand de
 Schutzregeln durchgeführten semantischen Stresstest aber nur in 6 von 12 Fällen. Sie wird daher
 nicht als Bewertungsmodell ausgeliefert.
 
-Beim Wechsel auf Version 0.5.7 entfernt das Template vor einem neuen Quality-Download
+Seit Version 0.5.7 entfernt das Template vor einem neuen Quality-Download
 ausschließlich die exakt gepinnten ausgehenden Qwen3-0.6B- und alten Qwen3-4B-Artefakte. Das
 aktuelle Qwen3-1.7B sowie fremde WebLLM-Cacheeinträge bleiben erhalten.
 
@@ -459,8 +459,9 @@ Quality-Auswahl beziehungsweise die kompatible implizite Auswahl durch Operator,
 aktiviertes Thinking startet den Quality-Pfad. Dieser wartet bei einem ungecachten oder nur teilweise
 gecachten Qualitätsmodell höchstens 30 Sekunden, bei einem vollständig gecachten Warmstart höchstens
 180 Sekunden. Danach greift der jeweils vorgesehene Kompakt- beziehungsweise `uncertain`-Fallback;
-eine bereits durch diesen Quality-Aufruf gestartete Hintergrundvorbereitung darf für spätere
-Quality-Antworten weiterlaufen.
+die dadurch gestartete globale Quality-Vorbereitung läuft jedoch sichtbar bis zum vollständigen
+Cache weiter. Weder das Ende der Quiz-Auswertung noch deren `stop`-Signal bricht diesen
+Hintergrunddownload ab.
 
 Vor dem ersten, noch nicht gecachten Download wird bei erkanntem Mobilfunk oder Datensparmodus
 gefragt. Weil nicht jeder Browser die Verbindungsart meldet, fragt das Template beim Download des
@@ -476,16 +477,23 @@ Anfrage nicht erneut aus. Die WebLLM-Laufzeit selbst ist im Template gebündelt 
 von einem CDN nachgeladen. Damit können vollständig geladene Modelle im selben Browserprofil und
 unter derselben Herkunft auch offline wiederverwendet werden.
 
+Seit Version 0.5.8 ist der Quality-Download vollständig von der WebGPU-Initialisierung getrennt:
+Konfiguration, Tokenizer, WASM-Laufzeit und alle Gewichts-Shards werden zuerst vollständig gecacht.
+Erst danach wird WebGPU initialisiert. Ein späterer GPU-Verlust kann den Netzwerktransfer daher
+nicht mehr abbrechen.
+
 Große Modell- und Laufzeitdateien werden in begrenzten Byte-Bereichen geladen. Bleibt ein Bereich
 45 Sekunden ohne neue Daten oder endet er vorzeitig, bricht das Template nur diesen Bereich ab und
-wiederholt ihn mit kurzen Wartezeiten bis zu viermal. Bereits vollständige Bereiche beziehungsweise
-WebLLM-Shards müssen dabei nicht erneut übertragen werden. Ein vorübergehender Fehler des
-Qualitätsmodells sperrt außerdem keine weiteren Versuche in derselben Sitzung. Ein fataler
-WebGPU-Laufzeitfehler wie `device lost`, `DXGI_ERROR_DEVICE_HUNG`,
-`DXGI_ERROR_DEVICE_REMOVED`, `DXGI_ERROR_DEVICE_RESET`, ein bereits freigegebenes
-(`disposed`) Engine-Objekt oder GPU-Speichermangel schaltet das Qualitätsmodell dagegen für die
-laufende Sitzung ab. So wird ein zerstörter GPU-Zustand nicht erneut verwendet; der
-Kompakt-Fallback bleibt verfügbar.
+wiederholt ihn mit kurzen Wartezeiten bis zu viermal. Schlägt anschließend das Schreiben in den
+Browsercache fehl, wird die gesamte Shard-Transaktion mit steigenden Pausen bis zu fünfmal versucht;
+bis zu drei Shards werden parallel vorbereitet. Bereits vollständig gecachte WebLLM-Shards müssen
+dabei nicht erneut übertragen werden. Ein vorübergehender Fehler des Qualitätsmodells sperrt
+außerdem keine weiteren Versuche in derselben Sitzung. Ein fataler WebGPU-Laufzeitfehler wie
+`device lost`, `DXGI_ERROR_DEVICE_HUNG`, `DXGI_ERROR_DEVICE_REMOVED`,
+`DXGI_ERROR_DEVICE_RESET`, ein bereits freigegebenes (`disposed`) Engine-Objekt oder
+GPU-Speichermangel schaltet das Qualitätsmodell dagegen für die laufende Sitzung ab. So wird ein
+zerstörter GPU-Zustand nicht erneut verwendet; der nun vollständige Modellcache bleibt für einen
+späteren Seitenaufruf erhalten und der Kompakt-Fallback bleibt verfügbar.
 
 Die exakt zum Bundle passende ONNX-Web-Laufzeit (`.mjs` und `.wasm`) liegt neben
 `dist/index.js`. Dadurch muss Edge sie nicht mehr von einem zusätzlichen CDN in den anfälligen

@@ -1,4 +1,9 @@
-import type { ChatCompletion, MLCEngine } from "@mlc-ai/web-llm"
+import type {
+  AppConfig,
+  ChatCompletion,
+  MLCEngine,
+  ModelRecord,
+} from "@mlc-ai/web-llm"
 
 import * as webLlm from "./generated/webllm.js"
 import {
@@ -98,6 +103,11 @@ export const QUALITY_POST_DATA_INSTRUCTION =
 const QUALITY_BASELINE_MAX_TOKENS = 256
 const QUALITY_DATA_START = "BEGIN_UNTRUSTED_ASSESSMENT_DATA_JSON"
 const QUALITY_DATA_END = "END_UNTRUSTED_ASSESSMENT_DATA_JSON"
+const QUALITY_ARTIFACT_RETRY_DELAYS_MS = [0, 750, 2_000, 5_000, 10_000] as const
+const QUALITY_ARTIFACT_DOWNLOAD_CONCURRENCY = 3
+const QUALITY_VERIFIED_BYTES_HEADER = "x-lia-llm-verified-bytes"
+const QUALITY_BINARY_VALIDATION_HEADER = "x-lia-llm-binary-validation"
+const QUALITY_WASM_VALIDATION_MARKER = "webassembly-validate-v1"
 const QUALITY_NOTICE =
   "Lokaler LLM-Selbstcheck: Das Ergebnis unterstützt das Lernen, ersetzt aber keine fachliche Bewertung durch eine Lehrkraft."
 const DETERMINISTIC_GUARD_NOTICE =
@@ -840,17 +850,22 @@ export function createAssessmentManipulationResult(
   return createDeterministicAssessmentResult(normalized, MANIPULATION_OUTPUT)
 }
 
-function qualityWeightUrls(
+interface QualityWeightArtifact {
+  url: string
+  expectedBytes?: number
+}
+
+function qualityWeightArtifacts(
   manifest: unknown,
   modelUrl: string,
-): string[] | null {
+): QualityWeightArtifact[] | null {
   if (typeof manifest !== "object" || manifest === null || Array.isArray(manifest)) {
     return null
   }
   const records = (manifest as { records?: unknown }).records
   if (!Array.isArray(records) || records.length === 0) return null
 
-  const urls: string[] = []
+  const artifacts: QualityWeightArtifact[] = []
   for (const record of records) {
     if (typeof record !== "object" || record === null || Array.isArray(record)) {
       return null
@@ -866,9 +881,626 @@ function qualityWeightUrls(
       return null
     }
     if (!dataUrl.startsWith(modelUrl)) return null
-    urls.push(dataUrl)
+    const nbytes = (record as { nbytes?: unknown }).nbytes
+    if (
+      nbytes !== undefined &&
+      (typeof nbytes !== "number" ||
+        !Number.isSafeInteger(nbytes) ||
+        nbytes <= 0)
+    ) {
+      return null
+    }
+    artifacts.push({ url: dataUrl, expectedBytes: nbytes })
   }
-  return [...new Set(urls)]
+  const unique = new Map<string, QualityWeightArtifact>()
+  for (const artifact of artifacts) {
+    const previous = unique.get(artifact.url)
+    if (
+      previous &&
+      previous.expectedBytes !== undefined &&
+      artifact.expectedBytes !== undefined &&
+      previous.expectedBytes !== artifact.expectedBytes
+    ) {
+      return null
+    }
+    unique.set(artifact.url, previous ?? artifact)
+  }
+  return [...unique.values()]
+}
+
+function qualityWeightUrls(
+  manifest: unknown,
+  modelUrl: string,
+): string[] | null {
+  return qualityWeightArtifacts(manifest, modelUrl)?.map(
+    (artifact) => artifact.url,
+  ) ?? null
+}
+
+interface QualityArtifactPrefetchObserver {
+  setWeightPlan(artifacts: readonly QualityWeightArtifact[]): void
+  markWeightComplete(artifact: QualityWeightArtifact): void
+}
+
+class QualityArtifactHttpError extends Error {
+  readonly retryable: boolean
+
+  constructor(url: string, status: number) {
+    super(`HTTP ${status} f\u00fcr ${url}`)
+    this.name = "QualityArtifactHttpError"
+    this.retryable =
+      status === 408 || status === 425 || status === 429 || status >= 500
+  }
+}
+
+class QualityDownloadProgress {
+  private readonly expected = new Map<string, number>()
+  private readonly loaded = new Map<string, number>()
+
+  setWeightPlan(artifacts: readonly QualityWeightArtifact[]): void {
+    this.expected.clear()
+    this.loaded.clear()
+    for (const artifact of artifacts) {
+      if (artifact.expectedBytes !== undefined) {
+        this.expected.set(artifact.url, artifact.expectedBytes)
+        this.loaded.set(artifact.url, 0)
+      }
+    }
+    this.report()
+  }
+
+  markWeightComplete(artifact: QualityWeightArtifact): void {
+    if (artifact.expectedBytes === undefined) return
+    this.loaded.set(artifact.url, artifact.expectedBytes)
+    this.report(artifact.url)
+  }
+
+  update(activity: {
+    url: string
+    loaded: number
+    total?: number
+  }): void {
+    const expected = this.expected.get(activity.url)
+    if (expected === undefined) return
+    this.loaded.set(activity.url, Math.min(expected, activity.loaded))
+    this.report(activity.url)
+  }
+
+  private report(activeUrl?: string): void {
+    const total = [...this.expected.values()].reduce(
+      (sum, value) => sum + value,
+      0,
+    )
+    if (total <= 0) return
+    const loaded = [...this.loaded.values()].reduce(
+      (sum, value) => sum + value,
+      0,
+    )
+    let file: string | undefined
+    if (activeUrl) {
+      try {
+        file = new URL(activeUrl).pathname.split("/").pop() || undefined
+      } catch {
+        // The downloader already validated every planned URL.
+      }
+    }
+    emit<ModelProgress>("lia-llm:progress", {
+      status: "progress",
+      progress: (loaded / total) * 100,
+      loaded,
+      total,
+      file,
+      message:
+        "Modelldaten werden vollst\u00e4ndig im Browsercache gespeichert \u2026",
+    })
+  }
+}
+
+function qualityModelRecord(appConfig: AppConfig): ModelRecord {
+  const record = appConfig.model_list.find(
+    (candidate) => candidate.model_id === QUALITY_MODEL_ID,
+  )
+  if (!record) {
+    throw new Error(`WebLLM enth\u00e4lt keine Konfiguration f\u00fcr ${QUALITY_MODEL_ID}.`)
+  }
+  return record
+}
+
+function normalizedQualityModelUrl(record: ModelRecord): string {
+  return record.model.endsWith("/") ? record.model : record.model + "/"
+}
+
+function cachedArtifactLength(response: Response): number | undefined {
+  const encoding = response.headers.get("content-encoding")?.trim().toLowerCase()
+  if (encoding && encoding !== "identity") return undefined
+  const value = response.headers.get("content-length")
+  if (!value || !/^\d+$/u.test(value)) return undefined
+  const parsed = Number.parseInt(value, 10)
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined
+}
+
+async function matchingCachedArtifact(
+  cache: Cache,
+  artifact: QualityWeightArtifact,
+): Promise<Response | undefined> {
+  const cached = await cache.match(artifact.url)
+  if (!cached?.ok) return undefined
+  if (artifact.expectedBytes === undefined) return cached
+
+  const cachedLength = cachedArtifactLength(cached)
+  if (
+    cachedLength !== undefined &&
+    cachedLength !== artifact.expectedBytes
+  ) {
+    await cache.delete(artifact.url)
+    return undefined
+  }
+  const verifiedLength = cached.headers.get(QUALITY_VERIFIED_BYTES_HEADER)
+  if (
+    cachedLength === artifact.expectedBytes &&
+    verifiedLength === String(artifact.expectedBytes)
+  ) {
+    return cached
+  }
+
+  // Cache API entries written by older versions have no verification marker.
+  // Read their real body once, reject truncated data, and migrate valid data
+  // to a self-describing entry. Subsequent warm starts stay metadata-only.
+  try {
+    const bytes = await cached.arrayBuffer()
+    if (bytes.byteLength !== artifact.expectedBytes) {
+      await cache.delete(artifact.url)
+      return undefined
+    }
+    const headers = new Headers(cached.headers)
+    headers.set("content-length", String(artifact.expectedBytes))
+    headers.set(
+      QUALITY_VERIFIED_BYTES_HEADER,
+      String(artifact.expectedBytes),
+    )
+    headers.delete("content-encoding")
+    headers.delete("content-range")
+    const migrated = new Response(bytes, {
+      status: cached.status,
+      statusText: cached.statusText,
+      headers,
+    })
+    try {
+      await cache.put(artifact.url, migrated.clone())
+      return (await cache.match(artifact.url)) ?? migrated
+    } catch {
+      // A verified legacy entry remains usable even if its optional metadata
+      // migration cannot be written (for example near the storage quota).
+      return migrated
+    }
+  } catch {
+    await cache.delete(artifact.url).catch(() => false)
+    return undefined
+  }
+}
+
+function terminalQualityArtifactError(error: unknown): boolean {
+  if (error instanceof QualityArtifactHttpError) return !error.retryable
+  if (!(error instanceof Error)) return false
+  return (
+    error.name === "AbortError" ||
+    error.name === "QuotaExceededError" ||
+    error.name === "SecurityError" ||
+    error.name === "NotSupportedError"
+  )
+}
+
+function waitQualityArtifactRetry(
+  milliseconds: number,
+  signal: AbortSignal,
+): Promise<void> {
+  if (signal.aborted) return Promise.reject(abortError())
+  if (milliseconds <= 0) return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer)
+      reject(abortError())
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort)
+      resolve()
+    }, milliseconds)
+    signal.addEventListener("abort", onAbort, { once: true })
+  })
+}
+
+async function ensureQualityArtifactCached(
+  cache: Cache,
+  artifact: QualityWeightArtifact,
+  session: ResilientFetchSession,
+): Promise<Response> {
+  const existing = await matchingCachedArtifact(cache, artifact)
+  if (existing) return existing
+
+  let lastError: unknown
+  for (
+    let attempt = 0;
+    attempt < QUALITY_ARTIFACT_RETRY_DELAYS_MS.length;
+    attempt += 1
+  ) {
+    const delay = QUALITY_ARTIFACT_RETRY_DELAYS_MS[attempt] ?? 0
+    if (delay > 0) await waitQualityArtifactRetry(delay, session.signal)
+    try {
+      const request = new Request(artifact.url)
+      const response =
+        artifact.expectedBytes === undefined
+          ? await session.fetch(request)
+          : await session.fetchExact(request, artifact.expectedBytes)
+      if (!response.ok) {
+        void response.body?.cancel().catch(() => undefined)
+        throw new QualityArtifactHttpError(artifact.url, response.status)
+      }
+
+      // Cache.put consumes the complete custom response stream. Keeping it
+      // inside this retry boundary also retries failures in later byte ranges.
+      const verifiedBytes =
+        artifact.expectedBytes ?? cachedArtifactLength(response)
+      if (verifiedBytes === undefined) {
+        await cache.put(request, response)
+      } else {
+        const headers = new Headers(response.headers)
+        headers.delete("content-encoding")
+        headers.delete("content-range")
+        headers.set("content-length", String(verifiedBytes))
+        headers.set(
+          QUALITY_VERIFIED_BYTES_HEADER,
+          String(verifiedBytes),
+        )
+        await cache.put(
+          request,
+          new Response(response.body, {
+            status: response.status,
+            statusText: response.statusText,
+            headers,
+          }),
+        )
+      }
+      const stored = await matchingCachedArtifact(cache, artifact)
+      if (!stored) {
+        throw new Error(
+          `Das vollst\u00e4ndige Modellartefakt wurde nicht im Cache gespeichert: ${artifact.url}`,
+        )
+      }
+      return stored
+    } catch (error) {
+      lastError = error
+      await cache.delete(artifact.url).catch(() => false)
+      if (
+        terminalQualityArtifactError(error) ||
+        attempt + 1 >= QUALITY_ARTIFACT_RETRY_DELAYS_MS.length
+      ) {
+        throw error
+      }
+      recordDebugRetry("quality", {
+        url: artifact.url,
+        attempt: attempt + 1,
+        error,
+      })
+      emit<ModelProgress>("lia-llm:progress", {
+        status: "retry",
+        message:
+          `Modelldatei wird automatisch weitergeladen ` +
+          `(Versuch ${attempt + 2}/${QUALITY_ARTIFACT_RETRY_DELAYS_MS.length}).`,
+      })
+    }
+  }
+  throw lastError
+}
+
+async function loadValidatedQualityJson<T>(
+  cache: Cache,
+  artifact: QualityWeightArtifact,
+  session: ResilientFetchSession,
+  validate: (value: unknown) => T | null,
+  invalidMessage: string,
+): Promise<T> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = await ensureQualityArtifactCached(cache, artifact, session)
+    try {
+      const validated = validate(await response.json())
+      if (validated !== null) return validated
+    } catch {
+      // A corrupt cached JSON artifact is removed and fetched once again.
+    }
+    await cache.delete(artifact.url)
+  }
+  throw new Error(invalidMessage)
+}
+
+function qualityTokenizerFile(config: unknown): string | null {
+  if (typeof config !== "object" || config === null || Array.isArray(config)) {
+    return null
+  }
+  const files = (config as { tokenizer_files?: unknown }).tokenizer_files
+  if (!Array.isArray(files)) return null
+  if (files.includes("tokenizer.json")) return "tokenizer.json"
+  if (files.includes("tokenizer.model")) return "tokenizer.model"
+  return null
+}
+
+async function responseHasRequiredPrefix(
+  response: Response,
+  expectedPrefix?: readonly number[],
+): Promise<boolean> {
+  if (!response.body) return false
+  const reader = response.body.getReader()
+  const requiredBytes = expectedPrefix?.length ?? 1
+  let offset = 0
+  try {
+    while (offset < requiredBytes) {
+      const item = await reader.read()
+      if (item.done) return false
+      for (
+        let index = 0;
+        index < item.value.byteLength && offset < requiredBytes;
+        index += 1
+      ) {
+        if (
+          expectedPrefix !== undefined &&
+          item.value[index] !== expectedPrefix[offset]
+        ) {
+          return false
+        }
+        offset += 1
+      }
+    }
+    return true
+  } finally {
+    // A cloned Cache API response can be backed by a tee whose other branch
+    // remains stored in the cache. Waiting for cancel() would then wait for
+    // that unused branch as well and deadlock the prefetch.
+    void reader.cancel().catch(() => undefined)
+    reader.releaseLock()
+  }
+}
+
+function bytesHaveRequiredPrefix(
+  bytes: Uint8Array,
+  expectedPrefix?: readonly number[],
+): boolean {
+  if (bytes.byteLength === 0) return false
+  if (expectedPrefix === undefined) return true
+  if (bytes.byteLength < expectedPrefix.length) return false
+  return expectedPrefix.every((value, index) => bytes[index] === value)
+}
+
+async function validateQualityBinaryResponse(
+  cache: Cache,
+  artifact: QualityWeightArtifact,
+  response: Response,
+  expectedPrefix?: readonly number[],
+  validateComplete?: (bytes: Uint8Array<ArrayBuffer>) => boolean,
+): Promise<boolean> {
+  const declaredLength = cachedArtifactLength(response)
+  const verifiedLength = response.headers.get(QUALITY_VERIFIED_BYTES_HEADER)
+  if (
+    declaredLength !== undefined &&
+    declaredLength > 0 &&
+    verifiedLength === String(declaredLength) &&
+    (validateComplete === undefined ||
+      response.headers.get(QUALITY_BINARY_VALIDATION_HEADER) ===
+        QUALITY_WASM_VALIDATION_MARKER)
+  ) {
+    return responseHasRequiredPrefix(response, expectedPrefix)
+  }
+
+  const bytes = new Uint8Array(await response.arrayBuffer())
+  if (
+    !bytesHaveRequiredPrefix(bytes, expectedPrefix) ||
+    (declaredLength !== undefined && declaredLength !== bytes.byteLength) ||
+    (validateComplete !== undefined && !validateComplete(bytes))
+  ) {
+    return false
+  }
+
+  const headers = new Headers(response.headers)
+  headers.delete("content-encoding")
+  headers.delete("content-range")
+  headers.set("content-length", String(bytes.byteLength))
+  headers.set(QUALITY_VERIFIED_BYTES_HEADER, String(bytes.byteLength))
+  if (validateComplete !== undefined) {
+    headers.set(
+      QUALITY_BINARY_VALIDATION_HEADER,
+      QUALITY_WASM_VALIDATION_MARKER,
+    )
+  }
+  try {
+    await cache.put(
+      artifact.url,
+      new Response(bytes, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      }),
+    )
+  } catch {
+    // The fully read legacy artifact is valid for this load even when its
+    // optional verification marker cannot be persisted.
+  }
+  return true
+}
+
+async function ensureValidatedQualityBinary(
+  cache: Cache,
+  artifact: QualityWeightArtifact,
+  session: ResilientFetchSession,
+  expectedPrefix: readonly number[] | undefined,
+  validateComplete: ((bytes: Uint8Array<ArrayBuffer>) => boolean) | undefined,
+  invalidMessage: string,
+): Promise<void> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = await ensureQualityArtifactCached(cache, artifact, session)
+    try {
+      if (
+        await validateQualityBinaryResponse(
+          cache,
+          artifact,
+          response,
+          expectedPrefix,
+          validateComplete,
+        )
+      ) return
+    } catch {
+      // A corrupt cached binary artifact is removed and fetched once again.
+    }
+    await cache.delete(artifact.url)
+  }
+  throw new Error(invalidMessage)
+}
+
+async function settleQualityArtifactTasks(
+  tasks: readonly (() => Promise<unknown>)[],
+  session: ResilientFetchSession,
+): Promise<void> {
+  let failed = false
+  let firstError: unknown
+  const pending = tasks.map(async (task) => {
+    try {
+      await task()
+    } catch (error) {
+      if (!failed) {
+        failed = true
+        firstError = error
+      }
+      session.abort(errorMessage(error))
+      throw error
+    }
+  })
+  await Promise.allSettled(pending)
+  if (failed) throw firstError
+}
+
+async function cacheQualityWeights(
+  cache: Cache,
+  artifacts: readonly QualityWeightArtifact[],
+  session: ResilientFetchSession,
+  observer?: QualityArtifactPrefetchObserver,
+): Promise<void> {
+  observer?.setWeightPlan(artifacts)
+  let nextIndex = 0
+  let stopped = false
+  const failures: unknown[] = []
+  const worker = async (): Promise<void> => {
+    while (true) {
+      if (stopped) return
+      const index = nextIndex
+      nextIndex += 1
+      const artifact = artifacts[index]
+      if (!artifact) return
+      try {
+        await ensureQualityArtifactCached(cache, artifact, session)
+        observer?.markWeightComplete(artifact)
+      } catch (error) {
+        failures.push(error)
+        if (terminalQualityArtifactError(error)) {
+          stopped = true
+          session.abort(errorMessage(error))
+          return
+        }
+        // Other independent shards still complete and remain reusable.
+      }
+    }
+  }
+  const workers = Array.from(
+    {
+      length: Math.min(
+        QUALITY_ARTIFACT_DOWNLOAD_CONCURRENCY,
+        artifacts.length,
+      ),
+    },
+    worker,
+  )
+  await Promise.all(workers)
+  if (failures.length > 0) throw failures[0]
+}
+
+export async function prefetchQualityArtifacts(
+  appConfig: AppConfig,
+  session: ResilientFetchSession,
+  observer?: QualityArtifactPrefetchObserver,
+): Promise<void> {
+  if (typeof caches === "undefined") {
+    throw new Error("Dieser Browser unterst\u00fctzt keinen Modellcache.")
+  }
+  if (
+    appConfig.cacheBackend !== undefined &&
+    appConfig.cacheBackend !== "cache"
+  ) {
+    throw new Error("Der Quality-Downloader ben\u00f6tigt die Browser Cache API.")
+  }
+
+  const record = qualityModelRecord(appConfig)
+  const modelUrl = normalizedQualityModelUrl(record)
+  const configCache = await caches.open("webllm/config")
+  const modelCache = await caches.open("webllm/model")
+  const wasmCache = await caches.open("webllm/wasm")
+  const configUrl = new URL("mlc-chat-config.json", modelUrl).href
+  const config = await loadValidatedQualityJson(
+    configCache,
+    { url: configUrl },
+    session,
+    (value) => (qualityTokenizerFile(value) ? value : null),
+    "Die WebLLM-Modellkonfiguration ist ung\u00fcltig.",
+  )
+  const tokenizerFile = qualityTokenizerFile(config)
+  if (!tokenizerFile) {
+    throw new Error("Die WebLLM-Modellkonfiguration enth\u00e4lt keinen Tokenizer.")
+  }
+
+  const manifestUrl = new URL("tensor-cache.json", modelUrl).href
+  const weights = await loadValidatedQualityJson(
+    modelCache,
+    { url: manifestUrl },
+    session,
+    (value) => qualityWeightArtifacts(value, modelUrl),
+    "Das WebLLM-Gewichtsmanifest ist ung\u00fcltig.",
+  )
+
+  const tokenizerUrl = new URL(tokenizerFile, modelUrl).href
+  await settleQualityArtifactTasks(
+    [
+      () =>
+        tokenizerFile === "tokenizer.json"
+          ? loadValidatedQualityJson(
+              modelCache,
+              { url: tokenizerUrl },
+              session,
+              (value) =>
+                typeof value === "object" &&
+                value !== null &&
+                !Array.isArray(value)
+                  ? true
+                  : null,
+              "Der WebLLM-Tokenizer ist ungültig.",
+            )
+          : ensureValidatedQualityBinary(
+              modelCache,
+              { url: tokenizerUrl },
+              session,
+              undefined,
+              undefined,
+              "Der WebLLM-Tokenizer ist ungültig.",
+            ),
+      () =>
+        ensureValidatedQualityBinary(
+          wasmCache,
+          { url: record.model_lib },
+          session,
+          [0x00, 0x61, 0x73, 0x6d],
+          (bytes) =>
+            typeof WebAssembly !== "undefined" &&
+            WebAssembly.validate(bytes),
+          "Die WebLLM-WASM-Laufzeit ist ungültig.",
+        ),
+    ],
+    session,
+  )
+  await cacheQualityWeights(modelCache, weights, session, observer)
 }
 
 export async function hasPinnedQualityWeightsInCache(
@@ -1014,8 +1646,12 @@ export class QualityEvaluator {
       "quality",
       globalThis.fetch.bind(globalThis),
     )
+    const downloadProgress = new QualityDownloadProgress()
     const session = new ResilientFetchSession(diagnosticFetch, {
-      onActivity: (activity) => recordDebugActivity("quality", activity),
+      onActivity: (activity) => {
+        recordDebugActivity("quality", activity)
+        downloadProgress.update(activity)
+      },
       onRetry: (retry) => {
         const { attempt } = retry
         recordDebugRetry("quality", retry)
@@ -1032,38 +1668,46 @@ export class QualityEvaluator {
       __liaLlmArtifactFetch?: typeof fetch
     }
     const previousArtifactFetch = fetchGlobal.__liaLlmArtifactFetch
-    fetchGlobal.__liaLlmArtifactFetch = session.fetch
-
     const appConfig = createQualityAppConfig(webLlm.prebuiltAppConfig)
-    const engine = new webLlm.MLCEngine({
-      appConfig,
-      initProgressCallback: (report) => {
-        const rawProgress = Number.isFinite(report.progress) ? report.progress : undefined
-        const progress =
-          rawProgress === undefined
-            ? undefined
-            : rawProgress <= 1
-              ? rawProgress * 100
-              : rawProgress
-        emit<ModelProgress>("lia-llm:progress", {
-          status: "loading",
-          progress,
-          message: report.text,
-        })
-      },
-      logLevel: "WARN",
-    })
-    this.loadingEngine = engine
+    let engine: MLCEngine | null = null
+    let stage = "artifact-prefetch"
 
     try {
+      // Finish the persistent network transfer before WebLLM creates a GPU
+      // device. A later device loss can no longer abort or invalidate it.
+      await prefetchQualityArtifacts(appConfig, session, downloadProgress)
+
+      stage = "engine-reload"
+      fetchGlobal.__liaLlmArtifactFetch = session.fetch
+      engine = new webLlm.MLCEngine({
+        appConfig,
+        initProgressCallback: (report) => {
+          const rawProgress = Number.isFinite(report.progress)
+            ? report.progress
+            : undefined
+          const progress =
+            rawProgress === undefined
+              ? undefined
+              : rawProgress <= 1
+                ? rawProgress * 100
+                : rawProgress
+          emit<ModelProgress>("lia-llm:progress", {
+            status: "loading",
+            progress,
+            message: report.text,
+          })
+        },
+        logLevel: "WARN",
+      })
+      this.loadingEngine = engine
       await engine.reload(QUALITY_MODEL_ID)
       return engine
     } catch (error) {
-      recordDebugFailure("quality", { error }, "engine-reload")
-      await engine.unload().catch(() => undefined)
+      recordDebugFailure("quality", { error }, stage)
+      if (engine) await engine.unload().catch(() => undefined)
       throw error
     } finally {
-      if (this.loadingEngine === engine) this.loadingEngine = null
+      if (engine && this.loadingEngine === engine) this.loadingEngine = null
       if (this.fetchSession === session) this.fetchSession = null
       if (fetchGlobal.__liaLlmArtifactFetch === session.fetch) {
         fetchGlobal.__liaLlmArtifactFetch = previousArtifactFetch

@@ -1,6 +1,7 @@
 const DEFAULT_CHUNK_SIZE_BYTES = 8 * 1024 * 1024
 const DEFAULT_STALL_TIMEOUT_MS = 45_000
 const DEFAULT_RETRY_DELAYS_MS = [0, 750, 2_000, 5_000] as const
+const MAX_FULL_FALLBACK_PREFIX_BYTES = 64 * 1024 * 1024
 
 type FetchLike = (
   input: RequestInfo | URL,
@@ -29,6 +30,7 @@ export interface ResilientFetchOptions {
   chunkSizeBytes?: number
   stallTimeoutMs?: number
   retryDelaysMs?: readonly number[]
+  maxFullFallbackPrefixBytes?: number
   shouldChunk?(request: Request): boolean
   onActivity?(activity: DownloadActivity): void
   onRetry?(retry: DownloadRetry): void
@@ -253,6 +255,7 @@ export class ResilientFetchSession {
   private readonly chunkSizeBytes: number
   private readonly stallTimeoutMs: number
   private readonly retryDelaysMs: readonly number[]
+  private readonly maxFullFallbackPrefixBytes: number
   private readonly shouldChunk: (request: Request) => boolean
   private readonly onActivity?: (activity: DownloadActivity) => void
   private readonly onRetry?: (retry: DownloadRetry) => void
@@ -272,6 +275,13 @@ export class ResilientFetchSession {
       options.retryDelaysMs && options.retryDelaysMs.length > 0
         ? options.retryDelaysMs
         : DEFAULT_RETRY_DELAYS_MS
+    this.maxFullFallbackPrefixBytes = Math.max(
+      0,
+      Math.floor(
+        options.maxFullFallbackPrefixBytes ??
+          MAX_FULL_FALLBACK_PREFIX_BYTES,
+      ),
+    )
     this.shouldChunk = options.shouldChunk ?? shouldChunkModelRequest
     this.onActivity = options.onActivity
     this.onRetry = options.onRetry
@@ -280,6 +290,10 @@ export class ResilientFetchSession {
 
   readonly fetch: FetchLike = async (input, init) => {
     return this.fetchRequest(input, init)
+  }
+
+  get signal(): AbortSignal {
+    return this.controller.signal
   }
 
   private reportFailure(failure: DownloadFailure): void {
@@ -658,7 +672,7 @@ export class ResilientFetchSession {
 
     const streamController = new AbortController()
     const signal = combinedSignal([request.signal, streamController.signal])!
-    const retainPrefix = expectedByteLength !== undefined
+    const retainPrefix = first.total <= this.maxFullFallbackPrefixBytes
     let offset = 0
     let firstChunk: Uint8Array | null = first.bytes
     let emittedChunks: Uint8Array[] = []
@@ -740,6 +754,7 @@ export class ResilientFetchSession {
       )
       if (
         prefixBytes > 0 &&
+        retainPrefix &&
         !comparePrefix(item.value.subarray(0, prefixBytes))
       ) {
         throw new NonRetryableDownloadError(
@@ -779,7 +794,7 @@ export class ResilientFetchSession {
               new Request(request, { signal }),
               offset,
               Math.min(offset + this.chunkSizeBytes - 1, first.total - 1),
-              expectedByteLength,
+              first.total,
             )
             if (
               next === DIRECT_FALLBACK ||

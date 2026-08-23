@@ -497,7 +497,12 @@ export class AutomaticEvaluator {
     if (generation !== this.generation) return
     this.qualityReady = false
     this.qualityDegraded = true
-    emitStatus(this.compactEvaluator.getStatus())
+    // A foreground wait limit only releases the current quiz. It does not
+    // stop the global Quality download, so keep its real loading status and
+    // progress visible until that background operation settles.
+    if (this.qualityEvaluator.getStatus().phase !== "loading") {
+      emitStatus(this.compactEvaluator.getStatus())
+    }
   }
 
   private async waitForQualityUpgradeInForeground(

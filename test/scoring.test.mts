@@ -88,6 +88,7 @@ import {
   LANGUAGE_ANALYSIS_SYSTEM_PROMPT,
   parseLanguageJudgeOutput,
   parseQualityJudgeOutput,
+  prefetchQualityArtifacts,
   QualityOutputError,
   QualityEvaluator,
   qualityDiagnosticForCriteria,
@@ -167,6 +168,64 @@ class MemoryRuntimeCache {
   }
 }
 
+class ConsumingMemoryRuntimeCache extends MemoryRuntimeCache {
+  readonly consumingPutAttempts: string[] = []
+  onPutComplete: ((url: string) => void) | undefined
+  private failWhileReadingOnceUrl: string | undefined
+
+  failNextPutWhileReading(url: string): void {
+    this.failWhileReadingOnceUrl = url
+  }
+
+  override async put(
+    request: RequestInfo | URL,
+    response: Response,
+  ): Promise<void> {
+    const url = requestUrl(request)
+    this.consumingPutAttempts.push(url)
+    const reader = response.body?.getReader()
+    if (!reader) {
+      await super.put(request, response)
+      this.onPutComplete?.(url)
+      return
+    }
+
+    const chunks: Uint8Array[] = []
+    let byteLength = 0
+    try {
+      while (true) {
+        const item = await reader.read()
+        if (item.done) break
+        chunks.push(item.value)
+        byteLength += item.value.byteLength
+        if (this.failWhileReadingOnceUrl === url) {
+          this.failWhileReadingOnceUrl = undefined
+          await reader.cancel('synthetic cache stream failure')
+          throw new Error('Synthetic Cache.put stream failure')
+        }
+      }
+    } finally {
+      reader.releaseLock()
+    }
+
+    const bytes = new Uint8Array(byteLength)
+    let offset = 0
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset)
+      offset += chunk.byteLength
+    }
+    await super.put(
+      request,
+      new Response(bytes, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      }),
+    )
+    this.onPutComplete?.(url)
+  }
+}
+
 class RuntimeCacheStorageStub {
   readonly cachesByName = new Map<string, MemoryRuntimeCache>()
   readonly deletedNames: string[] = []
@@ -237,6 +296,123 @@ async function withGlobalFetch<T>(
       Object.defineProperty(globalThis, "fetch", descriptor)
     } else {
       Reflect.deleteProperty(globalThis, "fetch")
+    }
+  }
+}
+
+interface SyntheticQualityPrefetchFixture {
+  appConfig: Parameters<typeof prefetchQualityArtifacts>[0]
+  bodies: ReadonlyMap<string, Uint8Array>
+  expectedCacheUrls: ReadonlyMap<string, readonly string[]>
+  firstShardUrl: string
+}
+
+function syntheticQualityPrefetchFixture(): SyntheticQualityPrefetchFixture {
+  const modelUrl = 'https://models.example.test/quality/'
+  const wasmUrl = 'https://runtime.example.test/quality.wasm'
+  const configUrl = new URL('mlc-chat-config.json', modelUrl).href
+  const manifestUrl = new URL('tensor-cache.json', modelUrl).href
+  const tokenizerUrl = new URL('tokenizer.json', modelUrl).href
+  const shardPaths = [
+    'params/params_shard_0.bin',
+    'params/params_shard_1.bin',
+    'params/params_shard_2.bin',
+  ]
+  const shardUrls = shardPaths.map((path) => new URL(path, modelUrl).href)
+  const shardBodies = [
+    Uint8Array.from([1, 2, 3]),
+    Uint8Array.from([4, 5, 6, 7]),
+    Uint8Array.from([8, 9]),
+  ]
+  const encode = (value: unknown): Uint8Array =>
+    new TextEncoder().encode(JSON.stringify(value))
+  const bodies = new Map<string, Uint8Array>([
+    [configUrl, encode({ tokenizer_files: ['tokenizer.json'] })],
+    [
+      manifestUrl,
+      encode({
+        records: shardPaths.map((dataPath, index) => ({
+          dataPath,
+          nbytes: shardBodies[index].byteLength,
+        })),
+      }),
+    ],
+    [tokenizerUrl, encode({ model: { type: 'BPE' } })],
+    [wasmUrl, Uint8Array.from([0, 97, 115, 109, 1, 0, 0, 0])],
+    ...shardUrls.map(
+      (url, index) => [url, shardBodies[index]] as [string, Uint8Array],
+    ),
+  ])
+
+  return {
+    appConfig: {
+      cacheBackend: 'cache',
+      model_list: [
+        { model_id: QUALITY_MODEL_ID, model: modelUrl, model_lib: wasmUrl },
+      ],
+    } as Parameters<typeof prefetchQualityArtifacts>[0],
+    bodies,
+    expectedCacheUrls: new Map([
+      ['webllm/config', [configUrl]],
+      ['webllm/model', [manifestUrl, tokenizerUrl, ...shardUrls]],
+      ['webllm/wasm', [wasmUrl]],
+    ]),
+    firstShardUrl: shardUrls[0],
+  }
+}
+
+function consumingQualityCacheStorage(): RuntimeCacheStorageStub {
+  const storage = new RuntimeCacheStorageStub()
+  for (const name of ['webllm/config', 'webllm/model', 'webllm/wasm']) {
+    storage.cachesByName.set(name, new ConsumingMemoryRuntimeCache())
+  }
+  return storage
+}
+
+function syntheticQualityFetch(
+  fixture: SyntheticQualityPrefetchFixture,
+  requests: string[],
+): (input: RequestInfo | URL) => Promise<Response> {
+  return async (input) => {
+    const request = input instanceof Request ? input : new Request(input)
+    requests.push(request.url)
+    assert.equal(request.headers.get('range'), null)
+    const body = fixture.bodies.get(request.url)
+    assert.ok(body, 'Unexpected quality artifact request: ' + request.url)
+    return new Response(body.slice(), {
+      status: 200,
+      headers: {
+        'content-length': String(body.byteLength),
+        'content-type': request.url.endsWith('.json')
+          ? 'application/json'
+          : 'application/octet-stream',
+      },
+    })
+  }
+}
+
+async function assertSyntheticQualityCache(
+  storage: RuntimeCacheStorageStub,
+  fixture: SyntheticQualityPrefetchFixture,
+): Promise<void> {
+  assert.deepEqual(
+    [...storage.cachesByName.keys()].sort(),
+    [...fixture.expectedCacheUrls.keys()].sort(),
+  )
+  for (const [name, expectedUrls] of fixture.expectedCacheUrls) {
+    const cache = storage.cachesByName.get(name)
+    assert.ok(cache)
+    assert.deepEqual(
+      (await cache.keys()).map((request) => request.url).sort(),
+      [...expectedUrls].sort(),
+    )
+    for (const url of expectedUrls) {
+      const response = await cache.match(url)
+      assert.ok(response, 'Missing cached quality artifact: ' + url)
+      assert.deepEqual(
+        new Uint8Array(await response.arrayBuffer()),
+        fixture.bodies.get(url),
+      )
     }
   }
 }
@@ -3595,6 +3771,324 @@ test("prepared WebLLM clears an interrupted non-streaming request", () => {
   )
 })
 
+test('quality artifact prefetch fills exact WebLLM caches and reuses them', async () => {
+  const fixture = syntheticQualityPrefetchFixture()
+  const storage = consumingQualityCacheStorage()
+  const networkRequests: string[] = []
+  const session = new ResilientFetchSession(
+    syntheticQualityFetch(fixture, networkRequests),
+    {
+      retryDelaysMs: [0],
+      shouldChunk: () => false,
+      stallTimeoutMs: 1_000,
+    },
+  )
+
+  await withCacheStorage(storage.asCacheStorage(), async () => {
+    await prefetchQualityArtifacts(fixture.appConfig, session)
+    assert.equal(networkRequests.length, fixture.bodies.size)
+    assert.deepEqual(
+      [...networkRequests].sort(),
+      [...fixture.bodies.keys()].sort(),
+    )
+    await assertSyntheticQualityCache(storage, fixture)
+
+    let repeatedNetworkRequests = 0
+    const cacheOnlySession = new ResilientFetchSession(
+      async () => {
+        repeatedNetworkRequests += 1
+        throw new Error('Cached quality prefetch must not fetch')
+      },
+      { retryDelaysMs: [0], shouldChunk: () => false },
+    )
+    await prefetchQualityArtifacts(fixture.appConfig, cacheOnlySession)
+    assert.equal(repeatedNetworkRequests, 0)
+  })
+})
+
+test('quality artifact prefetch retries a whole shard after Cache.put stream failure', async () => {
+  const fixture = syntheticQualityPrefetchFixture()
+  const storage = consumingQualityCacheStorage()
+  const modelCache = storage.cachesByName.get('webllm/model')
+  assert.ok(modelCache instanceof ConsumingMemoryRuntimeCache)
+  modelCache.failNextPutWhileReading(fixture.firstShardUrl)
+  const networkRequests: string[] = []
+  const session = new ResilientFetchSession(
+    syntheticQualityFetch(fixture, networkRequests),
+    {
+      retryDelaysMs: [0],
+      shouldChunk: () => false,
+      stallTimeoutMs: 1_000,
+    },
+  )
+
+  await withCacheStorage(storage.asCacheStorage(), async () => {
+    await prefetchQualityArtifacts(fixture.appConfig, session)
+    await assertSyntheticQualityCache(storage, fixture)
+  })
+
+  const requestCounts = new Map<string, number>()
+  for (const url of networkRequests) {
+    requestCounts.set(url, (requestCounts.get(url) ?? 0) + 1)
+  }
+  assert.equal(requestCounts.get(fixture.firstShardUrl), 2)
+  for (const url of fixture.bodies.keys()) {
+    if (url !== fixture.firstShardUrl) assert.equal(requestCounts.get(url), 1)
+  }
+  assert.equal(
+    modelCache.consumingPutAttempts.filter(
+      (url) => url === fixture.firstShardUrl,
+    ).length,
+    2,
+  )
+})
+
+test('quality artifact prefetch replaces a cached shard with a truncated body', async () => {
+  const fixture = syntheticQualityPrefetchFixture()
+  const storage = consumingQualityCacheStorage()
+  for (const [name, urls] of fixture.expectedCacheUrls) {
+    const cache = storage.cachesByName.get(name)
+    assert.ok(cache)
+    for (const url of urls) {
+      const body = fixture.bodies.get(url)
+      assert.ok(body)
+      cache.seed(
+        url,
+        new Response(body.slice(), {
+          status: 200,
+          headers: { 'content-length': String(body.byteLength) },
+        }),
+      )
+    }
+  }
+
+  const modelCache = storage.cachesByName.get('webllm/model')
+  assert.ok(modelCache instanceof ConsumingMemoryRuntimeCache)
+  const expectedShard = fixture.bodies.get(fixture.firstShardUrl)
+  assert.ok(expectedShard)
+  modelCache.seed(
+    fixture.firstShardUrl,
+    new Response(expectedShard.slice(0, -1), {
+      status: 200,
+      headers: { 'content-length': String(expectedShard.byteLength) },
+    }),
+  )
+
+  const networkRequests: string[] = []
+  const session = new ResilientFetchSession(
+    syntheticQualityFetch(fixture, networkRequests),
+    {
+      retryDelaysMs: [0],
+      shouldChunk: () => false,
+      stallTimeoutMs: 1_000,
+    },
+  )
+
+  await withCacheStorage(storage.asCacheStorage(), async () => {
+    await prefetchQualityArtifacts(fixture.appConfig, session)
+
+    const cachedShard = await modelCache.match(fixture.firstShardUrl)
+    assert.ok(cachedShard)
+    assert.equal(
+      cachedShard.headers.get('content-length'),
+      String(expectedShard.byteLength),
+    )
+    assert.deepEqual(
+      new Uint8Array(await cachedShard.arrayBuffer()),
+      expectedShard,
+    )
+  })
+
+  assert.equal(modelCache.deleteCalls, 1)
+  assert.deepEqual(networkRequests, [fixture.firstShardUrl])
+  assert.equal(
+    modelCache.consumingPutAttempts.filter(
+      (url) => url === fixture.firstShardUrl,
+    ).length,
+    1,
+  )
+})
+
+test('quality artifact prefetch rejects a legacy truncated WASM module', async () => {
+  const fixture = syntheticQualityPrefetchFixture()
+  const storage = consumingQualityCacheStorage()
+  const initialRequests: string[] = []
+  await withCacheStorage(storage.asCacheStorage(), async () => {
+    await prefetchQualityArtifacts(
+      fixture.appConfig,
+      new ResilientFetchSession(
+        syntheticQualityFetch(fixture, initialRequests),
+        { retryDelaysMs: [0], shouldChunk: () => false },
+      ),
+    )
+  })
+
+  const wasmUrl = fixture.expectedCacheUrls.get('webllm/wasm')?.[0]
+  const wasmCache = storage.cachesByName.get('webllm/wasm')
+  assert.ok(wasmUrl)
+  assert.ok(wasmCache)
+  wasmCache.seed(
+    wasmUrl,
+    new Response(Uint8Array.from([0, 97, 115, 109]), {
+      status: 200,
+      headers: { 'content-length': '4' },
+    }),
+  )
+
+  const replacementRequests: string[] = []
+  await withCacheStorage(storage.asCacheStorage(), async () => {
+    await prefetchQualityArtifacts(
+      fixture.appConfig,
+      new ResilientFetchSession(
+        syntheticQualityFetch(fixture, replacementRequests),
+        { retryDelaysMs: [0], shouldChunk: () => false },
+      ),
+    )
+    await assertSyntheticQualityCache(storage, fixture)
+  })
+  assert.deepEqual(replacementRequests, [wasmUrl])
+})
+
+test('quality artifact prefetch settles parallel siblings before rejection', async () => {
+  const fixture = syntheticQualityPrefetchFixture()
+  const storage = consumingQualityCacheStorage()
+  const configCache = storage.cachesByName.get('webllm/config')
+  const modelCache = storage.cachesByName.get('webllm/model')
+  const wasmCache = storage.cachesByName.get('webllm/wasm')
+  assert.ok(configCache instanceof ConsumingMemoryRuntimeCache)
+  assert.ok(modelCache instanceof ConsumingMemoryRuntimeCache)
+  assert.ok(wasmCache instanceof ConsumingMemoryRuntimeCache)
+
+  const configUrl = fixture.expectedCacheUrls.get('webllm/config')?.[0]
+  const modelUrls = fixture.expectedCacheUrls.get('webllm/model')
+  const wasmUrl = fixture.expectedCacheUrls.get('webllm/wasm')?.[0]
+  assert.ok(configUrl)
+  assert.ok(modelUrls)
+  assert.ok(wasmUrl)
+  const [manifestUrl, tokenizerUrl] = modelUrls
+  for (const [cache, url] of [
+    [configCache, configUrl],
+    [modelCache, manifestUrl],
+  ] as const) {
+    const body = fixture.bodies.get(url)
+    assert.ok(body)
+    cache.seed(
+      url,
+      new Response(body.slice(), {
+        status: 200,
+        headers: {
+          'content-length': String(body.byteLength),
+          'content-type': 'application/json',
+        },
+      }),
+    )
+  }
+
+  let releaseWasm!: () => void
+  const wasmRelease = new Promise<void>((resolve) => {
+    releaseWasm = resolve
+  })
+  let resolveBothStarted!: () => void
+  const bothStarted = new Promise<void>((resolve) => {
+    resolveBothStarted = resolve
+  })
+  const startedUrls = new Set<string>()
+  const markStarted = (url: string): void => {
+    startedUrls.add(url)
+    if (startedUrls.has(tokenizerUrl) && startedUrls.has(wasmUrl)) {
+      resolveBothStarted()
+    }
+  }
+
+  let resolveWasmTerminal!: () => void
+  const wasmTerminal = new Promise<void>((resolve) => {
+    resolveWasmTerminal = resolve
+  })
+  let wasmPutCompleted = false
+  let wasmRequestSignal: AbortSignal | undefined
+  wasmCache.onPutComplete = (url) => {
+    if (url !== wasmUrl) return
+    wasmPutCompleted = true
+    resolveWasmTerminal()
+  }
+  const wasmBody = fixture.bodies.get(wasmUrl)
+  assert.ok(wasmBody)
+
+  const session = new ResilientFetchSession(
+    async (input) => {
+      const request = input instanceof Request ? input : new Request(input)
+      assert.equal(request.headers.get('range'), null)
+      markStarted(request.url)
+      if (request.url === tokenizerUrl) {
+        await bothStarted
+        return new Response('missing', {
+          status: 404,
+          headers: { 'content-length': '7' },
+        })
+      }
+      if (request.url === wasmUrl) {
+        wasmRequestSignal = request.signal
+        request.signal.addEventListener('abort', resolveWasmTerminal, {
+          once: true,
+        })
+        await wasmRelease
+        return new Response(wasmBody.slice(), {
+          status: 200,
+          headers: { 'content-length': String(wasmBody.byteLength) },
+        })
+      }
+      throw new Error('Unexpected parallel quality request: ' + request.url)
+    },
+    {
+      retryDelaysMs: [0],
+      shouldChunk: () => false,
+      stallTimeoutMs: 1_000,
+    },
+  )
+
+  let rejection: unknown
+  let siblingTerminatedAtReject = false
+  let wasmPutAttemptsAtReject = 0
+  await withCacheStorage(storage.asCacheStorage(), async () => {
+    const prefetchOutcome = prefetchQualityArtifacts(
+      fixture.appConfig,
+      session,
+    ).then(
+      () => assert.fail('Parallel quality prefetch unexpectedly succeeded'),
+      (error: unknown) => {
+        rejection = error
+        siblingTerminatedAtReject =
+          wasmPutCompleted || wasmRequestSignal?.aborted === true
+        wasmPutAttemptsAtReject = wasmCache.consumingPutAttempts.filter(
+          (url) => url === wasmUrl,
+        ).length
+      },
+    )
+
+    await bothStarted
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    releaseWasm()
+    await prefetchOutcome
+    await wasmTerminal
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+  })
+
+  const finalWasmPutAttempts = wasmCache.consumingPutAttempts.filter(
+    (url) => url === wasmUrl,
+  ).length
+  assert.match(String(rejection), /HTTP 404/u)
+  assert.deepEqual(
+    {
+      siblingTerminatedAtReject,
+      laterCachePuts: finalWasmPutAttempts - wasmPutAttemptsAtReject,
+    },
+    {
+      siblingTerminatedAtReject: true,
+      laterCachePuts: 0,
+    },
+  )
+})
+
 test("quality weight cache probe uses only manifest-directed matches", async () => {
   const modelUrl =
     `https://huggingface.co/mlc-ai/${QUALITY_MODEL_ID}/resolve/` +
@@ -5325,6 +5819,87 @@ test("automatic evaluator bounds an uncached quality wait and accepts late succe
   })
 })
 
+test("automatic evaluator preserves loading status after an uncached quality wait times out", async () => {
+  await withForegroundQualityRuntime(async () => {
+    const dispatchEventDescriptor = Object.getOwnPropertyDescriptor(
+      globalThis,
+      "dispatchEvent",
+    )
+    const emittedStatuses: RuntimeStatus[] = []
+    Object.defineProperty(globalThis, "dispatchEvent", {
+      configurable: true,
+      value: (event: Event): boolean => {
+        if (event.type === "lia-llm:status") {
+          emittedStatuses.push((event as CustomEvent<RuntimeStatus>).detail)
+        }
+        return true
+      },
+    })
+
+    try {
+      const compact = new ForegroundWaitMockEvaluator(
+        "compact-loading-timeout",
+        "compact",
+        foregroundWaitCache(true),
+      )
+      const quality = new ForegroundWaitMockEvaluator(
+        "quality-loading-timeout",
+        "quality",
+        foregroundWaitCache(false),
+        true,
+      )
+      quality.status.phase = "loading"
+      globalThis.dispatchEvent(
+        new CustomEvent("lia-llm:status", {
+          detail: { ...quality.getStatus() },
+        }),
+      )
+      const automatic = new AutomaticEvaluator(
+        compact as never,
+        quality as never,
+        {
+          uncachedQualityWaitMs: 5,
+          cachedQualityWaitMs: 50,
+        },
+      )
+      const request: EvaluationRequest = {
+        question: "Warum schwimmt Eis?",
+        answer: "Eis besitzt eine geringere Dichte als flüssiges Wasser.",
+        reference: "Eis besitzt eine geringere Dichte als flüssiges Wasser.",
+      }
+
+      const first = await automatic.evaluate(request, {
+        maxThinkingTimeMs: 20_000,
+        maxThinkingTokens: 256,
+      })
+      assert.equal(first.model.id, "compact-loading-timeout")
+      assert.equal(quality.getStatus().phase, "loading")
+      assert.deepEqual(
+        emittedStatuses.map(
+          (status) => [status.assessmentEngine, status.phase] as const,
+        ),
+        [["quality", "loading"]],
+      )
+
+      quality.releasePreload()
+      await waitForQualityReady(automatic)
+      assert.equal(automatic.getStatus().assessmentEngine, "quality")
+      assert.equal(automatic.getStatus().phase, "ready")
+    } finally {
+      if (dispatchEventDescriptor) {
+        Object.defineProperty(
+          globalThis,
+          "dispatchEvent",
+          dispatchEventDescriptor,
+        )
+      } else {
+        delete (globalThis as typeof globalThis & { dispatchEvent?: unknown })
+          .dispatchEvent
+      }
+    }
+  })
+})
+
 test("automatic evaluator retries after a timeout and late transient quality failure", async () => {
   await withForegroundQualityRuntime(async () => {
     const compact = new ForegroundWaitMockEvaluator(
@@ -6175,7 +6750,7 @@ test("formatResult hides criterion details by default but keeps them available",
   assert.match(detailed, /Bestätigung:/u)
 })
 
-test("the public version remains pinned exactly to 0.5.7", () => {
+test("the public version remains pinned exactly to 0.5.8", () => {
   const packageJson = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   ) as { version?: string }
@@ -6185,12 +6760,12 @@ test("the public version remains pinned exactly to 0.5.7", () => {
   const entry = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8")
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8")
 
-  assert.equal(packageJson.version, "0.5.7")
-  assert.equal(packageLock.version, "0.5.7")
-  assert.equal(packageLock.packages?.[""]?.version, "0.5.7")
-  assert.match(entry, /const VERSION = "0\.5\.7"/u)
-  assert.match(readme, /^version:\s+0\.5\.7$/mu)
-  assert.match(readme, /^script:\s+\.\/dist\/index\.js\?v=0\.5\.7$/mu)
+  assert.equal(packageJson.version, "0.5.8")
+  assert.equal(packageLock.version, "0.5.8")
+  assert.equal(packageLock.packages?.[""]?.version, "0.5.8")
+  assert.match(entry, /const VERSION = "0\.5\.8"/u)
+  assert.match(readme, /^version:\s+0\.5\.8$/mu)
+  assert.match(readme, /^script:\s+\.\/dist\/index\.js\?v=0\.5\.8$/mu)
 })
 
 test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper", () => {
@@ -6912,7 +7487,7 @@ test("resilient fetch recovers when a proxy ignores a resumed range", async () =
   assert.deepEqual(requestedRanges, ["bytes=0-3", "bytes=4-7"])
 })
 
-test("generic resilient fetch rejects a full response for a resumed range", async () => {
+test("generic resilient fetch reconstructs a full response for a resumed range", async () => {
   const payload = Uint8Array.from({ length: 10 }, (_value, index) => index + 25)
   const requestedRanges: Array<string | null> = []
 
@@ -6935,19 +7510,17 @@ test("generic resilient fetch rejects a full response for a resumed range", asyn
   }
   const session = new ResilientFetchSession(baseFetch, {
     chunkSizeBytes: 4,
+    maxFullFallbackPrefixBytes: 4,
     retryDelaysMs: [0],
     stallTimeoutMs: 1_000,
   })
 
   const response = await session.fetch("https://example.test/model.onnx")
-  await assert.rejects(
-    response.arrayBuffer(),
-    /HTTP 200 statt eines Byte-Bereichs/u,
-  )
+  assert.deepEqual(new Uint8Array(await response.arrayBuffer()), payload)
   assert.deepEqual(requestedRanges, ["bytes=0-3", "bytes=4-7"])
 })
 
-test("resilient fetch rejects a changed full object after a resumed range", async () => {
+test("generic resilient fetch rejects a changed full object after a resumed range", async () => {
   const payload = Uint8Array.from({ length: 10 }, (_value, index) => index + 30)
   let calls = 0
 
@@ -6975,10 +7548,7 @@ test("resilient fetch rejects a changed full object after a resumed range", asyn
     stallTimeoutMs: 1_000,
   })
 
-  const response = await session.fetchExact(
-    "https://example.test/model.onnx",
-    payload.byteLength,
-  )
+  const response = await session.fetch("https://example.test/model.onnx")
   await assert.rejects(response.arrayBuffer(), /bereits geladenen Bytes/u)
   assert.equal(calls, 2)
 })
