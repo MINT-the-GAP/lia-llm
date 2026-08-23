@@ -1,11 +1,11 @@
 <!--
 author:      MINT-the-GAP, Martin Lommatzsch
-version:     0.5.8
+version:     0.5.11
 language:    de
 narrator:    Deutsch Female
 comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
 repository:  https://github.com/MINT-the-GAP/lia-llm
-script:      ./dist/index.js?v=0.5.8
+script:      ./dist/index.js?v=0.5.11
 
 attribute:   [WebLLM](https://webllm.mlc.ai/docs/) by MLC is licensed under
              [Apache-2.0](https://github.com/mlc-ai/web-llm/blob/main/LICENSE), and
@@ -24,22 +24,29 @@ attribute:   [WebLLM](https://webllm.mlc.ai/docs/) by MLC is licensed under
 <script output="lia-llm-result-@0">
 const feedbackId = "lia-llm-feedback-@0"
 const activityId = "lia-llm-activity-@0"
+const solutionVariantId = "lia-llm-solution-variant-@0"
 const runId = activityId + "-" + Date.now().toString(36) + "-" +
   Math.random().toString(36).slice(2)
 const evaluationController = new AbortController()
 const optionSource = `@'1`
 const question = `@'2`
-const reference = `@'3`
+const referenceSource = `@'3`
 const answer = `@'input`.replace(/\u2028/gu, "\n")
 let active = true
 let finished = false
 let feedbackEnabled = false
+let referenceVariants = []
 
 window.LiaLLM?.showFeedback?.(feedbackId, "")
 window.LiaLLM?.showActivity?.(activityId, runId, "selecting-model")
+window.LiaLLM?.setSolutionVariant?.(solutionVariantId, runId)
 
 function clearActivity() {
   window.LiaLLM?.showActivity?.(activityId, runId, "")
+}
+
+function clearSolutionVariant() {
+  window.LiaLLM?.clearSolutionVariant?.(solutionVariantId, runId)
 }
 
 function showLearnerFeedback(message) {
@@ -58,6 +65,7 @@ function finishTechnicalError(error) {
   if (!active || finished) return
   finished = true
   clearActivity()
+  clearSolutionVariant()
   window.LiaLLM?.showFeedback?.(feedbackId, "")
   const message = error instanceof Error ? error.message : String(error)
   send.lia(message, [], false)
@@ -68,6 +76,7 @@ send.handle("stop", () => {
   finished = true
   evaluationController.abort()
   clearActivity()
+  clearSolutionVariant()
   window.LiaLLM?.showFeedback?.(feedbackId, "")
 })
 
@@ -76,11 +85,12 @@ Promise.resolve()
     if (!window.LiaLLM) {
       throw new Error("lia-llm konnte nicht geladen werden.")
     }
-    if (window.LiaLLM.version !== "0.5.8") {
-      throw new Error(`lia-llm 0.5.8 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
+    if (window.LiaLLM.version !== "0.5.11") {
+      throw new Error(`lia-llm 0.5.11 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
     }
 
     const options = window.LiaLLM.parseMacroOptions(optionSource)
+    referenceVariants = window.LiaLLM.parseReferenceVariants(referenceSource)
     feedbackEnabled = options.feedback
     if (options.operator && question === "LiaScript-Freitextaufgabe") {
       throw new Error(
@@ -91,7 +101,8 @@ Promise.resolve()
     return window.LiaLLM.evaluate({
       question,
       answer,
-      reference,
+      reference: referenceVariants[0],
+      referenceVariants: referenceVariants.slice(1),
       assessmentEngine: options.assessmentEngine,
       operator: options.operator ?? undefined,
       criterionThreshold: options.passThreshold,
@@ -107,13 +118,32 @@ Promise.resolve()
       maxThinkingTimeMs: options.maxThinkingTimeMs,
       maxThinkingTokens: options.maxThinkingTokens,
       onProgress: progress => {
-        if (!active) return
-        window.LiaLLM?.showActivity?.(activityId, runId, progress.phase)
+        if (!active || finished) return
+        window.LiaLLM?.showActivity?.(activityId, runId, progress.phase, {
+          message: progress.message,
+          thinkingTimeLimitMs: progress.thinkingTimeLimitMs,
+          thinkingTimeRemainingMs: progress.thinkingTimeRemainingMs
+        })
       }
     })
   })
   .then(result => {
     if (!active) return
+    if (result.passed) {
+      const selectedReferenceIndex =
+        Number.isInteger(result.selectedReferenceIndex) &&
+        result.selectedReferenceIndex >= 0 &&
+        result.selectedReferenceIndex < referenceVariants.length
+          ? result.selectedReferenceIndex
+          : 0
+      window.LiaLLM?.setSolutionVariant?.(
+        solutionVariantId,
+        runId,
+        selectedReferenceIndex
+      )
+    } else {
+      clearSolutionVariant()
+    }
     const feedback = feedbackEnabled
       ? window.LiaLLM?.feedbackForResult?.(result, "de-DE") ?? null
       : null
@@ -122,6 +152,7 @@ Promise.resolve()
   })
   .catch(error => {
     if (!active) return
+    clearSolutionVariant()
     const feedback = window.LiaLLM?.feedbackForError?.(error, "de-DE") ?? null
     if (feedback) {
       showLearnerFeedback(feedback.message)
@@ -141,12 +172,25 @@ Promise.resolve()
 <script style="display:block" modify="false">
 const solutionResult = "@input(`lia-llm-result-@0`)"
 const solutionOptions = window.LiaLLM?.parseMacroOptions?.(`@'1`)
-const solutionReference = `@'3`
+const solutionVariantId = "lia-llm-solution-variant-@0"
+const solutionReferenceSource = `@'3`
 const resultSeparator =
   "\n\n<lia-llm-result-separator></lia-llm-result-separator>"
 
 if (solutionResult === "true" && solutionOptions?.solution) {
-  send.liascript(solutionReference + resultSeparator)
+  const solutionReferenceVariants =
+    window.LiaLLM.parseReferenceVariants(solutionReferenceSource)
+  const storedReferenceIndex =
+    window.LiaLLM?.getSolutionVariant?.(solutionVariantId)
+  const selectedReferenceIndex =
+    Number.isInteger(storedReferenceIndex) &&
+    storedReferenceIndex >= 0 &&
+    storedReferenceIndex < solutionReferenceVariants.length
+      ? storedReferenceIndex
+      : 0
+  send.liascript(
+    solutionReferenceVariants[selectedReferenceIndex] + resultSeparator
+  )
 } else if (solutionResult === "true" || solutionResult === "false") {
   send.liascript(resultSeparator)
 } else {
@@ -206,6 +250,39 @@ Wasserstoffbrückennetzwerk eine offene Kristallstruktur, die mehr Volumen einni
 Deshalb schwimmt Eis an der Oberfläche.
 ```
 ````
+
+### Alternative Musterlösungen
+
+Für dieselbe Aufgabe können bis zu acht alternative, jeweils für sich vollständige
+Musterlösungen hinterlegt werden. Sie werden innerhalb desselben Lösungsblocks durch die allein
+stehende Kommentarzeile `<!-- lia-llm:alternative -->` getrennt:
+
+```` markdown
+Aufgabe: Erkläre, warum Eis auf flüssigem Wasser schwimmt.
+
+<!-- data-solution-button="off" data-llm-textarea="5" -->
+[[Antwort]]
+```text @LLMQuiz.question(0.66;solution=1;feedback=1,`Erkläre, warum Eis auf flüssigem Wasser schwimmt.`)
+Eis besitzt eine geringere Dichte als flüssiges Wasser. Deshalb trägt der Auftrieb das Eis
+bereits, bevor es vollständig eintaucht.
+<!-- lia-llm:alternative -->
+Beim Gefrieren entsteht eine offene Kristallstruktur. Dieselbe Masse nimmt dadurch mehr Volumen
+ein, ihre Dichte sinkt unter die von flüssigem Wasser und das Eis schwimmt.
+```
+````
+
+Die Varianten sind vollständige Alternativen mit Oder-Semantik. Die Antwort wird nicht aus
+passenden Einzelteilen mehrerer Varianten zusammengesetzt. Nach einer bestandenen Prüfung zeigt
+der Musterlösungsblock ausschließlich die inhaltlich passendste, von den Autor:innen hinterlegte
+Variante. Bei einem Gleichstand oder falls kein gültiger Auswahlindex vorliegt, wird
+deterministisch die erste Variante verwendet. `solution=0` unterdrückt die Anzeige weiterhin
+vollständig.
+
+Leere oder inhaltlich doppelte Varianten werden abgewiesen. Mehrere Varianten dürfen zusammen
+höchstens 8000 Zeichen enthalten. Die Syntax ist für verschiedene vollständige Lösungswege
+gedacht, nicht für Teilkriterien, Teilpunkte oder unterschiedliche Qualitätsstufen eines
+Erwartungshorizonts. Alle Varianten bleiben wie die bisherige einzelne Musterlösung im
+Kursquelltext und im Browser technisch auffindbar.
 
 `@LLMQuiz.question(...)` muss in derselben Zeile wie die öffnenden drei Backticks stehen. In der nächsten
 Zeile wäre der Aufruf nur Teil der Musterlösung und würde nicht ausgeführt.
@@ -276,6 +353,12 @@ Thinking-Lauf. Die Tokenpresets entsprechen `low=256`, `medium=512`, `high=768`,
 `<think>`-Block als auch das abschließende JSON und gilt als gemeinsames Budget für die gesamte
 Antwort, nicht erneut pro Kriterium. `ultra` ist nur für leistungsfähige Geräte gedacht;
 `extreme` ist eine experimentelle Desktop-Option und keine Empfehlung für Schulgeräte.
+
+Bei „Antwort wird gründlich geprüft …“ zeigt die Aktivitätsanzeige zunächst, wie viel zusätzliche
+Denkzeit bei Bedarf höchstens vorgesehen ist. Erst wenn der adaptive Thinking-Lauf tatsächlich
+beginnt, zählt diese Zeit sekundenweise herunter. Der Zähler ist deshalb keine Zusage für die
+gesamte Antwortzeit: Modellauswahl, Laden und der schnelle Erstdurchlauf liegen außerhalb dieses
+Thinking-Budgets.
 
 Die vorkompilierte WebLLM-Konfiguration von Qwen besitzt ein Kontextfenster von insgesamt 4096
 Tokens. Darin müssen bereits der tokenisierte Prompt und das Chat-Template sowie anschließend
@@ -381,7 +464,10 @@ Für die Fehlerzählung muss das Quality-Modell lokal verfügbar sein; bei Bedar
 dieselben Download-, Cache- und WebGPU-Bedingungen wie für die gründliche Inhaltsprüfung. Ist diese
 Prüfung nicht verfügbar oder liefert sie kein gültiges Ergebnis, bleibt die deterministisch
 ermittelte Wortzahl sichtbar. Die angeforderten Fehlerzahlen werden dann als nicht verfügbar
-gekennzeichnet und nicht fälschlich mit null angegeben.
+gekennzeichnet und nicht fälschlich mit null angegeben. lia-llm wiederholt eine unvollständige
+oder ungültige Modellausgabe einmal mit einer strengeren Reparaturanweisung. Scheitert auch dieser
+Versuch, weist die manuell abgerufene DebugNotiz den Grund als
+`language-analysis-output-invalid` aus, ohne Lernenden- oder Modelltext zu protokollieren.
 
 ## Modelle, Laden und Cache
 
@@ -537,8 +623,9 @@ copy(JSON.stringify(await LiaLLM.debugReport({ print: false }), null, 2))
 
 Die DebugNotiz enthält Browser-, Netzwerk-, Speicher-, Cache- und Artefaktmetadaten, aber keine
 Aufgabenstellung, Musterlösung, Schülerantwort, Response-Bodies, URL-Queryparameter oder
-Zugangsdaten. Für eine Fehlermeldung bitte den vollständigen Block zwischen
-`BEGIN LIA-LLM DEBUGNOTIZ` und `END LIA-LLM DEBUGNOTIZ` mitsenden.
+Zugangsdaten. Sie weist außerdem eine fehlgeschlagene Rechtschreib-/Satzbauausgabe aus, auch wenn
+das Quality-Modell selbst weiterhin bereit ist. Für eine Fehlermeldung bitte den vollständigen
+Block zwischen `BEGIN LIA-LLM DEBUGNOTIZ` und `END LIA-LLM DEBUGNOTIZ` mitsenden.
 
 Der reproduzierbare Cold-/Neustart-/Offline-Härtetest samt Schulnetzbedingungen ist in
 [`test/BROWSER-HARDENING.md`](test/BROWSER-HARDENING.md) dokumentiert.

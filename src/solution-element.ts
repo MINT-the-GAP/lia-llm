@@ -1,5 +1,58 @@
 const solutionById = new Map<string, string>()
+interface SolutionVariantState {
+  runId: string
+  index?: number
+}
+
+const solutionVariantById = new Map<string, SolutionVariantState>()
 const SOLUTION_CONTENT_CLASS = "lia-llm-solution-content"
+
+function normalizedIdentifier(value: string, label: string): string {
+  const normalized = value.trim()
+  if (!normalized) throw new Error(`${label} darf nicht leer sein.`)
+  return normalized
+}
+
+/**
+ * Starts a solution-selection run when `index` is omitted. An index can only
+ * be recorded by the run that is currently active for the solution ID.
+ */
+export function setSolutionVariant(
+  id: string,
+  runId: string,
+  index?: number,
+): void {
+  const normalizedId = normalizedIdentifier(id, "Die Lösungs-ID")
+  const normalizedRunId = normalizedIdentifier(runId, "Die Lauf-ID")
+  if (index !== undefined && (!Number.isInteger(index) || index < 0)) {
+    throw new Error("Der Lösungsvariantenindex muss eine nicht negative ganze Zahl sein.")
+  }
+
+  if (index === undefined) {
+    solutionVariantById.set(normalizedId, { runId: normalizedRunId })
+    return
+  }
+
+  const current = solutionVariantById.get(normalizedId)
+  if (current?.runId !== normalizedRunId) return
+  solutionVariantById.set(normalizedId, {
+    runId: normalizedRunId,
+    index,
+  })
+}
+
+export function getSolutionVariant(id: string): number | undefined {
+  const normalizedId = normalizedIdentifier(id, "Die Lösungs-ID")
+  return solutionVariantById.get(normalizedId)?.index
+}
+
+export function clearSolutionVariant(id: string, runId: string): void {
+  const normalizedId = normalizedIdentifier(id, "Die Lösungs-ID")
+  const normalizedRunId = normalizedIdentifier(runId, "Die Lauf-ID")
+  if (solutionVariantById.get(normalizedId)?.runId === normalizedRunId) {
+    solutionVariantById.delete(normalizedId)
+  }
+}
 
 function ensureSolutionContent(element: HTMLElement): HTMLElement {
   const shadow = element.shadowRoot ?? element.attachShadow({ mode: "open" })

@@ -511,6 +511,42 @@ export function recordDebugFailure(
   }
 }
 
+export function recordDebugLanguageAnalysisFailure(
+  engine: AssessmentEngine,
+  failure: {
+    attempts: number
+    reason: "incomplete-output" | "invalid-output" | "request-error"
+    finishReason: "stop" | "length" | "other" | "missing"
+  },
+): void {
+  appendEvent({
+    kind: "language-analysis",
+    engine,
+    runId: runIdFor(engine),
+    stage: "output-validation",
+    outcome: "unavailable",
+    details: {
+      attempts: failure.attempts,
+      reason: failure.reason,
+      finishReason: failure.finishReason,
+    },
+  })
+}
+
+export function recordDebugLanguageAnalysisCompleted(
+  engine: AssessmentEngine,
+  attempts: number,
+): void {
+  appendEvent({
+    kind: "language-analysis",
+    engine,
+    runId: runIdFor(engine),
+    stage: "output-validation",
+    outcome: "completed",
+    details: { attempts },
+  })
+}
+
 export function instrumentDebugFetch(
   engine: AssessmentEngine,
   baseFetch: FetchLike,
@@ -1255,6 +1291,48 @@ function failureFinding(
   return null
 }
 
+function languageAnalysisFinding(event: DebugTraceEvent): DebugFinding {
+  const attempts = event.details?.attempts
+  const reason = detailText(event.details, "reason")
+  const finishReason = detailText(event.details, "finishReason")
+  const reasonText = reason === "request-error"
+    ? "Die lokale Modellanfrage konnte nicht erfolgreich beendet werden."
+    : reason === "incomplete-output"
+      ? "Die lokale Modellausgabe war unvollständig."
+      : "Die lokale Modellausgabe entsprach nicht dem erwarteten JSON-Vertrag."
+  const evidence = [
+    (typeof attempts === "number" ? attempts : 0) +
+      " Sprachprüfungsversuche; finish_reason=" +
+      (finishReason ?? "missing") + ".",
+  ]
+  return {
+    code: reason === "request-error"
+      ? "language-analysis-request-failed"
+      : "language-analysis-output-invalid",
+    severity: "warning",
+    confidence: "high",
+    title: "Die Sprachstatistik wurde nicht abgeschlossen.",
+    analysis:
+      reasonText +
+      " Die fachliche Auswertung bleibt davon unberührt; nur die angeforderten Fehlerzahlen fehlen.",
+    action:
+      "Die Aufgabe erneut prüfen. Tritt die Meldung wieder auf, die vollständige DebugNotiz weitergeben.",
+    evidence,
+  }
+}
+
+function languageAnalysisWasSuperseded(
+  event: DebugTraceEvent,
+  events: readonly DebugTraceEvent[],
+): boolean {
+  return events.some((candidate) =>
+    candidate.kind === "language-analysis" &&
+    candidate.sequence > event.sequence &&
+    candidate.runId === event.runId &&
+    candidate.engine === event.engine,
+  )
+}
+
 function runtimeFailureFinding(runtime: RuntimeStatus | null): DebugFinding | null {
   if (runtime?.phase !== "error" || !runtime.error) return null
   const message = canonicalErrorSignature(
@@ -1356,6 +1434,12 @@ export function classifyDebugFindings(
       !responseWasRecovered(event, events)
     ) {
       finding = httpFinding(event)
+    } else if (
+      event.kind === "language-analysis" &&
+      event.outcome === "unavailable" &&
+      !languageAnalysisWasSuperseded(event, events)
+    ) {
+      finding = languageAnalysisFinding(event)
     } else if (event.kind === "failure") {
       finding = failureFinding(event, environment)
     }
@@ -1650,7 +1734,7 @@ export function printDebugReport(report: LiaLLMDebugReport): void {
   const primary = report.findings.find((finding) =>
     finding.code === report.primaryCause,
   )
-  const hasStorageWarning =
+  const hasWarning =
     report.outcome !== "failed" &&
     primary !== undefined &&
     primary.severity !== "info"
@@ -1658,22 +1742,22 @@ export function printDebugReport(report: LiaLLMDebugReport): void {
     ? "Das " + model + " konnte nicht geladen werden."
     : report.outcome === "cache-incomplete"
       ? "Das " + model + " wurde geladen, aber nicht vollst\u00e4ndig gecacht."
-      : hasStorageWarning
-        ? "Das " + model + " wurde geladen; die Cache-Diagnose meldet ein Problem."
+      : hasWarning
+        ? "Das " + model + " wurde geladen; die Diagnose meldet ein Problem."
         : "Diagnose f\u00fcr das " + model + "."
   const logHeadline = report.outcome === "failed"
     ? console.error
-    : report.outcome === "cache-incomplete" || hasStorageWarning
+    : report.outcome === "cache-incomplete" || hasWarning
       ? console.warn
       : console.info
   const marker = report.outcome === "failed"
     ? "\u274c"
-    : report.outcome === "cache-incomplete" || hasStorageWarning
+    : report.outcome === "cache-incomplete" || hasWarning
       ? "\u26a0\ufe0f"
       : "\u2139\ufe0f"
   const headlineStyle = report.outcome === "failed"
     ? "color:#b00020;font-weight:bold"
-    : report.outcome === "cache-incomplete" || hasStorageWarning
+    : report.outcome === "cache-incomplete" || hasWarning
       ? "color:#9a6700;font-weight:bold"
       : "color:#0969da;font-weight:bold"
   logHeadline.call(

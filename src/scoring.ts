@@ -26,6 +26,8 @@ export const LEGACY_MACRO_QUESTION = "LiaScript-Freitextaufgabe"
 
 const MAX_CRITERIA = 16
 const MAX_VARIANTS = 8
+const MAX_REFERENCE_VARIANTS = 8
+const MAX_COMBINED_REFERENCE_CHARACTERS = 8_000
 const MAX_TEXT_CHARACTERS = 8_000
 const MAX_CHUNK_CHARACTERS = 700
 const MAX_CHUNKS = 24
@@ -68,6 +70,87 @@ export function normalizeAnswerText(value: string): string {
     .join("\n")
     .replace(/\n{3,}/gu, "\n\n")
     .trim()
+}
+
+const REFERENCE_VARIANT_SEPARATOR =
+  /^[\t ]*<!--[\t ]*lia-llm(?::alternative|-(?:variant|variante))[\t ]*-->[\t ]*$/gimu
+
+function trimReferenceBoundaryLines(value: string): string {
+  return value
+    .replace(/^(?:[\t ]*\n)+/u, "")
+    .replace(/(?:\n[\t ]*)+$/u, "")
+}
+
+export function parseReferenceVariants(source: string): string[] {
+  if (typeof source !== "string") {
+    throw new Error("Die Musterlösung muss Text sein.")
+  }
+  const variants = source
+    .normalize("NFC")
+    .replace(/\r\n?|[\u2028\u2029]/gu, "\n")
+    .split(REFERENCE_VARIANT_SEPARATOR)
+    .map(trimReferenceBoundaryLines)
+
+  if (variants.length > MAX_REFERENCE_VARIANTS) {
+    throw new Error(
+      `Es sind höchstens ${MAX_REFERENCE_VARIANTS} vollständige Musterlösungsvarianten erlaubt.`,
+    )
+  }
+  const normalized = variants.map((variant, index) => {
+    const value = normalizeAnswerText(variant)
+    if (!value) {
+      throw new Error(`Musterlösungsvariante ${index + 1} ist leer.`)
+    }
+    return normalizeText(value)
+  })
+  if (new Set(normalized).size !== normalized.length) {
+    throw new Error("Musterlösungsvarianten müssen sich inhaltlich unterscheiden.")
+  }
+  if (
+    variants.length > 1 &&
+    normalized.reduce((total, value) => total + value.length, 0) >
+      MAX_COMBINED_REFERENCE_CHARACTERS
+  ) {
+    throw new Error(
+      `Mehrere Musterlösungsvarianten dürfen zusammen höchstens ${MAX_COMBINED_REFERENCE_CHARACTERS} Zeichen enthalten.`,
+    )
+  }
+  return variants
+}
+
+const REFERENCE_STATUS_RANK: Record<CriterionStatus, number> = {
+  met: 3,
+  uncertain: 2,
+  missed: 1,
+  contradicted: 0,
+}
+
+export function bestReferenceVariantIndex(
+  candidates: readonly CriterionResult[],
+): number {
+  if (candidates.length === 0) {
+    throw new Error("Mindestens eine bewertete Musterlösungsvariante wird benötigt.")
+  }
+  let bestIndex = 0
+  for (let index = 1; index < candidates.length; index += 1) {
+    const candidate = candidates[index]!
+    const best = candidates[bestIndex]!
+    const rankDifference =
+      REFERENCE_STATUS_RANK[candidate.status] -
+      REFERENCE_STATUS_RANK[best.status]
+    const candidateMargin = candidate.entailment - candidate.contradiction
+    const bestMargin = best.entailment - best.contradiction
+    if (
+      rankDifference > 0 ||
+      (rankDifference === 0 && candidateMargin > bestMargin) ||
+      (rankDifference === 0 &&
+        candidateMargin === bestMargin &&
+        candidate.entailment > best.entailment)
+    ) {
+      bestIndex = index
+    }
+  }
+  return bestIndex
 }
 
 export function clamp01(value: number): number {
@@ -193,7 +276,39 @@ function normalizeCriterion(
 export function normalizeRequest(request: EvaluationRequest): NormalizedEvaluationRequest {
   const question = normalizeText(request.question)
   const answer = normalizeAnswerText(request.answer)
-  const reference = normalizeAnswerText(request.reference)
+  if (
+    request.referenceVariants !== undefined &&
+    (!Array.isArray(request.referenceVariants) ||
+      request.referenceVariants.some((variant) => typeof variant !== "string"))
+  ) {
+    throw new Error("referenceVariants muss ein Array aus Texten sein.")
+  }
+  const authoredReferences = [
+    ...parseReferenceVariants(request.reference),
+    ...(request.referenceVariants ?? []).flatMap((variant) =>
+      parseReferenceVariants(variant)
+    ),
+  ]
+  if (authoredReferences.length > MAX_REFERENCE_VARIANTS) {
+    throw new Error(
+      `Es sind höchstens ${MAX_REFERENCE_VARIANTS} vollständige Musterlösungsvarianten erlaubt.`,
+    )
+  }
+  const references = authoredReferences.map(normalizeAnswerText)
+  const comparableReferences = references.map(normalizeText)
+  if (new Set(comparableReferences).size !== comparableReferences.length) {
+    throw new Error("Musterlösungsvarianten müssen sich inhaltlich unterscheiden.")
+  }
+  if (
+    references.length > 1 &&
+    comparableReferences.reduce((total, value) => total + value.length, 0) >
+      MAX_COMBINED_REFERENCE_CHARACTERS
+  ) {
+    throw new Error(
+      `Mehrere Musterlösungsvarianten dürfen zusammen höchstens ${MAX_COMBINED_REFERENCE_CHARACTERS} Zeichen enthalten.`,
+    )
+  }
+  const reference = references[0] ?? ""
   const operator = resolveOperatorRubric(request.operator)
   const languageAnalysis = normalizeLanguageAnalysisOptions(
     request.languageAnalysis,
@@ -242,6 +357,11 @@ export function normalizeRequest(request: EvaluationRequest): NormalizedEvaluati
   )
 
   const explicitCriteria = parseCriteria(request.criteria)
+  if (explicitCriteria && references.length > 1) {
+    throw new Error(
+      "Mehrere vollständige Musterlösungsvarianten können nicht gleichzeitig mit criteria verwendet werden.",
+    )
+  }
   const mode: EvaluationMode = explicitCriteria ? "criteria" : "holistic"
   const rawCriteria = explicitCriteria ?? [
     {
@@ -269,6 +389,7 @@ export function normalizeRequest(request: EvaluationRequest): NormalizedEvaluati
     question,
     answer,
     reference,
+    references,
     operator,
     mode,
     criteria,

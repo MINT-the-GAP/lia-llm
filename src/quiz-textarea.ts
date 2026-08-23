@@ -116,8 +116,12 @@ function normalizedAccessibleText(value: string | null | undefined): string {
   return (value ?? "").replace(/\s+/gu, " ").trim()
 }
 
+export function parseAriaReferenceIds(value: string | null): string[] {
+  return (value ?? "").trim().split(/\s+/u).filter(Boolean)
+}
+
 function ariaReferenceText(input: HTMLInputElement, attribute: string): string {
-  const ids = (input.getAttribute(attribute) ?? "").trim().split(/\s+/u)
+  const ids = parseAriaReferenceIds(input.getAttribute(attribute))
   const texts = ids
     .map((id) =>
       normalizedAccessibleText(input.ownerDocument.getElementById(id)?.textContent),

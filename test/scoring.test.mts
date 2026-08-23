@@ -6,15 +6,23 @@ import { env } from "@huggingface/transformers"
 import * as webLlm from "../src/generated/webllm.js"
 import {
   aggregateCriteria,
+  bestReferenceVariantIndex,
   chunkAnswer,
   classifyCriterion,
   evaluationAnswerContexts,
   normalizeAnswerText,
   normalizeRequest,
   parseCriteria,
+  parseReferenceVariants,
   splitReference,
 } from "../src/scoring.ts"
 import { AutomaticEvaluator } from "../src/automatic-evaluator.ts"
+import { activityCountdownSeconds } from "../src/activity-element.ts"
+import {
+  clearSolutionVariant,
+  getSolutionVariant,
+  setSolutionVariant,
+} from "../src/solution-element.ts"
 import { countWords } from "../src/language-analysis.ts"
 import {
   PINNED_RUNTIME_ASSET_BASE_URL,
@@ -53,6 +61,7 @@ import {
 import {
   fromQuizInputValue,
   isQuizTextareaNavigationKey,
+  parseAriaReferenceIds,
   parseTextareaRows,
   toQuizInputValue,
 } from "../src/quiz-textarea.ts"
@@ -85,6 +94,7 @@ import {
   isFatalQualityEngineError,
   isQualityOutputError,
   isRecoverableQualityRequestError,
+  LANGUAGE_ANALYSIS_POST_DATA_INSTRUCTION,
   LANGUAGE_ANALYSIS_SYSTEM_PROMPT,
   parseLanguageJudgeOutput,
   parseQualityJudgeOutput,
@@ -94,6 +104,7 @@ import {
   qualityDiagnosticForCriteria,
   QUALITY_POST_DATA_INSTRUCTION,
   QUALITY_SYSTEM_PROMPT,
+  validateSelectedReferenceIndex,
   validateOperatorJudgeOutput,
 } from "../src/quality-evaluator.ts"
 import type {
@@ -102,7 +113,8 @@ import type {
   DebugEnvironment,
   DebugStorageSummary,
   DebugTraceEvent,
-  EvaluationProgressPhase,
+  EvaluationOptions,
+  EvaluationProgress,
   EvaluationRequest,
   EvaluationResult,
   ModelCacheInfo,
@@ -460,6 +472,65 @@ function debugFindingCodes(
     (finding) => finding.code,
   )
 }
+
+test("language diagnostics keep only the latest analysis outcome", () => {
+  const invalid = debugEvent({
+    kind: "language-analysis",
+    engine: "quality",
+    runId: "quality-language",
+    outcome: "unavailable",
+    details: {
+      attempts: 2,
+      reason: "invalid-output",
+      finishReason: "stop",
+    },
+  })
+  const completed = debugEvent(
+    {
+      kind: "language-analysis",
+      engine: "quality",
+      runId: "quality-language",
+      outcome: "completed",
+      details: { attempts: 1 },
+    },
+    2,
+  )
+  assert.equal(
+    classifyDebugFindings(
+      [invalid, completed],
+      DEBUG_ENVIRONMENT,
+      DEBUG_STORAGE,
+      null,
+    ).some((finding) => finding.code.startsWith("language-analysis-")),
+    false,
+  )
+
+  const requestFailure = debugEvent(
+    {
+      kind: "language-analysis",
+      engine: "quality",
+      runId: "quality-language",
+      outcome: "unavailable",
+      details: {
+        attempts: 2,
+        reason: "request-error",
+        finishReason: "missing",
+      },
+    },
+    3,
+  )
+  assert.deepEqual(
+    classifyDebugFindings(
+      [invalid, completed, requestFailure],
+      DEBUG_ENVIRONMENT,
+      DEBUG_STORAGE,
+      null,
+    )
+      .filter((finding) => finding.code.startsWith("language-analysis-"))
+      .map((finding) => finding.code),
+    ["language-analysis-request-failed"],
+  )
+})
 
 test("debug diagnostics classify network, proxy, size, and integrity failures", () => {
   const cases: Array<{
@@ -1679,6 +1750,136 @@ test("parseCriteria accepts weighted JSON criteria and NLI thresholds", () => {
   assert.deepEqual(criteria?.[0]?.acceptedVariants, ["geringere Dichte"])
 })
 
+test("parseReferenceVariants preserves legacy text and authored LiaScript markup", () => {
+  const legacy =
+    "Erster Absatz mit $a^2$.\n\n- erster Punkt\n- zweiter Punkt\n\n$$b^2$$"
+  assert.deepEqual(parseReferenceVariants(legacy), [legacy])
+
+  const authored = [
+    "Erster Absatz mit $a^2$.",
+    "",
+    "- erster Punkt",
+    "",
+    "<!-- lia-llm:alternative -->",
+    "",
+    "## Zweiter Lösungsweg",
+    "",
+    "$$b^2$$",
+  ].join("\r\n")
+  assert.deepEqual(parseReferenceVariants(authored), [
+    "Erster Absatz mit $a^2$.\n\n- erster Punkt",
+    "## Zweiter Lösungsweg\n\n$$b^2$$",
+  ])
+  assert.deepEqual(
+    parseReferenceVariants(
+      "Der Text nennt <!-- lia-llm:alternative --> nur als Beispiel.",
+    ),
+    ["Der Text nennt <!-- lia-llm:alternative --> nur als Beispiel."],
+  )
+})
+
+test("parseReferenceVariants rejects empty, duplicate, and excessive alternatives", () => {
+  assert.throws(
+    () =>
+      parseReferenceVariants(
+        "Erste Lösung\n<!-- lia-llm:alternative -->\n\n",
+      ),
+    /Musterlösungsvariante 2 ist leer/u,
+  )
+  assert.throws(
+    () =>
+      parseReferenceVariants(
+        "Gleiche Lösung\n<!-- lia-llm:alternative -->\nGleiche Lösung",
+      ),
+    /inhaltlich unterscheiden/u,
+  )
+  assert.throws(
+    () =>
+      parseReferenceVariants(
+        Array.from({ length: 9 }, (_, index) => `Lösung ${index + 1}`).join(
+          "\n<!-- lia-llm:alternative -->\n",
+        ),
+      ),
+    /höchstens 8/u,
+  )
+  assert.throws(
+    () => parseReferenceVariants(null as never),
+    /Musterlösung muss Text/u,
+  )
+})
+
+test("normalizeRequest combines authored and API reference variants holistically", () => {
+  const normalized = normalizeRequest({
+    question: "Wie kann die Aufgabe gelöst werden?",
+    answer: "Die Antwort verwendet den dritten vollständigen Lösungsweg.",
+    reference:
+      "Erster Lösungsweg.\n<!-- lia-llm:alternative -->\nZweiter Lösungsweg.",
+    referenceVariants: ["Dritter vollständiger Lösungsweg."],
+  })
+
+  assert.equal(normalized.mode, "holistic")
+  assert.equal(normalized.reference, "Erster Lösungsweg.")
+  assert.deepEqual(normalized.references, [
+    "Erster Lösungsweg.",
+    "Zweiter Lösungsweg.",
+    "Dritter vollständiger Lösungsweg.",
+  ])
+  assert.equal(normalized.criteria.length, 1)
+  assert.equal(normalized.criteria[0]?.text, "Erster Lösungsweg.")
+  assert.deepEqual(normalized.criteria[0]?.acceptedVariants, [])
+
+  assert.throws(
+    () =>
+      normalizeRequest({
+        question: "Wie kann die Aufgabe gelöst werden?",
+        answer: "Die Antwort ist lang genug für eine Auswertung.",
+        reference: "Erster Lösungsweg.",
+        referenceVariants: ["Zweiter Lösungsweg."],
+        criteria: [{ text: "Ein explizites Kriterium." }],
+      }),
+    /nicht gleichzeitig mit criteria/u,
+  )
+})
+
+test("bestReferenceVariantIndex ranks status, margin, entailment, and author order", () => {
+  const candidate = (
+    id: string,
+    status: CriterionResult["status"],
+    entailment: number,
+    contradiction: number,
+  ): CriterionResult => ({
+    ...result(id, status, true),
+    entailment,
+    contradiction,
+  })
+
+  assert.equal(
+    bestReferenceVariantIndex([
+      candidate("met", "met", 0.56, 0.4),
+      candidate("uncertain", "uncertain", 0.99, 0),
+    ]),
+    0,
+  )
+  assert.equal(
+    bestReferenceVariantIndex([
+      candidate("weak", "missed", 0.2, 0.15),
+      candidate("closer", "missed", 0.45, 0.1),
+    ]),
+    1,
+  )
+  assert.equal(
+    bestReferenceVariantIndex([
+      candidate("first", "met", 0.9, 0.01),
+      candidate("second", "met", 0.9, 0.01),
+    ]),
+    0,
+  )
+  assert.throws(
+    () => bestReferenceVariantIndex([]),
+    /Mindestens eine bewertete Musterlösungsvariante/u,
+  )
+})
+
 test("normalizeRequest keeps the full reference as one holistic criterion", () => {
   const request = normalizeRequest({
     question: "Warum schwimmt Eis?",
@@ -2115,6 +2316,53 @@ test("quality judge accepts strict structured decisions only", () => {
   assert.throws(() => parseQualityJudgeOutput("not-json"), /JSON/u)
 })
 
+test("quality judge parses and bounds the selected complete reference index", () => {
+  const selected = parseQualityJudgeOutput(
+    '{"decision":"pass","confidence":0.93,"feedback_code":"none","operator_criterion_id":"","selected_reference_index":1}',
+  )
+  assert.equal(selected.selectedReferenceIndex, 1)
+  assert.equal(
+    validateSelectedReferenceIndex(selected, 2).selectedReferenceIndex,
+    1,
+  )
+
+  const legacySingle = parseQualityJudgeOutput(
+    '{"decision":"pass","confidence":0.93,"feedback_code":"none","operator_criterion_id":""}',
+  )
+  assert.equal(legacySingle.selectedReferenceIndex, undefined)
+  assert.equal(
+    validateSelectedReferenceIndex(legacySingle, 1).selectedReferenceIndex,
+    0,
+  )
+  assert.throws(
+    () => validateSelectedReferenceIndex(legacySingle, 2),
+    /Musterlösungsvariante|selected_reference_index/u,
+  )
+
+  for (const invalidIndex of [-1, 2, 1.5, "1", null]) {
+    assert.throws(
+      () => {
+        const output = parseQualityJudgeOutput(
+          JSON.stringify({
+            decision: "pass",
+            confidence: 0.93,
+            feedback_code: "none",
+            operator_criterion_id: "",
+            selected_reference_index: invalidIndex,
+          }),
+        )
+        validateSelectedReferenceIndex(output, 2)
+      },
+      /Musterlösungs(?:variante|index)|selected_reference_index|ganzzahl/u,
+      String(invalidIndex),
+    )
+  }
+  assert.throws(
+    () => validateSelectedReferenceIndex(selected, 0),
+    /variantCount|Musterlösungsvariante|positive/u,
+  )
+})
+
 test("quality judge tolerates WebLLM thinking prefixes and JSON fences", () => {
   assert.deepEqual(
     parseQualityJudgeOutput(
@@ -2405,6 +2653,57 @@ test('QualityEvaluator sends correct rebuttals through the model', async () => {
   assert.equal(calls, answers.length)
 })
 
+test('QualityEvaluator forwards complete alternatives and selects the judged variant', async () => {
+  const firstReference =
+    'Referenz A beschreibt eine erste vollstaendige fachliche Loesungsalternative.'
+  const secondReference =
+    'Referenz B beschreibt eine zweite vollstaendige fachliche Loesungsalternative.'
+  const prompts: string[] = []
+  const engine = {
+    interruptGenerate: async () => undefined,
+    chat: { completions: { create: async (request: {
+      messages?: Array<{ content?: string }>
+    }) => {
+      prompts.push(
+        request.messages?.map((message) => message.content ?? '').join('\n') ?? '',
+      )
+      return {
+        choices: [{
+          finish_reason: 'stop',
+          message: {
+            content:
+              '{"decision":"pass","confidence":0.93,"feedback_code":"none","operator_criterion_id":"","selected_reference_index":1}',
+          },
+        }],
+      }
+    } } },
+  }
+  const evaluator = new QualityEvaluator()
+  ;(evaluator as unknown as { engine: typeof engine | null }).engine = engine
+
+  const result = await evaluator.evaluate(
+    {
+      question: 'Welche der beiden vollstaendigen Alternativen passt zur Antwort?',
+      answer:
+        'Die Lernendenantwort passt eindeutig zur zweiten vollstaendigen Alternative B.',
+      reference: firstReference,
+      referenceVariants: [secondReference],
+    },
+    { maxThinkingTimeMs: 0 },
+  )
+
+  assert.equal(prompts.length, 1)
+  assert.ok(
+    prompts[0]?.includes(
+      '"erwartungshorizonte":' +
+        JSON.stringify([firstReference, secondReference]),
+    ),
+  )
+  assert.equal(result.selectedReferenceIndex, 1)
+  assert.equal(result.criteria[0]?.selectedReferenceIndex, 1)
+  assert.equal(result.criteria[0]?.supportEvidence.hypothesis, secondReference)
+})
+
 test('QualityEvaluator sends legitimate assessment-data content through the model', async () => {
   let calls = 0
   const engine = {
@@ -2654,6 +2953,7 @@ test('QualityEvaluator uses one bounded thinking repair after invalid baseline J
 
 test('QualityEvaluator adaptively refines long answers with bounded thinking', async () => {
   const requests: Array<Record<string, unknown>> = []
+  const thinkingProgress: EvaluationProgress[] = []
   const outputs = [
     '{"decision":"pass","confidence":0.71,"feedback_code":"none","operator_criterion_id":""}',
     '<think>Die Aussagen werden im Zusammenhang geprüft.</think>' +
@@ -2688,7 +2988,11 @@ test('QualityEvaluator adaptively refines long answers with bounded thinking', a
       answer: longAnswer,
       reference: 'Die vollständige fachliche Erklärung steht hier.',
     },
-    { maxThinkingTimeMs: 5_000, maxThinkingTokens: 768 },
+    {
+      maxThinkingTimeMs: 5_000,
+      maxThinkingTokens: 768,
+      onProgress: (progress) => thinkingProgress.push({ ...progress }),
+    },
   )
 
   assert.equal(requests.length, 2)
@@ -2736,6 +3040,17 @@ test('QualityEvaluator adaptively refines long answers with bounded thinking', a
   assert.equal(requests[1]?.temperature, 0.6)
   assert.equal(requests[1]?.top_p, 0.95)
   assert.equal(result.criteria[0]?.judgeConfidence, 0.97)
+  assert.deepEqual(
+    thinkingProgress.map((progress) => ({
+      phase: progress.phase,
+      limit: progress.thinkingTimeLimitMs,
+      remaining: progress.thinkingTimeRemainingMs,
+    })),
+    [
+      { phase: "evaluating-quality", limit: 5_000, remaining: 5_000 },
+      { phase: "evaluating-quality", limit: undefined, remaining: undefined },
+    ],
+  )
 
   outputs.push(
     '{"decision":"pass","confidence":0.71,"feedback_code":"none","operator_criterion_id":""}',
@@ -2867,6 +3182,7 @@ test('QualityEvaluator interrupts thinking on abort and releases its queue', asy
 
 test('maxThinkingTimeMs zero disables thinking even for long answers', async () => {
   let calls = 0
+  const progressEvents: EvaluationProgress[] = []
   const engine = {
     interruptGenerate: async () => undefined,
     chat: { completions: { create: async () => {
@@ -2889,9 +3205,13 @@ test('maxThinkingTimeMs zero disables thinking even for long answers', async () 
       answer: Array.from({ length: 45 }, (_, index) => `Aussage${index}`).join(' '),
       reference: 'Die vollständige fachliche Erklärung steht hier.',
     },
-    { maxThinkingTimeMs: 0 },
+    {
+      maxThinkingTimeMs: 0,
+      onProgress: (progress) => progressEvents.push({ ...progress }),
+    },
   )
   assert.equal(calls, 1)
+  assert.deepEqual(progressEvents, [])
 })
 
 test('QualityEvaluator keeps length-limited content output recoverable and retries later', async () => {
@@ -3133,6 +3453,170 @@ test("QualityEvaluator language-only analysis skips content judges", async () =>
     punctuationErrors: 0,
     syntaxErrors: 0,
   })
+})
+
+test("QualityEvaluator repairs invalid language output and accepts a complete length result", async () => {
+  const requests: Array<{
+    messages: Array<{ role: string; content: string }>
+    seed?: number
+    max_tokens?: number
+    response_format?: unknown
+  }> = []
+  const outputs = [
+    '{"spelling_errors":1',
+    '{"spelling_errors":1,"punctuation_errors":0,"syntax_errors":0}',
+  ]
+  const engine = {
+    chat: {
+      completions: {
+        create: async (request: {
+          messages: Array<{ role: string; content: string }>
+          seed?: number
+          max_tokens?: number
+          response_format?: unknown
+        }) => {
+          requests.push(request)
+          return {
+            choices: [
+              {
+                finish_reason: "length",
+                message: { content: outputs.shift() },
+              },
+            ],
+          }
+        },
+      },
+    },
+  }
+  const evaluator = new QualityEvaluator()
+  ;(evaluator as unknown as { engine: typeof engine | null }).engine = engine
+
+  const analysis = await evaluator.evaluateLanguage({
+    question: "Erkläre den Zusammenhang.",
+    answer: "Eis schwimt.",
+    reference: "Eis schwimmt.",
+    languageAnalysis: { spelling: true, syntax: true },
+  })
+
+  assert.deepEqual(analysis, {
+    spelling: true,
+    syntax: true,
+    status: "completed",
+    wordCount: 2,
+    spellingErrors: 1,
+    punctuationErrors: 0,
+    syntaxErrors: 0,
+  })
+  assert.equal(requests.length, 2)
+  assert.match(
+    requests[0]?.messages[1]?.content ?? "",
+    /BEGIN_UNTRUSTED_LANGUAGE_DATA_JSON/u,
+  )
+  assert.equal(
+    (requests[0]?.messages[1]?.content ?? "").includes(
+      LANGUAGE_ANALYSIS_POST_DATA_INSTRUCTION,
+    ),
+    true,
+  )
+  assert.doesNotMatch(
+    requests[0]?.messages[1]?.content ?? "",
+    /Reparaturhinweis/u,
+  )
+  assert.match(
+    requests[1]?.messages[1]?.content ?? "",
+    /Reparaturhinweis/u,
+  )
+  assert.notEqual(requests[0]?.messages[1]?.content, requests[1]?.messages[1]?.content)
+  assert.equal(requests[0]?.seed, 19)
+  assert.equal(requests[1]?.seed, 29)
+  assert.equal(requests[0]?.max_tokens, 160)
+  assert.equal(requests[0]?.response_format, undefined)
+})
+
+test("terminal language output failure is diagnosed without learner or response text", async () => {
+  const answerCanary = "LANGUAGE_ANSWER_SECRET_4e71"
+  const responseCanary = "LANGUAGE_RESPONSE_SECRET_92bd"
+  let calls = 0
+  beginDebugLoad("quality")
+  const engine = {
+    chat: {
+      completions: {
+        create: async () => {
+          calls += 1
+          return {
+            choices: [
+              {
+                finish_reason: "stop",
+                message: { content: "not-json " + responseCanary },
+              },
+            ],
+          }
+        },
+      },
+    },
+  }
+  const evaluator = new QualityEvaluator()
+  ;(evaluator as unknown as { engine: typeof engine | null }).engine = engine
+
+  const analysis = await evaluator.evaluateLanguage({
+    question: "Prüfe die Sprache.",
+    answer: "Antwort " + answerCanary,
+    reference: "Korrekte Formulierung.",
+    languageAnalysis: { spelling: true, syntax: true },
+  })
+  assert.equal(calls, 2)
+  assert.equal(analysis?.status, "unavailable")
+
+  const report = await createDebugReport(
+    {
+      version: "0.5.10",
+      getStatus: () => ({
+        phase: "ready",
+        assessmentEngine: "quality",
+        modelId: "test/quality",
+        revision: "test",
+        device: "webgpu",
+        dtype: "q4f16",
+      }),
+      getCacheInfo: async () => ({
+        supported: true,
+        cached: true,
+        downloadCached: true,
+        filesCached: 4,
+        filesTotal: 4,
+        estimatedBytes: 1,
+      }),
+    },
+    { print: false },
+  )
+  const serialized = JSON.stringify(report)
+  assert.equal(report.outcome, "ready")
+  assert.equal(
+    report.findings.some(
+      (finding) => finding.code === "language-analysis-output-invalid",
+    ),
+    true,
+  )
+  assert.equal(
+    report.findings.find(
+      (finding) => finding.code === "language-analysis-output-invalid",
+    )?.severity,
+    "warning",
+  )
+  assert.deepEqual(
+    report.events.find(
+      (event) =>
+        event.kind === "language-analysis" &&
+        event.outcome === "unavailable",
+    )?.details,
+    {
+      attempts: 2,
+      reason: "invalid-output",
+      finishReason: "stop",
+    },
+  )
+  assert.equal(serialized.includes(answerCanary), false)
+  assert.equal(serialized.includes(responseCanary), false)
 })
 
 test("quality judge validates operator criterion ids against the active profile", () => {
@@ -4796,6 +5280,59 @@ test("SemanticEvaluator wires normalized operators into compact fail-safe", asyn
   })
 })
 
+test("SemanticEvaluator selects one complete reference without cross-variant contradiction", async () => {
+  const evaluator = new SemanticEvaluator()
+  const firstReference =
+    "Die Lösung verwendet ausschließlich den ersten Rechenweg."
+  const secondReference =
+    "Die Lösung verwendet ausschließlich den zweiten Rechenweg."
+  const seenHypotheses: string[] = []
+  const mocked = evaluator as unknown as {
+    preload(): Promise<RuntimeStatus>
+    classifyPairs(
+      pairs: readonly { premise: string; hypothesis: string }[],
+    ): Promise<NliEvidence[]>
+  }
+  mocked.preload = async () => evaluator.getStatus()
+  mocked.classifyPairs = async (pairs) =>
+    pairs.map((pair) => {
+      seenHypotheses.push(pair.hypothesis)
+      if (pair.hypothesis === firstReference) {
+        return {
+          text: pair.premise,
+          hypothesis: pair.hypothesis,
+          entailment: 0.01,
+          neutral: 0.01,
+          contradiction: 0.98,
+        }
+      }
+      assert.equal(pair.hypothesis, secondReference)
+      return {
+        text: pair.premise,
+        hypothesis: pair.hypothesis,
+        entailment: 0.98,
+        neutral: 0.01,
+        contradiction: 0.01,
+      }
+    })
+
+  const evaluation = await evaluator.evaluate({
+    question: "Welchen Rechenweg hast du verwendet?",
+    answer:
+      "Ich habe ausschließlich den zweiten Rechenweg verwendet und den ersten nicht benutzt.",
+    reference: firstReference,
+    referenceVariants: [secondReference],
+  })
+
+  assert.deepEqual(seenHypotheses, [firstReference, secondReference])
+  assert.equal(evaluation.passed, true)
+  assert.equal(evaluation.status, "passed")
+  assert.equal(evaluation.selectedReferenceIndex, 1)
+  assert.equal(evaluation.criteria[0]?.selectedReferenceIndex, 1)
+  assert.equal(evaluation.criteria[0]?.supportEvidence.hypothesis, secondReference)
+  assert.equal(evaluation.criteria[0]?.contradiction, 0.01)
+})
+
 test("operator-not-met blocks fractional quality passing but keeps low confidence uncertain", () => {
   const met = result("content", "met", false)
   const missedOperator = result("form", "missed", false)
@@ -6402,9 +6939,26 @@ test("automatic evaluator rechecks an explicit quality request after the compact
       return this.status
     }
 
-    async evaluate(request: EvaluationRequest) {
+    async evaluate(
+      request: EvaluationRequest,
+      options?: EvaluationOptions,
+    ) {
       this.evaluateCalls += 1
       this.requests.push({ ...request })
+      if (this.status.assessmentEngine === "quality") {
+        options?.onProgress?.({
+          phase: "evaluating-quality",
+          engine: "quality",
+          message: "Antwort wird gründlich geprüft …",
+          thinkingTimeLimitMs: 5_000,
+          thinkingTimeRemainingMs: 5_000,
+        })
+        options?.onProgress?.({
+          phase: "evaluating-quality",
+          engine: "quality",
+          message: "Antwort wird gründlich geprüft …",
+        })
+      }
       const criterionStatus =
         this.resultStatus === "passed"
           ? "met"
@@ -6469,12 +7023,12 @@ test("automatic evaluator rechecks an explicit quality request after the compact
     criterionThreshold: 0.66,
     assessmentEngine: "quality",
   }
-  const phases: EvaluationProgressPhase[] = []
+  const progressEvents: EvaluationProgress[] = []
 
   try {
     const automatic = new AutomaticEvaluator(compact as never, quality as never)
     const resultValue = await automatic.evaluate(request, {
-      onProgress: (progress) => phases.push(progress.phase),
+      onProgress: (progress) => progressEvents.push({ ...progress }),
     })
 
     assert.equal(resultValue.passed, true)
@@ -6485,13 +7039,26 @@ test("automatic evaluator rechecks an explicit quality request after the compact
     assert.equal(quality.requests[0]?.answer, request.answer)
     assert.equal(compact.requests[0]?.reference, request.reference)
     assert.equal(quality.requests[0]?.reference, request.reference)
-    assert.deepEqual(phases, [
+    assert.deepEqual(progressEvents.map((progress) => progress.phase), [
       "selecting-model",
       "preparing-compact",
       "evaluating-compact",
       "preparing-quality",
       "evaluating-quality",
+      "evaluating-quality",
+      "evaluating-quality",
     ])
+    assert.deepEqual(
+      progressEvents.slice(-3).map((progress) => ({
+        limit: progress.thinkingTimeLimitMs,
+        remaining: progress.thinkingTimeRemainingMs,
+      })),
+      [
+        { limit: 15_000, remaining: undefined },
+        { limit: 5_000, remaining: 5_000 },
+        { limit: undefined, remaining: undefined },
+      ],
+    )
 
     const abortCompact = new StagedMockEvaluator(
       "compact-abort-test",
@@ -6750,7 +7317,71 @@ test("formatResult hides criterion details by default but keeps them available",
   assert.match(detailed, /Bestätigung:/u)
 })
 
-test("the public version remains pinned exactly to 0.5.8", () => {
+test("activity countdown rounds remaining wall time up to whole seconds", () => {
+  assert.equal(activityCountdownSeconds(15_000), 15)
+  assert.equal(activityCountdownSeconds(14_999), 15)
+  assert.equal(activityCountdownSeconds(14_000), 14)
+  assert.equal(activityCountdownSeconds(1), 1)
+  assert.equal(activityCountdownSeconds(0), 0)
+  assert.equal(activityCountdownSeconds(-1), 0)
+})
+
+test("solution variants are bound to the active evaluation run", () => {
+  const id = "solution-variant-run-test"
+
+  setSolutionVariant(id, "run-one", 4)
+  assert.equal(getSolutionVariant(id), undefined)
+  setSolutionVariant(id, "run-one")
+  assert.equal(getSolutionVariant(id), undefined)
+  setSolutionVariant(id, "run-one", 2)
+  assert.equal(getSolutionVariant(id), 2)
+
+  setSolutionVariant(id, "run-two")
+  assert.equal(getSolutionVariant(id), undefined)
+  setSolutionVariant(id, "run-one", 7)
+  assert.equal(getSolutionVariant(id), undefined)
+  setSolutionVariant(id, "run-two", 1)
+  assert.equal(getSolutionVariant(id), 1)
+  setSolutionVariant(id, "run-one", 7)
+  assert.equal(getSolutionVariant(id), 1)
+
+  clearSolutionVariant(id, "run-one")
+  assert.equal(getSolutionVariant(id), 1)
+  clearSolutionVariant(id, "run-two")
+  assert.equal(getSolutionVariant(id), undefined)
+})
+
+test("solution variant registry validates identifiers and indices", () => {
+  assert.throws(
+    () => setSolutionVariant(" ", "run"),
+    /Lösungs-ID darf nicht leer sein/u,
+  )
+  assert.throws(
+    () => setSolutionVariant("solution", " "),
+    /Lauf-ID darf nicht leer sein/u,
+  )
+  assert.throws(
+    () => getSolutionVariant("\t"),
+    /Lösungs-ID darf nicht leer sein/u,
+  )
+  assert.throws(
+    () => clearSolutionVariant("solution", "\n"),
+    /Lauf-ID darf nicht leer sein/u,
+  )
+
+  setSolutionVariant(" solution ", " run ")
+  for (const index of [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(
+      () => setSolutionVariant("solution", "run", index),
+      /nicht negative ganze Zahl/u,
+    )
+  }
+  setSolutionVariant("solution", "run", 0)
+  assert.equal(getSolutionVariant(" solution "), 0)
+  clearSolutionVariant(" solution ", " run ")
+})
+
+test("the public version remains pinned exactly to 0.5.11", () => {
   const packageJson = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   ) as { version?: string }
@@ -6760,12 +7391,12 @@ test("the public version remains pinned exactly to 0.5.8", () => {
   const entry = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8")
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8")
 
-  assert.equal(packageJson.version, "0.5.8")
-  assert.equal(packageLock.version, "0.5.8")
-  assert.equal(packageLock.packages?.[""]?.version, "0.5.8")
-  assert.match(entry, /const VERSION = "0\.5\.8"/u)
-  assert.match(readme, /^version:\s+0\.5\.8$/mu)
-  assert.match(readme, /^script:\s+\.\/dist\/index\.js\?v=0\.5\.8$/mu)
+  assert.equal(packageJson.version, "0.5.11")
+  assert.equal(packageLock.version, "0.5.11")
+  assert.equal(packageLock.packages?.[""]?.version, "0.5.11")
+  assert.match(entry, /const VERSION = "0\.5\.11"/u)
+  assert.match(readme, /^version:\s+0\.5\.11$/mu)
+  assert.match(readme, /^script:\s+\.\/dist\/index\.js\?v=0\.5\.11$/mu)
 })
 
 test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper", () => {
@@ -6811,6 +7442,12 @@ test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper
   assert.match(readme, /maxThinkingTimeMs: options\.maxThinkingTimeMs/u)
   assert.match(readme, /maxThinkingTokens: options\.maxThinkingTokens/u)
   assert.match(readme, /onProgress: progress =>/u)
+  assert.match(readme, /message: progress\.message/u)
+  assert.match(readme, /thinkingTimeLimitMs: progress\.thinkingTimeLimitMs/u)
+  assert.match(
+    readme,
+    /thinkingTimeRemainingMs: progress\.thinkingTimeRemainingMs/u,
+  )
   assert.match(readme, /if \(!active \|\| finished\) return/u)
   assert.match(readme, /criterionThreshold: options\.passThreshold/u)
   assert.match(readme, /assessmentEngine:\s*options\.assessmentEngine/u)
@@ -6827,7 +7464,25 @@ test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper
     /operator=erklaeren;Rechtschreibung=1;Satzbau=1,`Erkläre, warum/u,
   )
   assert.match(readme, /const question = `@'2`/u)
-  assert.match(readme, /const reference = `@'3`/u)
+  assert.match(readme, /const referenceSource = `@'3`/u)
+  assert.match(
+    readme,
+    /referenceVariants = window\.LiaLLM\.parseReferenceVariants\(referenceSource\)/u,
+  )
+  assert.match(readme, /reference:\s*referenceVariants\[0\]/u)
+  assert.match(
+    readme,
+    /referenceVariants:\s*referenceVariants\.slice\(1\)/u,
+  )
+  assert.match(readme, /result\.selectedReferenceIndex/u)
+  assert.match(
+    readme,
+    /\.setSolutionVariant\?\.\(\s*solutionVariantId,\s*runId,\s*selectedReferenceIndex/u,
+  )
+  assert.match(
+    readme,
+    /\.clearSolutionVariant\?\.\(solutionVariantId, runId\)/u,
+  )
   assert.match(readme, /return window\.LiaLLM\.evaluate\(\{\s*question,/u)
   assert.doesNotMatch(readme, /question:\s*"LiaScript-Freitextaufgabe"/u)
   assert.match(
@@ -6872,14 +7527,22 @@ test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper
     macro,
     /solutionResult === "true" && solutionOptions\?\.solution/u,
   )
-  assert.match(macro, /const solutionReference = `@'3`/u)
+  assert.match(macro, /const solutionReferenceSource = `@'3`/u)
+  assert.match(
+    macro,
+    /window\.LiaLLM\.parseReferenceVariants\(solutionReferenceSource\)/u,
+  )
+  assert.match(
+    macro,
+    /window\.LiaLLM\?\.getSolutionVariant\?\.\(solutionVariantId\)/u,
+  )
   assert.match(
     macro,
     /<lia-llm-result-separator><\/lia-llm-result-separator>/u,
   )
   assert.match(
     macro,
-    /send\.liascript\(solutionReference \+ resultSeparator\)/u,
+    /solutionReferenceVariants\[selectedReferenceIndex\] \+ resultSeparator/u,
   )
   assert.match(
     macro,
@@ -7061,6 +7724,16 @@ test("parseTextareaRows applies defaults and safe limits", () => {
   assert.equal(parseTextareaRows("1"), 2)
   assert.equal(parseTextareaRows("7"), 7)
   assert.equal(parseTextareaRows("99"), 12)
+})
+
+test("ARIA ID references ignore missing and empty identifiers", () => {
+  assert.deepEqual(parseAriaReferenceIds(null), [])
+  assert.deepEqual(parseAriaReferenceIds(""), [])
+  assert.deepEqual(parseAriaReferenceIds("   \t  "), [])
+  assert.deepEqual(
+    parseAriaReferenceIds("label  help\nerror"),
+    ["label", "help", "error"],
+  )
 })
 
 test("parseMacroOptions supports named and positional quiz options", () => {

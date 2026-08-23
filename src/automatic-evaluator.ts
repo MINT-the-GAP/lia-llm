@@ -13,6 +13,7 @@ import {
 } from "./debug-diagnostics.ts"
 import { SemanticEvaluator } from "./evaluator.ts"
 import {
+  countWords,
   normalizeLanguageAnalysisOptions,
   unavailableLanguageAnalysis,
 } from "./language-analysis.ts"
@@ -24,7 +25,10 @@ import {
   QualityEvaluator,
 } from "./quality-evaluator.ts"
 import { normalizeRequest } from "./scoring.ts"
-import { normalizeThinkingLimits } from "./thinking-config.ts"
+import {
+  normalizeAdaptiveThinkingLimits,
+  normalizeThinkingLimits,
+} from "./thinking-config.ts"
 import type {
   AssessmentEngine,
   EvaluationOptions,
@@ -179,6 +183,9 @@ function linkRunSignals(run: EvaluationRun): {
 function snapshotRequest(request: EvaluationRequest): EvaluationRequest {
   return {
     ...request,
+    referenceVariants: request.referenceVariants
+      ? [...request.referenceVariants]
+      : undefined,
     languageAnalysis: request.languageAnalysis
       ? { ...request.languageAnalysis }
       : undefined,
@@ -643,17 +650,29 @@ export class AutomaticEvaluator {
       ) {
         return fallback()
       }
-      this.reportProgress(options, run, {
+      const qualityProgress: EvaluationProgress = {
         phase: "evaluating-quality",
         engine: "quality",
         message: languageOnly
           ? "Sprachstatistik wird erstellt …"
           : "Antwort wird gründlich geprüft …",
-      })
+      }
+      if (!languageOnly) {
+        qualityProgress.thinkingTimeLimitMs =
+          normalizeAdaptiveThinkingLimits(
+            options,
+            countWords(request.answer),
+          ).maxTimeMs
+      }
+      this.reportProgress(options, run, qualityProgress)
       const linkedSignal = linkRunSignals(run)
       const qualityOptions: EvaluationOptions = {
         ...options,
         signal: linkedSignal.signal,
+      }
+      if (options?.onProgress) {
+        qualityOptions.onProgress = (progress) =>
+          this.reportProgress(options, run, progress)
       }
       try {
         if (languageOnly && compactFallback) {

@@ -141,6 +141,44 @@
       const compactThinkingDisabled = window.LiaLLM?.parseMacroOptions(
         "0.66;assessmentengine=compact;maxthinkingtime=0s"
       )
+      const parsedReferenceVariants = window.LiaLLM?.parseReferenceVariants(
+        [
+          "Erster Weg mit $a^2$.",
+          "<!-- lia-llm:alternative -->",
+          "## Zweiter Weg",
+          "",
+          "$$b^2$$"
+        ].join("\r\n")
+      )
+      const referenceVariantParserWorks =
+        JSON.stringify(parsedReferenceVariants) ===
+        JSON.stringify([
+          "Erster Weg mit $a^2$.",
+          "## Zweiter Weg\n\n$$b^2$$"
+        ])
+      const solutionVariantId = "browser-solution-variant-probe"
+      window.LiaLLM?.setSolutionVariant?.(solutionVariantId, "run-one")
+      window.LiaLLM?.setSolutionVariant?.(solutionVariantId, "run-one", 1)
+      const firstSolutionVariantWasStored =
+        window.LiaLLM?.getSolutionVariant?.(solutionVariantId) === 1
+      window.LiaLLM?.setSolutionVariant?.(solutionVariantId, "run-two")
+      const newSolutionRunResetTheIndex =
+        window.LiaLLM?.getSolutionVariant?.(solutionVariantId) === undefined
+      window.LiaLLM?.setSolutionVariant?.(solutionVariantId, "run-one", 0)
+      window.LiaLLM?.clearSolutionVariant?.(solutionVariantId, "run-one")
+      const staleSolutionRunWasIgnored =
+        window.LiaLLM?.getSolutionVariant?.(solutionVariantId) === undefined
+      window.LiaLLM?.setSolutionVariant?.(solutionVariantId, "run-two", 0)
+      window.LiaLLM?.clearSolutionVariant?.(solutionVariantId, "run-one")
+      const activeSolutionRunSurvivedStaleClear =
+        window.LiaLLM?.getSolutionVariant?.(solutionVariantId) === 0
+      window.LiaLLM?.clearSolutionVariant?.(solutionVariantId, "run-two")
+      const solutionVariantRegistryIsRunScoped =
+        firstSolutionVariantWasStored &&
+        newSolutionRunResetTheIndex &&
+        staleSolutionRunWasIgnored &&
+        activeSolutionRunSurvivedStaleClear &&
+        window.LiaLLM?.getSolutionVariant?.(solutionVariantId) === undefined
       let compactAdvancedRejected = false
       try {
         window.LiaLLM?.parseMacroOptions(
@@ -248,12 +286,60 @@
       window.LiaLLM?.showActivity(
         "activity-probe",
         "run-two",
-        "evaluating-quality"
+        "selecting-model"
       )
+      window.LiaLLM?.showActivity(
+        "activity-probe",
+        "run-two",
+        "evaluating-quality",
+        { thinkingTimeLimitMs: 1500 }
+      )
+      const potentialThinkingLimitIsShown =
+        activity?.shadowRoot?.querySelector(".lia-llm-activity-countdown")
+          ?.textContent ===
+          "Denkzeitbudget bei Bedarf: bis zu 2 s."
+      window.LiaLLM?.showActivity(
+        "activity-probe",
+        "run-two",
+        "evaluating-quality",
+        {
+          thinkingTimeLimitMs: 1500,
+          thinkingTimeRemainingMs: 1200
+        }
+      )
+      const countdown = activity?.shadowRoot?.querySelector(
+        ".lia-llm-activity-countdown"
+      )
+      const countdownBeforeTick = countdown?.textContent
+      const thinkingCountdownStartsAccessibly =
+        countdownBeforeTick ===
+          "Denkzeitbudget: noch 2 s." &&
+        countdown?.getAttribute("aria-hidden") === "true" &&
+        activity?.getAttribute("aria-label")?.includes(
+          "noch 2 Sekunden"
+        ) === true
+      window.LiaLLM?.showActivity(
+        "activity-probe",
+        "run-one",
+        "evaluating-compact"
+      )
+      const staleRunCannotReplaceCurrent =
+        activity?.shadowRoot?.querySelector(".lia-llm-activity-message")
+          ?.textContent ===
+          "Antwort wird gründlich geprüft …" &&
+        countdown?.textContent === countdownBeforeTick
       window.LiaLLM?.showActivity("activity-probe", "run-one", "")
+      await new Promise(resolve => setTimeout(resolve, 400))
+      const countdownAfterTick = countdown?.textContent
+      const thinkingCountdownRuns =
+        countdownAfterTick !== countdownBeforeTick &&
+        (countdownAfterTick ===
+          "Denkzeitbudget: noch 1 s." ||
+          countdownAfterTick ===
+            "Denkzeitlimit erreicht – laufende Prüfung wird abgeschlossen …")
       const staleRunCannotHideCurrent =
         activity?.hidden === false &&
-        activity?.shadowRoot?.querySelector(".lia-llm-activity-label")
+        activity?.shadowRoot?.querySelector(".lia-llm-activity-message")
           ?.textContent ===
           "Antwort wird gründlich geprüft …"
       window.LiaLLM?.showActivity(
@@ -856,13 +942,17 @@
 
       const matches = Boolean(
         window.LiaLLM &&
-        window.LiaLLM.version === "0.5.8" &&
+        window.LiaLLM.version === "0.5.11" &&
         typeof window.LiaLLM.evaluate === "function" &&
         typeof window.LiaLLM.debugReport === "function" &&
         typeof window.LiaLLM.feedbackForResult === "function" &&
         typeof window.LiaLLM.showFeedback === "function" &&
         typeof window.LiaLLM.showSolution === "function" &&
         typeof window.LiaLLM.showActivity === "function" &&
+        typeof window.LiaLLM.parseReferenceVariants === "function" &&
+        typeof window.LiaLLM.setSolutionVariant === "function" &&
+        typeof window.LiaLLM.getSolutionVariant === "function" &&
+        typeof window.LiaLLM.clearSolutionVariant === "function" &&
         initial?.assessmentEngine === "compact" &&
         initial?.phase === "idle" &&
         named?.passThreshold === 0.66 &&
@@ -880,6 +970,8 @@
         explicitCompact?.assessmentEngine === "compact" &&
         explicitQuality?.assessmentEngine === "quality" &&
         compactThinkingDisabled?.maxThinkingTimeMs === 0 &&
+        referenceVariantParserWorks &&
+        solutionVariantRegistryIsRunScoped &&
         compactAdvancedRejected &&
         area instanceof HTMLTextAreaElement &&
         textareaLivesOnlyInShadow &&
@@ -906,6 +998,10 @@
         resultSeparatorMatchesTheme &&
         quizPresenceStartsOnce &&
         activityStarted &&
+        potentialThinkingLimitIsShown &&
+        thinkingCountdownStartsAccessibly &&
+        thinkingCountdownRuns &&
+        staleRunCannotReplaceCurrent &&
         staleRunCannotHideCurrent &&
         activitiesStayIsolated &&
         activityClears &&
@@ -961,6 +1057,9 @@
         initial,
         named,
         positional,
+        parsedReferenceVariants,
+        referenceVariantParserWorks,
+        solutionVariantRegistryIsRunScoped,
         textareaLivesOnlyInShadow,
         textareaAriaStaysInsideShadow,
         textareaAriaTracksTextChanges,
@@ -977,6 +1076,10 @@
         resultSeparatorMatchesTheme,
         quizPresenceStartsOnce,
         activityStarted,
+        potentialThinkingLimitIsShown,
+        thinkingCountdownStartsAccessibly,
+        thinkingCountdownRuns,
+        staleRunCannotReplaceCurrent,
         staleRunCannotHideCurrent,
         activitiesStayIsolated,
         activityClears,

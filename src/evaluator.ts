@@ -32,6 +32,7 @@ import {
 } from "./debug-diagnostics.ts"
 import {
   aggregateCriteria,
+  bestReferenceVariantIndex,
   classifyCriterion,
   evaluationAnswerContexts,
   normalizeRequest,
@@ -1263,10 +1264,13 @@ export class SemanticEvaluator {
       }
 
       const pairCount = normalized.criteria.reduce((total, criterion) => {
-        const positiveCount = uniqueTexts([
-          criterion.text,
-          ...criterion.acceptedVariants,
-        ]).length
+        const positiveCount =
+          normalized.mode === "holistic" && normalized.references.length > 1
+            ? normalized.references.length
+            : uniqueTexts([
+                criterion.text,
+                ...criterion.acceptedVariants,
+              ]).length
         const misconceptionCount = uniqueTexts(criterion.misconceptions).length
         return total + answerContexts.length * (positiveCount + misconceptionCount)
       }, 0)
@@ -1278,6 +1282,61 @@ export class SemanticEvaluator {
 
       const results: CriterionResult[] = []
       for (const criterion of normalized.criteria) {
+        const misconceptionHypotheses = uniqueTexts(criterion.misconceptions)
+        const misconceptionEvidence =
+          misconceptionHypotheses.length === 0
+            ? undefined
+            : bestBy(
+                await this.classifyPairs(
+                  misconceptionHypotheses.flatMap((hypothesis) =>
+                    answerContexts.map((premise) => ({ premise, hypothesis })),
+                  ),
+                ),
+                (evidence) => evidence.entailment,
+              )
+
+        if (normalized.mode === "holistic" && normalized.references.length > 1) {
+          const positiveEvidence = await this.classifyPairs(
+            normalized.references.flatMap((hypothesis) =>
+              answerContexts.map((premise) => ({ premise, hypothesis })),
+            ),
+          )
+          const candidateResults = normalized.references.map(
+            (hypothesis, referenceIndex) => {
+              const start = referenceIndex * answerContexts.length
+              const evidence = positiveEvidence.slice(
+                start,
+                start + answerContexts.length,
+              )
+              return classifyCriterion({
+                criterion: {
+                  ...criterion,
+                  text: hypothesis,
+                  acceptedVariants: [],
+                },
+                supportEvidence: bestBy(
+                  evidence,
+                  (item) => item.entailment,
+                ),
+                contradictionEvidence: bestBy(
+                  evidence,
+                  (item) => item.contradiction,
+                ),
+                misconceptionEvidence,
+                uncertaintyMargin: normalized.uncertaintyMargin,
+                contrastiveMargin: normalized.contrastiveMargin,
+              })
+            },
+          )
+          const selectedReferenceIndex =
+            bestReferenceVariantIndex(candidateResults)
+          results.push({
+            ...candidateResults[selectedReferenceIndex]!,
+            selectedReferenceIndex,
+          })
+          continue
+        }
+
         const positiveHypotheses = uniqueTexts([
           criterion.text,
           ...criterion.acceptedVariants,
@@ -1294,19 +1353,6 @@ export class SemanticEvaluator {
           positiveEvidence,
           (evidence) => evidence.contradiction,
         )
-
-        const misconceptionHypotheses = uniqueTexts(criterion.misconceptions)
-        const misconceptionEvidence =
-          misconceptionHypotheses.length === 0
-            ? undefined
-            : bestBy(
-                await this.classifyPairs(
-                  misconceptionHypotheses.flatMap((hypothesis) =>
-                    answerContexts.map((premise) => ({ premise, hypothesis })),
-                  ),
-                ),
-                (evidence) => evidence.entailment,
-              )
 
         results.push(
           classifyCriterion({
@@ -1330,6 +1376,7 @@ export class SemanticEvaluator {
         mode: normalized.mode,
         criteria: results,
         answer: normalized.answer,
+        selectedReferenceIndex: results[0]?.selectedReferenceIndex ?? 0,
         operator: normalized.operator,
         diagnostic: finalized.diagnostic,
         languageAnalysis: normalized.languageAnalysis

@@ -123,6 +123,8 @@ export interface EvaluationRequest {
   question: string
   answer: string
   reference: string
+  /** Additional complete reference answers; any one may satisfy the task. */
+  referenceVariants?: string[]
   operator?: string
   assessmentEngine?: AssessmentEngine
   criteria?: string | CriterionInput[]
@@ -169,6 +171,19 @@ export interface EvaluationProgress {
   phase: EvaluationProgressPhase
   engine: AssessmentEngine
   message: string
+  /** Maximum shared wall-clock budget currently available if adaptive Thinking is needed. */
+  thinkingTimeLimitMs?: number
+  /** Remaining shared wall-clock budget while an adaptive Thinking pass is active. */
+  thinkingTimeRemainingMs?: number
+}
+
+export interface ActivityDisplayOptions {
+  /** Visible phase message; falls back to the built-in message for the phase. */
+  message?: string
+  /** Shows the maximum additional Thinking budget before a pass starts. */
+  thinkingTimeLimitMs?: number
+  /** Starts a visual countdown for an active adaptive Thinking pass. */
+  thinkingTimeRemainingMs?: number
 }
 
 export interface EvaluationOptions {
@@ -184,6 +199,8 @@ export interface NormalizedEvaluationRequest {
   question: string
   answer: string
   reference: string
+  /** Complete normalized reference answers in author order, including `reference`. */
+  references: string[]
   operator?: OperatorRubric
   mode: EvaluationMode
   criteria: Criterion[]
@@ -228,6 +245,8 @@ export interface CriterionResult extends NliScores {
   judgeConfidence?: number
   /** Missing operator criterion reported by the quality model after runtime validation. */
   operatorCriterionId?: string
+  /** Zero-based complete reference-answer variant selected for this result. */
+  selectedReferenceIndex?: number
 }
 
 export type EvaluationDiagnosticCode =
@@ -249,6 +268,8 @@ export interface EvaluationResult {
   potentialCoverage: number
   criteria: CriterionResult[]
   answer: string
+  /** Zero-based authored reference variant best matching the answer; defaults to 0. */
+  selectedReferenceIndex?: number
   operator?: OperatorRubric
   diagnostic?: EvaluationDiagnostic
   /** Optional advisory language statistics; never changes `passed`. */
@@ -356,6 +377,7 @@ export interface DebugTraceEvent {
     | "fetch-attempt-error"
     | "fetch-activity"
     | "fetch-retry"
+    | "language-analysis"
     | "failure"
     | "status"
   engine?: AssessmentEngine
@@ -443,6 +465,7 @@ export interface LiaLLMApi {
   debugReport(options?: DebugReportOptions): Promise<LiaLLMDebugReport>
   clearCache(): Promise<number>
   parseMacroOptions(source: string): import("./macro-options.ts").LLMQuizMacroOptions
+  parseReferenceVariants(source: string): string[]
   parseCriteria(source: string | CriterionInput[] | undefined): CriterionInput[] | undefined
   formatResult(
     result: EvaluationResult,
@@ -456,6 +479,10 @@ export interface LiaLLMApi {
     id: string,
     runId: string,
     phase: EvaluationProgressPhase | "",
+    options?: ActivityDisplayOptions,
   ): void
   showSolution(id: string, text: string): void
+  setSolutionVariant(id: string, runId: string, index?: number): void
+  getSolutionVariant(id: string): number | undefined
+  clearSolutionVariant(id: string, runId: string): void
 }
