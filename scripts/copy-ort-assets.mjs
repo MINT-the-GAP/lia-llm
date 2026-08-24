@@ -16,6 +16,13 @@ export async function copyOrtAssets() {
       resolve(targetDirectory, asset),
     )
   }
+  await copyFile(
+    resolve(
+      root,
+      "node_modules/@cspell/dict-de-de/German_de_DE.trie.gz",
+    ),
+    resolve(targetDirectory, "German_de_DE.d94b8665.trie.gz"),
+  )
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

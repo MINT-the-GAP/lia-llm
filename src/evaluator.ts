@@ -292,7 +292,7 @@ class OnnxWasmProxyModeError extends Error {
   override name = "OnnxWasmProxyModeError"
 }
 
-function runtimeAssetUrl(filename: string): string {
+export function runtimeAssetUrl(filename: string): string {
   return new URL(filename, runtimeAssetBaseUrl).href
 }
 

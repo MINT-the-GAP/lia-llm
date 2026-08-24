@@ -48,6 +48,38 @@
     id="feedback-probe"
     data-elm-owned-host
   >elm-owned-placeholder</lia-llm-feedback>
+  <lia-llm-feedback
+    id="feedback-correction-probe"
+    data-elm-owned-host
+  >elm-owned-placeholder</lia-llm-feedback>
+  <lia-llm-feedback
+    id="feedback-syntax-only-probe"
+    data-elm-owned-host
+  >elm-owned-placeholder</lia-llm-feedback>
+  <lia-llm-feedback
+    id="feedback-unavailable-probe"
+    data-elm-owned-host
+  >elm-owned-placeholder</lia-llm-feedback>
+  <lia-llm-feedback
+    id="feedback-zero-errors-probe"
+    data-elm-owned-host
+  >elm-owned-placeholder</lia-llm-feedback>
+  <lia-llm-feedback
+    id="feedback-language-action-probe"
+    data-elm-owned-host
+  >elm-owned-placeholder</lia-llm-feedback>
+  <lia-llm-feedback
+    id="feedback-language-retry-probe"
+    data-elm-owned-host
+  >elm-owned-placeholder</lia-llm-feedback>
+  <lia-llm-feedback
+    id="feedback-language-lifecycle-probe"
+    data-elm-owned-host
+  >elm-owned-placeholder</lia-llm-feedback>
+  <lia-llm-feedback
+    id="feedback-language-syntax-probe"
+    data-elm-owned-host
+  >elm-owned-placeholder</lia-llm-feedback>
   <lia-llm-result-separator id="separator-probe"></lia-llm-result-separator>
   <lia-llm-activity
     id="activity-probe"
@@ -203,14 +235,672 @@
         "feedback-probe",
         "Sprachstatistik:\nWörter insgesamt: 2"
       )
-      const feedbackPreservesLineBreaks =
+      const feedbackContent =
         feedbackProbe?.shadowRoot?.querySelector(".lia-llm-feedback-content")
-          ?.textContent ===
+      const feedbackPreservesLineBreaks =
+        feedbackContent?.textContent ===
           "Sprachstatistik:\nWörter insgesamt: 2" &&
-        feedbackProbe?.style.whiteSpace === "pre-line"
+        getComputedStyle(feedbackContent).whiteSpace === "pre-line"
       const feedbackUsesCompactThemeStyle =
         feedbackProbe?.classList.contains("lia-link") === true &&
         parseFloat(feedbackProbe?.style.marginBlockStart || "") === 0.75
+      const legacyFeedbackHasNoCorrectionButton =
+        feedbackProbe?.shadowRoot?.querySelector(
+          ".lia-llm-feedback-correction-toggle"
+        )?.hidden === true
+
+      window.__liaOrthographyXss = false
+      const orthographyCorrection = {
+        parts: [
+          { text: "Heute ich ", changed: false },
+          {
+            text: "schwimmt",
+            changed: true,
+            kind: "spelling",
+            removedText: "schwimt"
+          },
+          { text: " im Wasser", changed: false },
+          {
+            text: ".",
+            changed: true,
+            kind: "punctuation",
+            removedText: ""
+          },
+          {
+            text:
+              "\n\nDann Eis oben treibt. " +
+              "<img src=x onerror=window.__liaOrthographyXss=true>",
+            changed: false
+          }
+        ]
+      }
+      const feedbackResult = languageAnalysis =>
+        window.LiaLLM?.feedbackForResult({
+          status: "passed",
+          passed: true,
+          criteria: [],
+          languageAnalysis
+        }, "de-DE")
+      const showResultFeedback = (id, feedback) =>
+        window.LiaLLM?.showFeedback(
+          id,
+          feedback?.message ?? "",
+          { orthographyCorrection: feedback?.orthographyCorrection }
+        )
+
+      const spellingFeedback = feedbackResult({
+        spelling: true,
+        syntax: true,
+        status: "completed",
+        wordCount: 9,
+        spellingErrors: 1,
+        punctuationErrors: 1,
+        syntaxErrors: 2,
+        orthographyCorrection
+      })
+      showResultFeedback("feedback-correction-probe", spellingFeedback)
+
+      const syntaxOnlyFeedback = feedbackResult({
+        spelling: false,
+        syntax: true,
+        status: "completed",
+        wordCount: 9,
+        syntaxErrors: 2,
+        orthographyCorrection
+      })
+      showResultFeedback("feedback-syntax-only-probe", syntaxOnlyFeedback)
+
+      const unavailableFeedback = feedbackResult({
+        spelling: true,
+        syntax: true,
+        status: "unavailable",
+        wordCount: 9,
+        orthographyCorrection
+      })
+      showResultFeedback("feedback-unavailable-probe", unavailableFeedback)
+
+      const unchangedOrthographyCorrection = {
+        parts: [
+          {
+            text: "Fehlerfreier Text.\n\nZweiter Absatz.",
+            changed: false
+          }
+        ]
+      }
+      const zeroErrorFeedback = feedbackResult({
+        spelling: true,
+        syntax: false,
+        status: "completed",
+        wordCount: 4,
+        spellingErrors: 0,
+        punctuationErrors: 0,
+        orthographyCorrection: unchangedOrthographyCorrection
+      })
+      showResultFeedback("feedback-zero-errors-probe", zeroErrorFeedback)
+
+      const correctionProbe = document.getElementById(
+        "feedback-correction-probe"
+      )
+      const correctionToggle = correctionProbe?.shadowRoot?.querySelector(
+        ".lia-llm-feedback-correction-toggle"
+      )
+      const correctionPanel = correctionProbe?.shadowRoot?.querySelector(
+        ".lia-llm-feedback-correction-panel"
+      )
+      const syntaxOnlyToggle = document.getElementById(
+        "feedback-syntax-only-probe"
+      )?.shadowRoot?.querySelector(".lia-llm-feedback-correction-toggle")
+      const unavailableToggle = document.getElementById(
+        "feedback-unavailable-probe"
+      )?.shadowRoot?.querySelector(".lia-llm-feedback-correction-toggle")
+      const orthographyButtonIsStrictlyGated =
+        correctionToggle instanceof HTMLButtonElement &&
+        correctionToggle.hidden === false &&
+        correctionToggle.getAttribute("aria-expanded") === "false" &&
+        correctionPanel?.hidden === true &&
+        syntaxOnlyToggle?.hidden === true &&
+        unavailableToggle?.hidden === true
+
+      correctionToggle?.click()
+      const correctionExpandedAccessibly =
+        correctionToggle?.getAttribute("aria-expanded") === "true" &&
+        correctionToggle?.textContent === "Korrigierten Text ausblenden" &&
+        correctionPanel?.hidden === false &&
+        correctionPanel?.getAttribute("role") === "region" &&
+        correctionPanel?.getAttribute("aria-label")?.startsWith(
+          "Korrigierter Text."
+        ) === true
+      const correctionMarks = Array.from(
+        correctionPanel?.querySelectorAll(
+          ".lia-llm-feedback-correction-mark"
+        ) ?? []
+      )
+      const onlyCorrectedSegmentsAreMarked =
+        JSON.stringify(
+          correctionMarks.map(mark => ({
+            text: mark.textContent,
+            kind: mark.dataset.kind
+          }))
+        ) === JSON.stringify([
+          { text: "schwimmt", kind: "spelling" },
+          { text: ".", kind: "punctuation" }
+        ]) &&
+        correctionMarks.every(
+          mark =>
+            !mark.textContent?.includes("Heute ich") &&
+            !mark.textContent?.includes("Dann Eis oben treibt")
+        )
+      const correctionMarksUseThemeAndRedundantEmphasis =
+        correctionMarks.length === 2 &&
+        correctionMarks.every(mark => {
+          const style = getComputedStyle(mark)
+          return style.color === "rgb(17, 34, 51)" &&
+            style.textDecorationLine.includes("underline") &&
+            Number(style.fontWeight) >= 700
+        })
+      const expectedCorrectedText =
+        "Heute ich schwimmt im Wasser.\n\nDann Eis oben treibt. " +
+        "<img src=x onerror=window.__liaOrthographyXss=true>"
+      const correctionPreservesParagraphsAndSyntax =
+        correctionPanel?.textContent === expectedCorrectedText &&
+        correctionPanel?.textContent.includes("\n\n") === true &&
+        correctionPanel?.textContent.startsWith("Heute ich ") === true &&
+        correctionPanel?.textContent.includes("Dann Eis oben treibt.") === true &&
+        getComputedStyle(correctionPanel).whiteSpace === "pre-wrap"
+      const correctionUsesSafeTextNodes =
+        window.__liaOrthographyXss === false &&
+        correctionPanel?.querySelector("img, script") === null &&
+        correctionPanel?.textContent.includes("<img src=x onerror=") === true
+
+      correctionToggle?.click()
+      const correctionCollapsesAccessibly =
+        correctionToggle?.getAttribute("aria-expanded") === "false" &&
+        correctionToggle?.textContent === "Korrigierten Text anzeigen" &&
+        correctionPanel?.hidden === true
+
+      const zeroErrorProbe = document.getElementById(
+        "feedback-zero-errors-probe"
+      )
+      const zeroErrorToggle = zeroErrorProbe?.shadowRoot?.querySelector(
+        ".lia-llm-feedback-correction-toggle"
+      )
+      const zeroErrorPanel = zeroErrorProbe?.shadowRoot?.querySelector(
+        ".lia-llm-feedback-correction-panel"
+      )
+      zeroErrorToggle?.click()
+      const zeroErrorCorrectionShowsUnchangedText =
+        zeroErrorToggle?.hidden === false &&
+        zeroErrorToggle?.getAttribute("aria-expanded") === "true" &&
+        zeroErrorPanel?.textContent ===
+          "Fehlerfreier Text.\n\nZweiter Absatz." &&
+        zeroErrorPanel?.querySelector(
+          ".lia-llm-feedback-correction-mark"
+        ) === null
+
+      window.LiaLLM?.showFeedback(
+        "feedback-correction-probe",
+        "Feedback ohne Korrektur"
+      )
+      const legacyCallResetsCorrection =
+        correctionProbe?.hidden === false &&
+        correctionProbe?.shadowRoot?.querySelector(
+          ".lia-llm-feedback-content"
+        )?.textContent === "Feedback ohne Korrektur" &&
+        correctionToggle?.hidden === true &&
+        correctionToggle?.getAttribute("aria-expanded") === "false" &&
+        correctionPanel?.hidden === true &&
+        correctionPanel?.hasChildNodes() === false
+      window.LiaLLM?.showFeedback("feedback-correction-probe", "")
+      const emptyFeedbackClearsCorrection =
+        correctionProbe?.hidden === true &&
+        correctionToggle?.hidden === true &&
+        correctionPanel?.hidden === true &&
+        correctionPanel?.hasChildNodes() === false
+
+      const flushLanguageCheckUi = () =>
+        new Promise(resolve => setTimeout(resolve, 0))
+      const deferredLanguageCheck = () => {
+        let resolve
+        const promise = new Promise(next => {
+          resolve = next
+        })
+        return { promise, resolve }
+      }
+
+      window.__liaLanguageCheckXss = false
+      const languageActionProbe = document.getElementById(
+        "feedback-language-action-probe"
+      )
+      const orthographyDeferred = deferredLanguageCheck()
+      let orthographyRuns = 0
+      let orthographySignal = null
+      window.LiaLLM?.showFeedback(
+        "feedback-language-action-probe",
+        "",
+        {
+          languageCheck: {
+            runId: "orthography-action-run",
+            kind: "orthography",
+            run(signal) {
+              orthographyRuns += 1
+              orthographySignal = signal
+              return orthographyDeferred.promise
+            }
+          }
+        }
+      )
+      const languageActionContent =
+        languageActionProbe?.shadowRoot?.querySelector(
+          ".lia-llm-feedback-content"
+        )
+      const languageActionButton =
+        languageActionProbe?.shadowRoot?.querySelector(
+          ".lia-llm-feedback-language-action"
+        )
+      const languageActionStatus =
+        languageActionProbe?.shadowRoot?.querySelector(
+          ".lia-llm-feedback-language-status"
+        )
+      const languageActionToggle =
+        languageActionProbe?.shadowRoot?.querySelector(
+          ".lia-llm-feedback-correction-toggle"
+        )
+      const languageActionPanel =
+        languageActionProbe?.shadowRoot?.querySelector(
+          ".lia-llm-feedback-correction-panel"
+        )
+      const languageCheckActionIsLazyAndVisible =
+        languageActionProbe?.hidden === false &&
+        languageActionContent?.textContent === "" &&
+        languageActionButton instanceof HTMLButtonElement &&
+        languageActionButton.hidden === false &&
+        languageActionButton.disabled === false &&
+        languageActionButton.textContent === "Rechtschreibung pr\u00fcfen" &&
+        languageActionStatus?.hidden === true &&
+        orthographyRuns === 0
+
+      languageActionButton?.click()
+      languageActionButton?.click()
+      await flushLanguageCheckUi()
+      const languageCheckLoadingIsSingleAndAccessible =
+        orthographyRuns === 1 &&
+        orthographySignal instanceof AbortSignal &&
+        orthographySignal.aborted === false &&
+        languageActionButton?.hidden === false &&
+        languageActionButton?.disabled === true &&
+        languageActionButton?.getAttribute("aria-busy") === "true" &&
+        languageActionStatus?.hidden === false &&
+        languageActionStatus?.textContent ===
+          "Rechtschreibung und Zeichensetzung werden gepr\u00fcft \u2026"
+
+      const correctedLanguageText =
+        "Der Hund ist da. " +
+        "<img src=x onerror=window.__liaLanguageCheckXss=true>"
+      orthographyDeferred.resolve({
+        message: "RechtschreibprÃ¼fung abgeschlossen.",
+        completed: true,
+        orthographyCorrection: {
+          parts: [
+            { text: "Der ", changed: false },
+            {
+              text: "Hund",
+              changed: true,
+              kind: "spelling",
+              removedText: "Hunt"
+            },
+            {
+              text:
+                " ist da. " +
+                "<img src=x onerror=window.__liaLanguageCheckXss=true>",
+              changed: false
+            }
+          ]
+        }
+      })
+      await flushLanguageCheckUi()
+      const languageActionMarks = Array.from(
+        languageActionPanel?.querySelectorAll(
+          ".lia-llm-feedback-correction-mark"
+        ) ?? []
+      )
+      const orthographyResultIsSafeAndExpanded =
+        orthographyRuns === 1 &&
+        languageActionButton?.hidden === true &&
+        languageActionContent?.textContent ===
+          "RechtschreibprÃ¼fung abgeschlossen." &&
+        languageActionStatus?.hidden === true &&
+        languageActionStatus?.textContent === "" &&
+        languageActionToggle?.hidden === false &&
+        languageActionToggle?.getAttribute("aria-expanded") === "true" &&
+        languageActionPanel?.hidden === false &&
+        languageActionPanel?.textContent === correctedLanguageText &&
+        languageActionMarks.length === 1 &&
+        languageActionMarks[0]?.textContent === "Hund" &&
+        languageActionMarks[0]?.dataset.kind === "spelling" &&
+        languageActionPanel?.querySelector("img, script") === null &&
+        window.__liaLanguageCheckXss === false
+      languageActionToggle?.click()
+      const orthographyToggleDoesNotRerun =
+        orthographyRuns === 1 &&
+        languageActionToggle?.getAttribute("aria-expanded") === "false" &&
+        languageActionPanel?.hidden === true
+
+      const retryProbe = document.getElementById(
+        "feedback-language-retry-probe"
+      )
+      let retryRuns = 0
+      const retryAttempts = []
+      window.LiaLLM?.showFeedback(
+        "feedback-language-retry-probe",
+        "Die inhaltliche PrÃ¼fung ist abgeschlossen.",
+        {
+          languageCheck: {
+            runId: "orthography-retry-run",
+            kind: "orthography",
+            run() {
+              retryRuns += 1
+              const attempt = deferredLanguageCheck()
+              retryAttempts.push(attempt)
+              return attempt.promise
+            }
+          }
+        }
+      )
+      const retryButton = retryProbe?.shadowRoot?.querySelector(
+        ".lia-llm-feedback-language-action"
+      )
+      const retryContent = retryProbe?.shadowRoot?.querySelector(
+        ".lia-llm-feedback-content"
+      )
+      const retryStatus = retryProbe?.shadowRoot?.querySelector(
+        ".lia-llm-feedback-language-status"
+      )
+      retryButton?.click()
+      retryButton?.click()
+      await flushLanguageCheckUi()
+      retryAttempts[0]?.resolve({
+        message: "RechtschreibprÃ¼fung derzeit nicht verfÃ¼gbar.",
+        completed: false
+      })
+      await flushLanguageCheckUi()
+      const unavailableLanguageCheckOffersRetry =
+        retryRuns === 1 &&
+        retryButton?.hidden === false &&
+        retryButton?.disabled === false &&
+        retryButton?.getAttribute("aria-busy") === "false" &&
+        retryButton?.textContent === "Erneut versuchen" &&
+        retryContent?.textContent ===
+          "RechtschreibprÃ¼fung derzeit nicht verfÃ¼gbar." &&
+        retryStatus?.hidden === false &&
+        retryStatus?.textContent ===
+          "Die Rechtschreibpr\u00fcfung ist derzeit nicht verf\u00fcgbar."
+      retryButton?.click()
+      retryButton?.click()
+      await flushLanguageCheckUi()
+      const retryStartsOneAdditionalRun =
+        retryRuns === 2 &&
+        retryAttempts.length === 2 &&
+        retryButton?.disabled === true &&
+        retryButton?.getAttribute("aria-busy") === "true"
+      retryAttempts[1]?.resolve({
+        message: "RechtschreibprÃ¼fung abgeschlossen.",
+        completed: true
+      })
+      await flushLanguageCheckUi()
+      const languageCheckRetryIsSingle =
+        unavailableLanguageCheckOffersRetry &&
+        retryStartsOneAdditionalRun &&
+        retryRuns === 2 &&
+        retryButton?.hidden === true &&
+        retryContent?.textContent === "RechtschreibprÃ¼fung abgeschlossen." &&
+        retryStatus?.hidden === true &&
+        retryStatus?.textContent === ""
+
+      const lifecycleProbe = document.getElementById(
+        "feedback-language-lifecycle-probe"
+      )
+      const clearDeferred = deferredLanguageCheck()
+      let clearRuns = 0
+      let clearSignal = null
+      window.LiaLLM?.showFeedback(
+        "feedback-language-lifecycle-probe",
+        "Lauf wird anschlieÃŸend geleert.",
+        {
+          languageCheck: {
+            runId: "language-clear-run",
+            kind: "orthography",
+            run(signal) {
+              clearRuns += 1
+              clearSignal = signal
+              return clearDeferred.promise
+            }
+          }
+        }
+      )
+      const lifecycleAction = lifecycleProbe?.shadowRoot?.querySelector(
+        ".lia-llm-feedback-language-action"
+      )
+      const lifecycleContent = lifecycleProbe?.shadowRoot?.querySelector(
+        ".lia-llm-feedback-content"
+      )
+      const lifecycleStatus = lifecycleProbe?.shadowRoot?.querySelector(
+        ".lia-llm-feedback-language-status"
+      )
+      const lifecycleToggle = lifecycleProbe?.shadowRoot?.querySelector(
+        ".lia-llm-feedback-correction-toggle"
+      )
+      lifecycleAction?.click()
+      await flushLanguageCheckUi()
+      window.LiaLLM?.showFeedback("feedback-language-lifecycle-probe", "")
+      const emptyFeedbackAbortedPendingCheck =
+        clearRuns === 1 &&
+        clearSignal instanceof AbortSignal &&
+        clearSignal.aborted === true &&
+        lifecycleProbe?.hidden === true
+      clearDeferred.resolve({
+        message: "VERALTETES LEERERGEBNIS",
+        completed: true,
+        orthographyCorrection: {
+          parts: [
+            {
+              text: "VERALTETES LEERERGEBNIS",
+              changed: true,
+              kind: "spelling"
+            }
+          ]
+        }
+      })
+      await flushLanguageCheckUi()
+      const emptyFeedbackAbortsAndRejectsStale =
+        emptyFeedbackAbortedPendingCheck &&
+        lifecycleProbe?.hidden === true &&
+        lifecycleContent?.textContent === "" &&
+        lifecycleStatus?.textContent === "" &&
+        lifecycleToggle?.hidden === true
+
+      const staleRunDeferred = deferredLanguageCheck()
+      let staleRunSignal = null
+      let staleRunCalls = 0
+      let currentRunCalls = 0
+      window.LiaLLM?.showFeedback(
+        "feedback-language-lifecycle-probe",
+        "Alter Lauf",
+        {
+          languageCheck: {
+            runId: "language-old-run",
+            kind: "orthography",
+            run(signal) {
+              staleRunCalls += 1
+              staleRunSignal = signal
+              return staleRunDeferred.promise
+            }
+          }
+        }
+      )
+      lifecycleAction?.click()
+      await flushLanguageCheckUi()
+      window.LiaLLM?.showFeedback(
+        "feedback-language-lifecycle-probe",
+        "Neuer Lauf",
+        {
+          languageCheck: {
+            runId: "language-new-run",
+            kind: "orthography",
+            run() {
+              currentRunCalls += 1
+              return Promise.resolve({
+                message: "Aktuelles Ergebnis",
+                completed: true
+              })
+            }
+          }
+        }
+      )
+      const oldRunWasAborted =
+        staleRunCalls === 1 &&
+        staleRunSignal instanceof AbortSignal &&
+        staleRunSignal.aborted === true
+      staleRunDeferred.resolve({
+        message: "VERALTETES RUN-ID-ERGEBNIS",
+        completed: true,
+        orthographyCorrection: {
+          parts: [
+            {
+              text: "VERALTETES RUN-ID-ERGEBNIS",
+              changed: true,
+              kind: "spelling"
+            }
+          ]
+        }
+      })
+      await flushLanguageCheckUi()
+      const newRunIdAbortsAndRejectsStale =
+        oldRunWasAborted &&
+        currentRunCalls === 0 &&
+        lifecycleContent?.textContent === "Neuer Lauf" &&
+        lifecycleStatus?.textContent === "" &&
+        lifecycleAction?.hidden === false &&
+        lifecycleAction?.textContent === "Rechtschreibung pr\u00fcfen" &&
+        lifecycleToggle?.hidden === true
+      window.LiaLLM?.showFeedback("feedback-language-lifecycle-probe", "")
+
+      const disconnectProbe = document.createElement("lia-llm-feedback")
+      disconnectProbe.id = "feedback-language-disconnect-probe"
+      document.body.append(disconnectProbe)
+      await flushLanguageCheckUi()
+      const disconnectDeferred = deferredLanguageCheck()
+      let disconnectRuns = 0
+      let disconnectSignal = null
+      window.LiaLLM?.showFeedback(
+        "feedback-language-disconnect-probe",
+        "Lauf vor Navigation",
+        {
+          languageCheck: {
+            runId: "language-disconnect-run",
+            kind: "orthography",
+            run(signal) {
+              disconnectRuns += 1
+              disconnectSignal = signal
+              return disconnectDeferred.promise
+            }
+          }
+        }
+      )
+      const disconnectAction = disconnectProbe.shadowRoot?.querySelector(
+        ".lia-llm-feedback-language-action"
+      )
+      disconnectAction?.click()
+      await flushLanguageCheckUi()
+      disconnectProbe.remove()
+      const disconnectAbortedPendingCheck =
+        disconnectRuns === 1 &&
+        disconnectSignal instanceof AbortSignal &&
+        disconnectSignal.aborted === true
+      disconnectDeferred.resolve({
+        message: "VERALTETES NAVIGATIONSERGEBNIS",
+        completed: true,
+        orthographyCorrection: {
+          parts: [
+            {
+              text: "VERALTETES NAVIGATIONSERGEBNIS",
+              changed: true,
+              kind: "spelling"
+            }
+          ]
+        }
+      })
+      await flushLanguageCheckUi()
+      document.body.append(disconnectProbe)
+      await flushLanguageCheckUi()
+      const disconnectAbortsAndRejectsStale =
+        disconnectAbortedPendingCheck &&
+        disconnectProbe.hidden === true &&
+        disconnectProbe.shadowRoot?.querySelector(
+          ".lia-llm-feedback-content"
+        )?.textContent === "" &&
+        disconnectProbe.shadowRoot?.querySelector(
+          ".lia-llm-feedback-language-status"
+        )?.textContent === "" &&
+        disconnectProbe.shadowRoot?.querySelector(
+          ".lia-llm-feedback-correction-toggle"
+        )?.hidden === true
+      disconnectProbe.remove()
+
+      const syntaxProbe = document.getElementById(
+        "feedback-language-syntax-probe"
+      )
+      let syntaxRuns = 0
+      window.LiaLLM?.showFeedback(
+        "feedback-language-syntax-probe",
+        "Die InhaltsprÃ¼fung ist abgeschlossen.",
+        {
+          languageCheck: {
+            runId: "language-syntax-run",
+            kind: "syntax",
+            run() {
+              syntaxRuns += 1
+              return Promise.resolve({
+                message: "SatzbauprÃ¼fung abgeschlossen.",
+                completed: true
+              })
+            }
+          }
+        }
+      )
+      const syntaxAction = syntaxProbe?.shadowRoot?.querySelector(
+        ".lia-llm-feedback-language-action"
+      )
+      const syntaxContent = syntaxProbe?.shadowRoot?.querySelector(
+        ".lia-llm-feedback-content"
+      )
+      const syntaxStatus = syntaxProbe?.shadowRoot?.querySelector(
+        ".lia-llm-feedback-language-status"
+      )
+      const syntaxCorrectionToggle = syntaxProbe?.shadowRoot?.querySelector(
+        ".lia-llm-feedback-correction-toggle"
+      )
+      const syntaxCorrectionPanel = syntaxProbe?.shadowRoot?.querySelector(
+        ".lia-llm-feedback-correction-panel"
+      )
+      const syntaxStartsWithoutCorrectionToggle =
+        syntaxRuns === 0 &&
+        syntaxAction?.hidden === false &&
+        syntaxAction?.textContent === "Satzbau pr\u00fcfen" &&
+        syntaxCorrectionToggle?.hidden === true
+      syntaxAction?.click()
+      syntaxAction?.click()
+      await flushLanguageCheckUi()
+      const syntaxLanguageCheckHasNoCorrection =
+        syntaxStartsWithoutCorrectionToggle &&
+        syntaxRuns === 1 &&
+        syntaxAction?.hidden === true &&
+        syntaxContent?.textContent === "SatzbauprÃ¼fung abgeschlossen." &&
+        syntaxStatus?.hidden === true &&
+        syntaxStatus?.textContent === "" &&
+        syntaxCorrectionToggle?.hidden === true &&
+        syntaxCorrectionPanel?.hidden === true &&
+        syntaxCorrectionPanel?.hasChildNodes() === false
+
       const quizSpacingIsCompacted =
         getComputedStyle(
           document.getElementById("quiz-layout-probe")
@@ -942,7 +1632,7 @@
 
       const matches = Boolean(
         window.LiaLLM &&
-        window.LiaLLM.version === "0.5.11" &&
+        window.LiaLLM.version === "0.5.12" &&
         typeof window.LiaLLM.evaluate === "function" &&
         typeof window.LiaLLM.debugReport === "function" &&
         typeof window.LiaLLM.feedbackForResult === "function" &&
@@ -994,6 +1684,26 @@
         solution?.style.whiteSpace === "pre-wrap" &&
         feedbackPreservesLineBreaks &&
         feedbackUsesCompactThemeStyle &&
+        legacyFeedbackHasNoCorrectionButton &&
+        orthographyButtonIsStrictlyGated &&
+        correctionExpandedAccessibly &&
+        onlyCorrectedSegmentsAreMarked &&
+        correctionMarksUseThemeAndRedundantEmphasis &&
+        correctionPreservesParagraphsAndSyntax &&
+        correctionUsesSafeTextNodes &&
+        correctionCollapsesAccessibly &&
+        zeroErrorCorrectionShowsUnchangedText &&
+        legacyCallResetsCorrection &&
+        emptyFeedbackClearsCorrection &&
+        languageCheckActionIsLazyAndVisible &&
+        languageCheckLoadingIsSingleAndAccessible &&
+        orthographyResultIsSafeAndExpanded &&
+        orthographyToggleDoesNotRerun &&
+        languageCheckRetryIsSingle &&
+        emptyFeedbackAbortsAndRejectsStale &&
+        newRunIdAbortsAndRejectsStale &&
+        disconnectAbortsAndRejectsStale &&
+        syntaxLanguageCheckHasNoCorrection &&
         quizSpacingIsCompacted &&
         resultSeparatorMatchesTheme &&
         quizPresenceStartsOnce &&
@@ -1072,6 +1782,29 @@
         solutionHidesWhenCleared,
         feedbackPreservesLineBreaks,
         feedbackUsesCompactThemeStyle,
+        legacyFeedbackHasNoCorrectionButton,
+        orthographyButtonIsStrictlyGated,
+        correctionExpandedAccessibly,
+        onlyCorrectedSegmentsAreMarked,
+        correctionMarksUseThemeAndRedundantEmphasis,
+        correctionPreservesParagraphsAndSyntax,
+        correctionUsesSafeTextNodes,
+        correctionCollapsesAccessibly,
+        zeroErrorCorrectionShowsUnchangedText,
+        legacyCallResetsCorrection,
+        emptyFeedbackClearsCorrection,
+        languageCheckActionIsLazyAndVisible,
+        languageCheckLoadingIsSingleAndAccessible,
+        orthographyResultIsSafeAndExpanded,
+        orthographyToggleDoesNotRerun,
+        languageCheckRetryIsSingle,
+        emptyFeedbackAbortsAndRejectsStale,
+        newRunIdAbortsAndRejectsStale,
+        disconnectAbortsAndRejectsStale,
+        syntaxLanguageCheckHasNoCorrection,
+        orthographyRuns,
+        retryRuns,
+        syntaxRuns,
         quizSpacingIsCompacted,
         resultSeparatorMatchesTheme,
         quizPresenceStartsOnce,

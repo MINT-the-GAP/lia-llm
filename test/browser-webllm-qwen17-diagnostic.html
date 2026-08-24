@@ -63,6 +63,9 @@ function pinnedAppConfig() {
   modelLib.pathname =
     `/mlc-ai/binary-mlc-llm-libs/${MODEL_LIB_REVISION}/` +
     modelLib.pathname.slice(mutablePrefix.length)
+  const requestedContext = Number(
+    new URL(location.href).searchParams.get("context"),
+  )
   return {
     cacheBackend: 'cache',
     model_list: [
@@ -71,7 +74,13 @@ function pinnedAppConfig() {
         model:
           `https://huggingface.co/mlc-ai/${MODEL_ID}/resolve/` +
           `${MODEL_REVISION}/`,
-        model_lib: modelLib.href
+        model_lib: modelLib.href,
+        overrides: {
+          ...source.overrides,
+          ...(Number.isInteger(requestedContext) && requestedContext >= 512
+            ? { context_window_size: requestedContext }
+            : {}),
+        }
       }
     ]
   }
@@ -149,7 +158,414 @@ window.addEventListener('unhandledrejection', event => {
     })
     const loadDurationMs = Number((performance.now() - loadStarted).toFixed(1))
     const generationStarted = performance.now()
-    const completion = await engine.chat.completions.create({
+    const diagnosticMode = new URL(location.href).searchParams.get('mode')
+    const orthographyTextMode = diagnosticMode === 'orthography-text'
+    const orthographyWordsMode = diagnosticMode === 'orthography-words'
+    const orthographyMapMode = diagnosticMode === 'orthography-map'
+    const orthographyTargetMode = diagnosticMode === 'orthography-target'
+    const orthographyCandidateMode = diagnosticMode === 'orthography-candidates'
+    const orthographyCaseMode = diagnosticMode === 'orthography-case'
+    const orthographyStructureMode = diagnosticMode === 'orthography-structure'
+    const diagnosticStage = Number(
+      new URL(location.href).searchParams.get('stage') ?? 0
+    )
+    const diagnosticAnswers = [
+      'Wasser hat eie grössere Dichte als Eis da Eis durch die Wasserstoffbrückenbindung sich beim gefrieren besonders anordnet und somit mehr Volumen pro Molekyl braucht. Durch die gringere Dichte von Eis schwimmt es auf dem Wasser.',
+      'Wasser hat eine grössere Dichte als Eis da Eis durch die Wasserstoffbrückenbindung sich beim gefrieren besonders anordnet und somit mehr Volumen pro Molekyl braucht. Durch die gringere Dichte von Eis schwimmt es auf dem Wasser.',
+      'Wasser hat eine größere Dichte als Eis da Eis durch die Wasserstoffbrückenbindung sich beim gefrieren besonders anordnet und somit mehr Volumen pro Molekyl braucht. Durch die gringere Dichte von Eis schwimmt es auf dem Wasser.',
+      'Wasser hat eine größere Dichte als Eis, da Eis durch die Wasserstoffbrückenbindung sich beim gefrieren besonders anordnet und somit mehr Volumen pro Molekyl braucht. Durch die gringere Dichte von Eis schwimmt es auf dem Wasser.',
+      'Wasser hat eine größere Dichte als Eis, da Eis durch die Wasserstoffbrückenbindung sich beim Gefrieren besonders anordnet und somit mehr Volumen pro Molekyl braucht. Durch die gringere Dichte von Eis schwimmt es auf dem Wasser.',
+      'Wasser hat eine größere Dichte als Eis, da Eis durch die Wasserstoffbrückenbindung sich beim Gefrieren besonders anordnet und somit mehr Volumen pro Molekül braucht. Durch die gringere Dichte von Eis schwimmt es auf dem Wasser.',
+      'Wasser hat eine grössere Dichte als Eis, da Eis durch die Wasserstoffbrückenbindung sich beim gefrieren besonders anordnet und somit mehr Volumen pro Molekyl braucht. Durch die gringere Dichte von Eis schwimmt es auf dem Wasser.',
+      'Wasser hat eine größere Dichte als Eis da Eis durch die Wasserstoffbrückenbindung sich beim gefrieren besonders anordnet und somit mehr Volumen pro Molekül braucht. Durch die geringere Dichte von Eis schwimmt es auf dem Wasser.'
+    ]
+    const diagnosticAnswer =
+      diagnosticAnswers[diagnosticStage] ?? diagnosticAnswers[0]
+    const diagnosticWords = diagnosticAnswer.match(/[\p{L}\p{M}]+/gu) ?? []
+    const wordChunkStart = Number(
+      new URL(location.href).searchParams.get('start') ?? 0
+    )
+    const diagnosticWordChunk = diagnosticWords
+      .map((word, word_index) => ({ word_index, word }))
+      .slice(wordChunkStart, wordChunkStart + 8)
+    const targetWordIndex = Number(
+      new URL(location.href).searchParams.get('target') ?? 0
+    )
+    const targetWord = diagnosticWords[targetWordIndex] ?? ''
+    const candidateItems = [
+      {
+        word_index: 2,
+        original: 'eie',
+        candidates: ['eibe', 'eide', 'eier', 'eies', 'eike', 'eile', 'eine', 'eire', 'eie']
+      },
+      {
+        word_index: 3,
+        original: 'grössere',
+        candidates: ['gröbere', 'größere', 'grassiere', 'glossiere', 'grössere']
+      },
+      {
+        word_index: 14,
+        original: 'gefrieren',
+        candidates: ['gefrieren', 'Gefrieren']
+      },
+      {
+        word_index: 22,
+        original: 'Molekyl',
+        candidates: ['Molekül', 'Moleküle', 'Moleküls', 'Molke', 'Molekyl']
+      },
+      {
+        word_index: 26,
+        original: 'gringere',
+        candidates: ['geringere', 'grünere', 'geringer', 'gringere']
+      }
+    ]
+    const targetCandidates =
+      candidateItems.find(item => item.word_index === targetWordIndex)
+        ?.candidates ?? [targetWord]
+    const completionRequest = orthographyStructureMode
+      ? {
+          messages: [
+            {
+              role: 'system',
+              content:
+                'Prüfe ausschließlich deutsche Großschreibung und fehlende Kommas. Die Wörter sind nullbasiert nummeriert. uppercase_word_indices enthält nur Indizes von kleingeschriebenen Wörtern, die im Satz groß beginnen müssen; beachte besonders nominalisierte Verben nach "beim", "zum" oder "im". comma_before_word_indices enthält nur Wortindizes, unmittelbar vor denen ein fehlendes Komma stehen muss; beachte Nebensätze mit "da", "weil", "dass", "wenn", "obwohl". Keine Rechtschreibung, keine anderen Satzzeichen, keine Grammatik, keine Wortänderung. Prüfe alle Wörter und gib nur JSON aus.'
+            },
+            {
+              role: 'user',
+              content:
+                'Originaltext: ' + diagnosticAnswer + '\nWörter:\n' +
+                JSON.stringify(
+                  diagnosticWords.map((word, word_index) => ({
+                    word_index,
+                    word
+                  }))
+                ) +
+                '\nGib genau {"uppercase_word_indices":[],"comma_before_word_indices":[]} aus.'
+            }
+          ],
+          temperature: 0,
+          max_tokens: 64,
+          response_format: {
+            type: 'json_object',
+            schema: JSON.stringify({
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                uppercase_word_indices: {
+                  type: 'array',
+                  maxItems: 24,
+                  items: { type: 'integer', minimum: 0, maximum: 8000 }
+                },
+                comma_before_word_indices: {
+                  type: 'array',
+                  maxItems: 24,
+                  items: { type: 'integer', minimum: 0, maximum: 8000 }
+                }
+              },
+              required: [
+                'uppercase_word_indices',
+                'comma_before_word_indices'
+              ]
+            })
+          },
+          extra_body: { enable_thinking: false }
+        }
+      : orthographyCandidateMode
+      ? {
+          messages: [
+            {
+              role: 'system',
+              content:
+                'Wähle für jedes markierte Wort im deutschen Satz genau die kontextuell richtige Schreibweise aus seiner Kandidatenliste. Deutschland-de-DE, keine Schweizer ss-Schreibung. Wähle original nur, wenn es bereits richtig geschrieben ist. Ändere weder Grammatik noch Wortbedeutung. word_index bleibt unverändert. Bearbeite alle Einträge. Gib nur JSON aus.'
+            },
+            {
+              role: 'user',
+              content:
+                'Satz: ' + diagnosticAnswer + '\nKandidaten:\n' +
+                JSON.stringify(candidateItems) +
+                '\nGib genau {"choices":[{"word_index":0,"replacement":"..."}]} mit allen Einträgen in derselben Reihenfolge aus.'
+            }
+          ],
+          temperature: 0,
+          max_tokens: 128,
+          response_format: {
+            type: 'json_object',
+            schema: JSON.stringify({
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                choices: {
+                  type: 'array',
+                  minItems: candidateItems.length,
+                  maxItems: candidateItems.length,
+                  items: {
+                    type: 'object',
+                    additionalProperties: false,
+                    properties: {
+                      word_index: {
+                        type: 'integer',
+                        minimum: 0,
+                        maximum: 8000
+                      },
+                      replacement: { type: 'string', maxLength: 64 }
+                    },
+                    required: ['word_index', 'replacement']
+                  }
+                }
+              },
+              required: ['choices']
+            })
+          },
+          extra_body: { enable_thinking: false }
+        }
+      : orthographyCaseMode
+      ? {
+          messages: [
+            {
+              role: 'system',
+              content:
+                'Korrigiere im deutschen Originaltext ausschließlich Groß-/Kleinschreibung und Zeichensetzung. Jeder Buchstabe jedes Wortes muss abgesehen von seiner Groß-/Kleinschreibung identisch bleiben; Wörter dürfen weder ergänzt, gelöscht, ersetzt noch umgestellt werden. Beachte insbesondere Kommas an Nebensatzgrenzen und nominalisierte Verben wie "beim Laufen". Gib nur JSON aus.'
+            },
+            {
+              role: 'user',
+              content:
+                'Originaltext:\n' + diagnosticAnswer +
+                '\nGib genau {"corrected_text":"..."} mit dem vollständigen Text aus.'
+            }
+          ],
+          temperature: 0,
+          max_tokens: 192,
+          response_format: {
+            type: 'json_object',
+            schema: JSON.stringify({
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                corrected_text: { type: 'string', maxLength: 4000 }
+              },
+              required: ['corrected_text']
+            })
+          },
+          extra_body: { enable_thinking: false }
+        }
+      : orthographyTargetMode
+      ? {
+          messages: [
+            {
+              role: 'system',
+              content:
+                'Du bist eine genaue Rechtschreibprüfung für Deutschland-de-DE. Wähle ausschließlich aus der vorgegebenen Kandidatenliste die im Satz kontextuell richtige Schreibweise des markierten Wortes. Keine Schweizer ss-Schreibung, keine Grammatik, keine Synonyme und keine Satzzeichen. Gib nur JSON aus.'
+            },
+            {
+              role: 'user',
+              content:
+                'Satz: ' + diagnosticAnswer + '\nMarkiertes Wort ' +
+                targetWordIndex + ': "' + targetWord +
+                '"\nErlaubte Kandidaten: ' + JSON.stringify(targetCandidates) +
+                '\nGib genau {"replacement":"..."} aus; replacement muss exakt einer der erlaubten Kandidaten sein.'
+            }
+          ],
+          temperature: 0,
+          max_tokens: 48,
+          response_format: {
+            type: 'json_object',
+            schema: JSON.stringify({
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                replacement: { type: 'string', maxLength: 64 }
+              },
+              required: ['replacement']
+            })
+          },
+          extra_body: { enable_thinking: false }
+        }
+      : orthographyMapMode
+      ? {
+          messages: [
+            {
+              role: 'system',
+              content:
+                'Korrigiere die deutsche Rechtschreibung nach de-DE. Gib für jeden Eingabeeintrag genau einen Ausgabeeintrag mit unverändertem word_index aus. Bei einem richtig geschriebenen Wort bleibt replacement exakt gleich; bei einem Rechtschreibfehler enthält replacement nur die richtige Schreibung dieses einen Wortes. Beachte Tippfehler, Umlaute, ß und Groß-/Kleinschreibung. Keine Grammatik, keine Wortwahl, keine Satzzeichen. Beispiel: [{"word_index":7,"word":"schwimt"}] wird zu {"words":[{"word_index":7,"replacement":"schwimmt"}]}. Gib nur JSON aus.'
+            },
+            {
+              role: 'user',
+              content:
+                'Kontextsatz: ' + diagnosticAnswer + '\nWörter:\n' +
+                JSON.stringify(diagnosticWordChunk) +
+                '\nGib alle ' + diagnosticWordChunk.length +
+                ' Einträge in derselben Reihenfolge als {"words":[...]} aus.'
+            }
+          ],
+          temperature: 0,
+          max_tokens: 192,
+          response_format: {
+            type: 'json_object',
+            schema: JSON.stringify({
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                words: {
+                  type: 'array',
+                  minItems: diagnosticWordChunk.length,
+                  maxItems: diagnosticWordChunk.length,
+                  items: {
+                    type: 'object',
+                    additionalProperties: false,
+                    properties: {
+                      word_index: {
+                        type: 'integer',
+                        minimum: 0,
+                        maximum: 8000
+                      },
+                      replacement: { type: 'string', maxLength: 64 }
+                    },
+                    required: ['word_index', 'replacement']
+                  }
+                }
+              },
+              required: ['words']
+            })
+          },
+          extra_body: { enable_thinking: false }
+        }
+      : orthographyWordsMode
+      ? {
+          messages: [
+            {
+              role: 'system',
+              content:
+                'Prüfe jedes nummerierte deutsche Wort nach de-DE. Gib für jedes sicher falsch geschriebene Wort genau einen Eintrag mit demselben word_index und der richtigen Schreibung aus. Prüfe Tippfehler, Umlaute, ß und Groß-/Kleinschreibung. Keine Grammatik, keine Wortwahl, keine Satzzeichen: das Wort "da" ist korrekt. Erfasse alle Fehler und höre nicht nach dem ersten auf. Gib nur JSON aus.'
+            },
+            {
+              role: 'user',
+              content:
+                'Die Wörter stehen in Textreihenfolge und word_index ist nullbasiert:\n' +
+                JSON.stringify(diagnosticWords.map((word, word_index) => ({
+                  word_index,
+                  word
+                }))) +
+                '\nGib genau {"corrections":[{"word_index":0,"replacement":"..."}]} aus. Korrekte Wörter werden nicht ausgegeben.'
+            }
+          ],
+          temperature: 0,
+          max_tokens: 256,
+          response_format: {
+            type: 'json_object',
+            schema: JSON.stringify({
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                corrections: {
+                  type: 'array',
+                  maxItems: 24,
+                  items: {
+                    type: 'object',
+                    additionalProperties: false,
+                    properties: {
+                      word_index: {
+                        type: 'integer',
+                        minimum: 0,
+                        maximum: 8000
+                      },
+                      replacement: { type: 'string', maxLength: 64 }
+                    },
+                    required: ['word_index', 'replacement']
+                  }
+                }
+              },
+              required: ['corrections']
+            })
+          },
+          extra_body: { enable_thinking: false }
+        }
+      : diagnosticMode?.startsWith('orthography')
+      ? {
+          messages: [
+            {
+              role: 'system',
+              content: orthographyTextMode
+                ? 'Korrigiere im deutschen Originaltext ausschließlich Rechtschreibung nach Deutschland-de-DE, Groß-/Kleinschreibung und Zeichensetzung. Verwende ausdrücklich keine Schweizer ss-Schreibung: zum Beispiel wird "Strasse" zu "Straße" und "grösser" zu "größer". Nominalisierte Verben werden großgeschrieben, zum Beispiel "beim laufen" zu "beim Laufen". Prüfe auch fehlende Buchstaben sowie falsche Umlaute wie in "Tyr" zu "Tür". Ändere keine Grammatik, keine Wörter aus stilistischen Gründen, keinen Satzbau, keine Wortstellung und keinen Inhalt. Behalte alle Wörter und Sätze in derselben Reihenfolge. Prüfe den gesamten Text bis zum letzten Wort und gib nur JSON aus.'
+                :
+                'Prüfe die gesamte deutsche Lernendenantwort Wort für Wort und Satz für Satz. ' +
+                'Gib nur sichere Korrekturstellen für Rechtschreibung und Zeichensetzung aus, ' +
+                'erfasse davon aber alle und höre nicht nach dem ersten Fehler auf. Verwende die ' +
+                'deutsche Rechtschreibung für de-DE, einschließlich Umlauten, ß, Groß-/Kleinschreibung ' +
+                'und erforderlichen Kommas an Nebensatzgrenzen. Ändere keine Grammatik, keinen Satzbau, ' +
+                'keine Wortstellung, keinen Stil und keinen Inhalt. Zweifelhafte Stellen bleiben unverändert. ' +
+                'Beispiel: "Eis schwimt." ben\u00f6tigt genau den spelling-Ersatz ' +
+                '{"source":"schwimt","replacement":"schwimmt"}. Gib nur Patch-JSON aus.'
+            },
+            {
+              role: 'user',
+              content:
+                'BEGIN_UNTRUSTED_ORTHOGRAPHY_DATA_JSON\n' +
+                JSON.stringify({
+                  sprache: 'de-DE',
+                  frage_nur_als_fachwortkontext:
+                    'Erkl\u00e4re, warum Eis auf flüssigem Wasser schwimmt.',
+                  musterloesung_nur_als_fachwortkontext:
+                    'Beim Gefrieren entsteht eine besondere Molekülstruktur, durch die Eis eine geringere Dichte als flüssiges Wasser hat. Deshalb schwimmt Eis auf Wasser.',
+                  maximale_aenderungen: 24,
+                  lernendenantwort_original: diagnosticAnswer
+                }) +
+                '\nEND_UNTRUSTED_ORTHOGRAPHY_DATA_JSON\n' +
+                (orthographyTextMode
+                  ? 'Gib genau {"corrected_text":"..."} mit dem vollständig korrigierten Text aus.'
+                  : 'Gib genau {"edits":[...]} mit kind, line, column, source und replacement aus. ' +
+                    'line und column sind nullbasiert und beziehen sich auf den unveränderten Originaltext. ' +
+                    'Sortiere alle sicheren Stellen in Textreihenfolge. source enthält bei spelling exakt ' +
+                    'das vollständige falsche Wort; bei einer reinen Satzzeicheneinfügung ist source leer. ' +
+                    'Erfasse die gesamte Antwort.')
+            }
+          ],
+          temperature: 0,
+          max_tokens: orthographyTextMode ? 256 : 384,
+          response_format: {
+            type: 'json_object',
+            schema: JSON.stringify(orthographyTextMode ? {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                corrected_text: { type: 'string', maxLength: 4000 }
+              },
+              required: ['corrected_text']
+            } : {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                edits: {
+                  type: 'array',
+                  maxItems: 24,
+                  items: {
+                    type: 'object',
+                    additionalProperties: false,
+                    properties: {
+                      kind: {
+                        type: 'string',
+                        enum: ['spelling', 'punctuation']
+                      },
+                      line: { type: 'integer', minimum: 0, maximum: 8000 },
+                      column: { type: 'integer', minimum: 0, maximum: 8000 },
+                      source: { type: 'string', maxLength: 64 },
+                      replacement: { type: 'string', maxLength: 64 }
+                    },
+                    required: [
+                      'kind',
+                      'line',
+                      'column',
+                      'source',
+                      'replacement'
+                    ]
+                  }
+                }
+              },
+              required: ['edits']
+            })
+          },
+          extra_body: { enable_thinking: false }
+        }
+      : {
       messages: [
         {
           role: 'user',
@@ -160,7 +576,8 @@ window.addEventListener('unhandledrejection', event => {
       temperature: 0,
       max_tokens: 48,
       extra_body: { enable_thinking: false }
-    })
+    }
+    const completion = await engine.chat.completions.create(completionRequest)
     const generationDurationMs = Number(
       (performance.now() - generationStarted).toFixed(1)
     )

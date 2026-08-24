@@ -1,11 +1,11 @@
 <!--
 author:      MINT-the-GAP, Martin Lommatzsch
-version:     0.5.11
+version:     0.5.12
 language:    de
 narrator:    Deutsch Female
 comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
 repository:  https://github.com/MINT-the-GAP/lia-llm
-script:      ./dist/index.js?v=0.5.11
+script:      ./dist/index.js
 
 attribute:   [WebLLM](https://webllm.mlc.ai/docs/) by MLC is licensed under
              [Apache-2.0](https://github.com/mlc-ai/web-llm/blob/main/LICENSE), and
@@ -16,6 +16,10 @@ attribute:   [WebLLM](https://webllm.mlc.ai/docs/) by MLC is licensed under
              and [multilingual mDeBERTa-v3 NLI](https://huggingface.co/Xenova/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7)
              by Moritz Laurer, converted for Transformers.js by Xenova, is licensed under
              [MIT](https://huggingface.co/MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7/blob/main/LICENSE).
+             [cspell-trie-lib](https://github.com/streetsidesoftware/cspell/tree/main/packages/cspell-trie-lib)
+             and the [German cspell dictionary](https://github.com/streetsidesoftware/cspell-dicts/tree/master/dictionaries/de_DE)
+             by Street Side Software are licensed under
+             [MIT](https://github.com/streetsidesoftware/cspell/blob/main/LICENSE).
 
 @LLMQuiz: @LLMQuiz_(@uid,@0,```LiaScript-Freitextaufgabe```,```@1```)
 @LLMQuiz.question: @LLMQuiz_(@uid,@0,```@1```,```@2```)
@@ -36,6 +40,7 @@ let active = true
 let finished = false
 let feedbackEnabled = false
 let referenceVariants = []
+let quizOptions = null
 
 window.LiaLLM?.showFeedback?.(feedbackId, "")
 window.LiaLLM?.showActivity?.(activityId, runId, "selecting-model")
@@ -49,9 +54,29 @@ function clearSolutionVariant() {
   window.LiaLLM?.clearSolutionVariant?.(solutionVariantId, runId)
 }
 
-function showLearnerFeedback(message) {
+function showLearnerFeedback(feedback, languageCheck) {
   if (!active) return
-  window.LiaLLM?.showFeedback?.(feedbackId, feedbackEnabled ? message : "")
+  const visibleFeedback = feedbackEnabled ? feedback : null
+  const displayOptions =
+    visibleFeedback?.orthographyCorrection || languageCheck
+      ? {
+          ...(visibleFeedback?.orthographyCorrection
+            ? { orthographyCorrection: visibleFeedback.orthographyCorrection }
+            : {}),
+          ...(languageCheck ? { languageCheck } : {})
+        }
+      : undefined
+  window.LiaLLM?.showFeedback?.(
+    feedbackId,
+    visibleFeedback?.message ?? "",
+    displayOptions
+  )
+}
+
+function stoppedError() {
+  const error = new Error("Die Sprachprüfung wurde beendet.")
+  error.name = "AbortError"
+  return error
 }
 
 function finishQuiz(value) {
@@ -85,11 +110,12 @@ Promise.resolve()
     if (!window.LiaLLM) {
       throw new Error("lia-llm konnte nicht geladen werden.")
     }
-    if (window.LiaLLM.version !== "0.5.11") {
-      throw new Error(`lia-llm 0.5.11 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
+    if (window.LiaLLM.version !== "0.5.12") {
+      throw new Error(`lia-llm 0.5.12 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
     }
 
     const options = window.LiaLLM.parseMacroOptions(optionSource)
+    quizOptions = options
     referenceVariants = window.LiaLLM.parseReferenceVariants(referenceSource)
     feedbackEnabled = options.feedback
     if (options.operator && question === "LiaScript-Freitextaufgabe") {
@@ -105,14 +131,7 @@ Promise.resolve()
       referenceVariants: referenceVariants.slice(1),
       assessmentEngine: options.assessmentEngine,
       operator: options.operator ?? undefined,
-      criterionThreshold: options.passThreshold,
-      languageAnalysis:
-        options.rechtschreibung || options.satzbau
-          ? {
-              spelling: options.rechtschreibung,
-              syntax: options.satzbau
-            }
-          : undefined
+      criterionThreshold: options.passThreshold
     }, {
       signal: evaluationController.signal,
       maxThinkingTimeMs: options.maxThinkingTimeMs,
@@ -147,7 +166,48 @@ Promise.resolve()
     const feedback = feedbackEnabled
       ? window.LiaLLM?.feedbackForResult?.(result, "de-DE") ?? null
       : null
-    showLearnerFeedback(feedback?.message ?? "")
+    const languageCheck =
+      feedbackEnabled &&
+      quizOptions &&
+      (quizOptions.rechtschreibung || quizOptions.satzbau)
+        ? {
+            runId,
+            kind: quizOptions.rechtschreibung ? "orthography" : "syntax",
+            run: async signal => {
+              if (!active) throw stoppedError()
+              const languageAnalysis = await window.LiaLLM.evaluateLanguage({
+                question,
+                answer,
+                reference: referenceVariants[0],
+                referenceVariants: referenceVariants.slice(1),
+                assessmentEngine: "quality",
+                operator: quizOptions.operator ?? undefined,
+                criterionThreshold: quizOptions.passThreshold,
+                languageAnalysis: {
+                  spelling: quizOptions.rechtschreibung,
+                  syntax: quizOptions.satzbau
+                }
+              }, { signal })
+              if (!active) throw stoppedError()
+              const languageFeedback =
+                window.LiaLLM.feedbackForResult(
+                  { ...result, languageAnalysis },
+                  "de-DE"
+                )
+              return {
+                completed: languageAnalysis?.status === "completed",
+                message: languageFeedback?.message ?? "",
+                ...(languageFeedback?.orthographyCorrection
+                  ? {
+                      orthographyCorrection:
+                        languageFeedback.orthographyCorrection
+                    }
+                  : {})
+              }
+            }
+          }
+        : undefined
+    showLearnerFeedback(feedback, languageCheck)
     finishQuiz(result.passed ? "true" : "false")
   })
   .catch(error => {
@@ -155,7 +215,7 @@ Promise.resolve()
     clearSolutionVariant()
     const feedback = window.LiaLLM?.feedbackForError?.(error, "de-DE") ?? null
     if (feedback) {
-      showLearnerFeedback(feedback.message)
+      showLearnerFeedback(feedback)
       finishQuiz("false")
       return
     }
@@ -306,10 +366,10 @@ Optionsschreibweise sind gleichwertig:
 | `solution=0` / zweiter Wert `0` | Musterlösung unabhängig vom Ergebnis nie anzeigen |
 | `feedback=1` / dritter Wert `1` | kurze priorisierte Rückmeldung einschalten; ein reiner Stilhinweis kann auch bei richtiger Antwort erscheinen |
 | `feedback=0` / dritter Wert `0` | zusätzliches Kurzfeedback ausschalten |
-| `assessmentengine=compact|quality` | Engine explizit festlegen; normale Auswertungen verwenden ohne Angabe `compact`, erweiterte Prüfungen zur Rückwärtskompatibilität implizit `quality` |
+| `assessmentengine=compact|quality` | Engine ausschließlich für die Inhaltsprüfung festlegen; ohne Angabe nutzt normaler Inhalt `compact`, die spätere optionale Sprachprüfung unabhängig davon `quality` |
 | `operator=...` / vierter Wert | zusätzlich die verlangte Antwortform des gesetzten Operators prüfen |
-| `Rechtschreibung=1` | Wortzahl sowie getrennte Schätzungen für Zeichensetzungs- und Rechtschreibfehler ausgeben |
-| `Satzbau=1` | Wortzahl sowie eine Schätzung für Satzbaufehler ausgeben |
+| `Rechtschreibung=1` | nach der fertigen Inhaltsprüfung einen Button für Rechtschreibung, Zeichensetzung und die sichere Korrekturansicht anbieten |
+| `Satzbau=1` | nach der fertigen Inhaltsprüfung einen Button für Wortzahl und geschätzte Satzbaufehler anbieten; ohne Textkorrektur |
 | `maxthinkingtime=...` | maximale zusätzliche Denkzeit: `0s`, `5s`, `10s`, `15s`, `20s` oder `30s`; Standard ist `15s` |
 | `maxthinkingtokens=...` | maximales Thinking-Ausgabebudget: `low`, `medium`, `high`, `ultra` oder experimentell `extreme`; Standard ist `medium` |
 
@@ -326,13 +386,15 @@ Namen sind nicht von Groß- und Kleinschreibung abhängig; als Werte sind `0`, `
 und `true` zulässig. Sobald mindestens eine dieser Optionen eingeschaltet ist, muss auch
 `feedback=1` gesetzt sein, damit die Sprachstatistik sichtbar ausgegeben werden kann.
 
-`assessmentengine` ist ausschließlich als benannte Option zulässig. Eine ausdrückliche Wahl von
-`assessmentengine=compact` wird niemals automatisch auf das WebGPU-Qualitätsmodell hochgestuft.
-Sie kann deshalb nicht mit einem Operator, aktivierter Rechtschreib-/Satzbauanalyse oder einem
-positiven Thinking-Limit kombiniert werden; der Parser meldet diesen Konflikt direkt. Ein allein
-gesetztes `maxthinkingtime=0s` bleibt mit `compact` zulässig. Für ältere Makros ohne Engine-Angabe
-bleibt die bisherige Auswahl erhalten: Operator, aktivierte Sprachanalyse und ausdrücklich
-aktiviertes Thinking wählen implizit `quality`; alle anderen Aufrufe verwenden `compact`.
+`assessmentengine` ist ausschließlich als benannte Option zulässig und steuert nur die
+Inhaltsprüfung. Eine ausdrückliche Wahl von `assessmentengine=compact` wird dafür niemals
+automatisch auf das WebGPU-Qualitätsmodell hochgestuft. Sie kann deshalb nicht mit einem Operator
+oder einem positiven Thinking-Limit kombiniert werden; der Parser meldet diesen Konflikt direkt.
+Ein allein gesetztes `maxthinkingtime=0s` bleibt mit `compact` zulässig.
+`Rechtschreibung=1` und `Satzbau=1` dürfen dagegen mit beiden Inhaltsengines kombiniert werden:
+Ihr eigener Quality-Lauf beginnt erst nach dem Inhaltsurteil und ausschließlich durch den
+zusätzlichen Button. Ohne Engine-Angabe wählen Operator oder ausdrücklich aktiviertes Thinking für
+den Inhalt `quality`; normale Inhaltsprüfungen verwenden `compact`.
 
 ### Adaptiver Denkmodus
 
@@ -454,19 +516,59 @@ Der echte Aufgabenwortlaut steht bei `@LLMQuiz.question` nach dem Komma als zwei
 Makroparameter. Enthält er ein Komma, schützen die Backticks den vollständigen Text vor der
 Parametertrennung.
 
-Die Wortzahl wird im Browser nach einer festen Segmentierungsregel bestimmt und ist deshalb keine
-Modellschätzung. Die Fehlerzahlen stammen dagegen aus einer konservativen Prüfung durch das lokal
-ausgeführte Quality-Modell. Sie sind Hinweise für die Überarbeitung, keine verbindliche Korrektur:
-Weder Rechtschreibung, Zeichensetzung noch Satzbau verändern für sich die fachliche
-Richtig/Falsch-Entscheidung.
+Der erste Prüfen-Klick übergibt ausschließlich die unveränderte Lernendenantwort zur fachlichen
+Bewertung. Er enthält keinen Auftrag zur Rechtschreib-, Zeichensetzungs- oder Satzbauanalyse.
+Das Richtig/Falsch-Ergebnis und gegebenenfalls die Musterlösung werden vollständig ausgegeben,
+bevor irgendeine Sprachprüfung gestartet werden kann. Erkennbare Schreibfehler soll der
+Quality-Inhaltsjudge bei seiner fachlichen Entscheidung ausdrücklich ignorieren.
+Die Optionen `Rechtschreibung` und `Satzbau` verändern weder die gewählte Inhaltsengine noch
+deren Zeit- oder Tokenbudget.
+
+Erst danach erscheint bei `Rechtschreibung=1` die Schaltfläche **Rechtschreibung prüfen**,
+bei reinem `Satzbau=1` entsprechend **Satzbau prüfen**. Nur dieser zusätzliche Klick startet
+den lokalen Sprachmodelllauf. Bei kombinierten Optionen entstehen Rechtschreib-, Zeichensetzungs-
+und Satzbaustatistik gemeinsam nach diesem Klick. Der Lauf besitzt ein eigenes Abbruchsignal und
+kein Inhalts-Thinking-Budget. Das bereits ausgegebene Inhaltsurteil, seine Qualität und die
+ausgewählte Musterlösung werden dadurch nicht mehr verändert. Währenddessen kann weitergearbeitet
+oder die Folie gewechselt werden; eine neue Inhaltsprüfung beendet einen noch laufenden optionalen
+Sprachjob, während ein bereits erlaubter Download und der Modellcache erhalten bleiben.
+
+Die Wortzahl wird nach dem Klick im Browser nach einer festen Segmentierungsregel bestimmt und ist
+keine Modellschätzung. Für Rechtschreibung wird erst jetzt zusätzlich ein lokal ausgeliefertes
+de-DE-Wörterbuch geladen. Es prüft die gesamte Antwort tokenweise und sichert eindeutige Tippfehler
+ab; das lokale Quality-Modell ergänzt kontextabhängige Entscheidungen, Groß-/Kleinschreibung und
+Zeichensetzung. Mehrdeutige Wörter dürfen nur zwischen geprüften Einzelwort-Kandidaten gewählt
+werden. Die Fehlerzahlen sind Hinweise für die Überarbeitung, keine verbindliche Korrektur.
+Schlägt die nachgelagerte Prüfung fehl, bleibt das Inhaltsurteil erhalten und der Button bietet
+einen neuen Versuch an.
+
+Nach einer erfolgreichen Rechtschreibprüfung wird die vorgeschlagene Fassung automatisch
+eingeblendet; danach lässt sie sich mit **Korrigierten Text anzeigen/ausblenden** umschalten.
+Darin sind ausschließlich korrigierte
+Rechtschreib- und Zeichensetzungsstellen türkis, fett und unterstrichen markiert. Der
+Korrekturlauf berücksichtigt keine Satzbaufehler und ist ausdrücklich angewiesen, Wortstellung,
+Stil und Inhalt nicht zu verändern. Zusätzlich lässt die lokale Validierung keine ergänzten,
+gelöschten oder umgestellten Wörter, keine Zahlenänderungen und keine veränderten Absätze zu.
+Da die richtige Schreibung eines einzelnen Wortes trotzdem modellgestützt beurteilt wird, bleibt
+die eingeblendete Fassung ein Vorschlag. Die ursprünglich eingegebene Antwort wird weder
+überschrieben noch als LiaScript ausgeführt. Bei einer fehlerfreien Antwort kann die unveränderte
+Fassung zur Kontrolle eingeblendet werden.
+
+Die Korrekturansicht ist eine zusätzliche, abgesicherte Modellhilfe. Sie wird nicht angezeigt,
+wenn mehr als 24 Korrekturstellen entstehen oder ein Patch nicht eindeutig auf
+die Originalantwort passt. In diesem Fall werden Rechtschreib- und Zeichensetzungszahlen nicht
+als vermeintlich vollständiges Teilergebnis ausgegeben. Zum Schutz von Inhalt und Notation werden
+Zahlen/Formeln, Codebereiche und Änderungen über mehrere Worttoken hinweg nicht automatisch
+korrigiert; auch dadurch kann die Ansicht entfallen. `Satzbau=1` allein erzeugt niemals eine
+Korrekturansicht.
 
 Für die Fehlerzählung muss das Quality-Modell lokal verfügbar sein; bei Bedarf gelten dafür
 dieselben Download-, Cache- und WebGPU-Bedingungen wie für die gründliche Inhaltsprüfung. Ist diese
 Prüfung nicht verfügbar oder liefert sie kein gültiges Ergebnis, bleibt die deterministisch
 ermittelte Wortzahl sichtbar. Die angeforderten Fehlerzahlen werden dann als nicht verfügbar
-gekennzeichnet und nicht fälschlich mit null angegeben. lia-llm wiederholt eine unvollständige
-oder ungültige Modellausgabe einmal mit einer strengeren Reparaturanweisung. Scheitert auch dieser
-Versuch, weist die manuell abgerufene DebugNotiz den Grund als
+gekennzeichnet und nicht fälschlich mit null angegeben. Unsichere freie Modellausgaben werden
+durch Wörterbuchtreffer und positionsgebundene Auswahlentscheidungen ergänzt beziehungsweise
+verworfen. Scheitert der sichere Gesamtlauf, weist die manuell abgerufene DebugNotiz den Grund als
 `language-analysis-output-invalid` aus, ohne Lernenden- oder Modelltext zu protokollieren.
 
 ## Modelle, Laden und Cache
@@ -642,9 +744,13 @@ Aufgabe 1: Erkläre, warum Eis auf flüssigem Wasser schwimmt.
 <!-- data-solution-button="off" data-llm-textarea="5" -->
 [[Antwort]]
 [[?]] Hinweis
-```text @LLMQuiz(0.66;solution=1;feedback=1;Rechtschreibung=1;Satzbau=1)
+```text @LLMQuiz.question(0.66;solution=1;feedback=1;assessmentengine=compact;Rechtschreibung=1;Satzbau=1,`Erkläre, warum Eis auf flüssigem Wasser schwimmt.`)
 Beim Gefrieren entsteht eine besondere Molekülstruktur, durch die Eis eine geringere
 Dichte als flüssiges Wasser hat. Deshalb schwimmt Eis auf Wasser.
+<!-- lia-llm:alternative -->
+Flüssiges Wasser hat eine größere Dichte als Eis. Beim Gefrieren ordnen sich Wassermoleküle
+durch Wasserstoffbrücken so an, dass mehr Volumen entsteht. Wegen seiner geringeren Dichte
+schwimmt Eis auf Wasser.
 ```
 
 

@@ -119,9 +119,6 @@ function validateEngineCompatibility(options: LLMQuizMacroOptions): void {
 
   const incompatible: string[] = []
   if (options.operator) incompatible.push("operator")
-  if (options.rechtschreibung || options.satzbau) {
-    incompatible.push("Rechtschreibung/Satzbau")
-  }
   if (explicitlyEnablesThinking(options)) {
     incompatible.push("aktivem Thinking")
   }

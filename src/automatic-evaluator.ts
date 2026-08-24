@@ -35,6 +35,7 @@ import type {
   EvaluationProgress,
   EvaluationRequest,
   EvaluationResult,
+  LanguageAnalysisResult,
   ModelCacheInfo,
   RuntimeConfig,
   RuntimeStatus,
@@ -277,6 +278,7 @@ export class AutomaticEvaluator {
   private qualityCacheInfoPromise: Promise<ModelCacheInfo> | null = null
   private qualityUpgradePromise: Promise<boolean> | null = null
   private qualityEvaluationQueue: Promise<void> = Promise.resolve()
+  private activeLanguageController: AbortController | null = null
   private compactUsers = 0
   private compactUnloadPromise: Promise<void> | null = null
   private clearPromise: Promise<number> | null = null
@@ -318,6 +320,11 @@ export class AutomaticEvaluator {
   private async waitForClear(): Promise<void> {
     const clearing = this.clearPromise
     if (clearing) await clearing
+  }
+
+  private cancelActiveLanguageEvaluation(): void {
+    this.activeLanguageController?.abort()
+    this.activeLanguageController = null
   }
 
   private reportProgress(
@@ -622,7 +629,7 @@ export class AutomaticEvaluator {
   ): Promise<EvaluationResult> {
     const generation = this.generation
     const languageOnly =
-      compactFallback?.passed === true &&
+      compactFallback !== undefined &&
       !request.operator?.trim() &&
       !explicitlyRequestsThinking(options) &&
       normalizeLanguageAnalysisOptions(request.languageAnalysis) !== undefined
@@ -732,6 +739,9 @@ export class AutomaticEvaluator {
     const requestedEngine = requestedAssessmentEngine(request.assessmentEngine)
     const evaluationOptions = options ? { ...options } : undefined
     const normalized = normalizeRequest(request)
+    // A newly requested content assessment always takes precedence over an
+    // optional language check that was started from an earlier feedback UI.
+    this.cancelActiveLanguageEvaluation()
     const deterministicResult = createAssessmentManipulationResult(normalized)
     if (deterministicResult) {
       if (evaluationOptions?.signal?.aborted) throw abortError()
@@ -744,6 +754,11 @@ export class AutomaticEvaluator {
     const useQuality =
       requestedEngine === "quality" ||
       (requestedEngine === undefined && advancedQualityFeature)
+    const implicitLanguageOnly =
+      requestedEngine === undefined &&
+      normalized.languageAnalysis !== undefined &&
+      normalized.operator === undefined &&
+      !explicitlyRequestsThinking(evaluationOptions)
     await this.waitForClear()
     const run: EvaluationRun = {
       generation: this.generation,
@@ -765,11 +780,25 @@ export class AutomaticEvaluator {
       )
     }
 
+    let compactResult: EvaluationResult | undefined
+    if (implicitLanguageOnly) {
+      compactResult = operatorSafeCompactResult(
+        request,
+        await this.evaluateCompact(request, evaluationOptions, run),
+      )
+      assertRunActive(run)
+    }
+
     if (
       this.qualityReady &&
       !this.qualityDegraded
     ) {
-      return this.evaluateQualityWithFallback(request, evaluationOptions, run)
+      return this.evaluateQualityWithFallback(
+        request,
+        evaluationOptions,
+        run,
+        compactResult,
+      )
     }
 
     let qualityCache: ModelCacheInfo | undefined
@@ -781,7 +810,12 @@ export class AutomaticEvaluator {
     assertRunActive(run)
 
     if (this.qualityReady && !this.qualityDegraded) {
-      return this.evaluateQualityWithFallback(request, evaluationOptions, run)
+      return this.evaluateQualityWithFallback(
+        request,
+        evaluationOptions,
+        run,
+        compactResult,
+      )
     }
 
     if (
@@ -802,15 +836,22 @@ export class AutomaticEvaluator {
       )
       assertRunActive(run)
       if (qualityAvailable) {
-        return this.evaluateQualityWithFallback(request, evaluationOptions, run)
+        return this.evaluateQualityWithFallback(
+          request,
+          evaluationOptions,
+          run,
+          compactResult,
+        )
       }
     }
 
-    const compactResult = operatorSafeCompactResult(
-      request,
-      await this.evaluateCompact(request, evaluationOptions, run),
-    )
-    assertRunActive(run)
+    if (!compactResult) {
+      compactResult = operatorSafeCompactResult(
+        request,
+        await this.evaluateCompact(request, evaluationOptions, run),
+      )
+      assertRunActive(run)
+    }
     const qualityUpgrade = this.startQualityUpgrade(qualityCache)
 
     this.reportProgress(evaluationOptions, run, {
@@ -833,6 +874,134 @@ export class AutomaticEvaluator {
       run,
       compactResult,
     )
+  }
+
+  async evaluateLanguage(
+    originalRequest: EvaluationRequest,
+    options?: EvaluationOptions,
+  ): Promise<LanguageAnalysisResult | undefined> {
+    const request = snapshotRequest(originalRequest)
+    const normalized = normalizeRequest(request)
+    const languageOptions = normalized.languageAnalysis
+    if (!languageOptions) return undefined
+
+    this.cancelActiveLanguageEvaluation()
+    const controller = new AbortController()
+    const callerSignal = options?.signal
+    const abortFromCaller = (): void => controller.abort()
+    if (callerSignal?.aborted) controller.abort()
+    else callerSignal?.addEventListener("abort", abortFromCaller, { once: true })
+    this.activeLanguageController = controller
+
+    try {
+      await this.waitForClear()
+      const run: EvaluationRun = {
+        generation: this.generation,
+        requestSignal: controller.signal,
+        lifecycleSignal: this.lifecycleController.signal,
+      }
+      assertRunActive(run)
+      this.reportProgress(options, run, {
+        phase: "selecting-model",
+        engine: "quality",
+        message: "Sprachmodell wird ausgewählt …",
+      })
+      if (!this.qualityReady || this.qualityDegraded) {
+        let cache: ModelCacheInfo | undefined
+        try {
+          cache = await waitForRun(this.getQualityCacheInfo(), run)
+        } catch (error) {
+          if (isAbortError(error)) throw error
+        }
+        assertRunActive(run)
+        if (!this.qualityDegraded) {
+          this.reportProgress(options, run, {
+            phase: "preparing-quality",
+            engine: "quality",
+            message: "Sprachprüfung wird vorbereitet …",
+          })
+          const available = await waitForRun(
+            this.startQualityUpgrade(cache),
+            run,
+          )
+          if (!available) {
+            return unavailableLanguageAnalysis(
+              normalized.answer,
+              languageOptions,
+            )
+          }
+        }
+      }
+      assertRunActive(run)
+      if (!this.qualityReady || this.qualityDegraded) {
+        return unavailableLanguageAnalysis(normalized.answer, languageOptions)
+      }
+      this.reportProgress(options, run, {
+        phase: "evaluating-quality",
+        engine: "quality",
+        message: languageOptions.spelling
+          ? "Rechtschreibung und Zeichensetzung werden geprüft …"
+          : "Satzbau wird geprüft …",
+      })
+
+      const generation = run.generation
+      const task = async (): Promise<LanguageAnalysisResult> => {
+        assertRunActive(run)
+        if (
+          generation !== this.generation ||
+          !this.qualityReady ||
+          this.qualityDegraded
+        ) {
+          return unavailableLanguageAnalysis(
+            normalized.answer,
+            languageOptions,
+          )
+        }
+        const linkedSignal = linkRunSignals(run)
+        const languageEvaluationOptions: EvaluationOptions = {
+          ...options,
+          signal: linkedSignal.signal,
+        }
+        if (options?.onProgress) {
+          languageEvaluationOptions.onProgress = (progress) =>
+            this.reportProgress(options, run, progress)
+        }
+        try {
+          return (
+            (await waitForRun(
+              this.qualityEvaluator.evaluateLanguage(
+                request,
+                languageEvaluationOptions,
+              ),
+              run,
+            )) ??
+            unavailableLanguageAnalysis(normalized.answer, languageOptions)
+          )
+        } catch (error) {
+          if (isAbortError(error)) throw error
+          if (isFatalQualityEngineError(error)) {
+            this.markQualityDegraded(generation)
+          }
+          return unavailableLanguageAnalysis(
+            normalized.answer,
+            languageOptions,
+          )
+        } finally {
+          linkedSignal.dispose()
+        }
+      }
+      const evaluation = this.qualityEvaluationQueue.then(task, task)
+      this.qualityEvaluationQueue = evaluation.then(
+        () => undefined,
+        () => undefined,
+      )
+      return await waitForRun(evaluation, run)
+    } finally {
+      callerSignal?.removeEventListener("abort", abortFromCaller)
+      if (this.activeLanguageController === controller) {
+        this.activeLanguageController = null
+      }
+    }
   }
 
   async getCacheInfo(): Promise<ModelCacheInfo> {
@@ -875,6 +1044,7 @@ export class AutomaticEvaluator {
     if (this.clearPromise) return this.clearPromise
 
     this.generation += 1
+    this.cancelActiveLanguageEvaluation()
     this.lifecycleController.abort()
     this.lifecycleController = new AbortController()
     for (const controller of this.consentControllers) controller.abort()

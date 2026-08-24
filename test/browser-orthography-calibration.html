@@ -1,0 +1,123 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>lia-llm orthography calibration</title>
+<script src="../dist/index.js"></script>
+<pre id="output">starting</pre>
+<script>
+window.__liaCalibrationDone = false
+window.__liaCalibration = []
+window.__liaCalibrationExpected = 1
+;(async () => {
+  try {
+    const statusBefore = window.LiaLLM.getStatus()
+    const cacheBefore = await window.LiaLLM.getCacheInfo()
+    const contentProgress = []
+    const languageProgress = []
+    const question = "Erkläre, warum Eis auf flüssigem Wasser schwimmt."
+    const reference =
+      "Beim Gefrieren entsteht eine besondere Molekülstruktur, durch die Eis " +
+      "eine geringere Dichte als flüssiges Wasser hat. Deshalb schwimmt Eis auf Wasser."
+    const referenceVariants = [
+      "Flüssiges Wasser hat eine größere Dichte als Eis. Beim Gefrieren ordnen " +
+        "sich Wassermoleküle durch Wasserstoffbrücken so an, dass mehr Volumen " +
+        "entsteht. Wegen seiner geringeren Dichte schwimmt Eis auf Wasser.",
+    ]
+    const answer =
+      "Wasser hat eie grössere Dichte als Eis da Eis durch die " +
+      "Wasserstoffbrückenbindung sich beim gefrieren besonders anordnet und " +
+      "somit mehr Volumen pro Molekyl braucht. Durch die gringere Dichte von " +
+      "Eis schwimmt es auf dem Wasser."
+    const contentResult = await window.LiaLLM.evaluate({
+      question,
+      answer,
+      reference,
+      referenceVariants,
+      assessmentEngine: "compact",
+      criterionThreshold: 0.66,
+      contradictionThreshold: 0.65,
+    }, {
+      onProgress: update => contentProgress.push(update),
+    })
+    const inverseResult = await window.LiaLLM.evaluate({
+      question,
+      answer: "Eis schwimmt, weil es eine höhere Dichte als Wasser hat.",
+      reference,
+      referenceVariants,
+      assessmentEngine: "compact",
+      criterionThreshold: 0.66,
+      contradictionThreshold: 0.65,
+    })
+    const languageAnalysis = await window.LiaLLM.evaluateLanguage({
+      question,
+      answer,
+      reference,
+      referenceVariants,
+      languageAnalysis: { spelling: true, syntax: true },
+    }, {
+      onProgress: update => languageProgress.push(update),
+    })
+    const statusAfter = window.LiaLLM.getStatus()
+    const correctedAnswer =
+      languageAnalysis?.orthographyCorrection?.parts
+        ?.map(part => part.text)
+        .join("") ?? null
+    const feedbackHasCorrection = Boolean(
+      languageAnalysis?.orthographyCorrection
+    )
+    const report = await window.LiaLLM.debugReport({ print: false })
+    window.__liaCalibration.push({
+      matches:
+        contentResult.passed === true &&
+        contentResult.selectedReferenceIndex === 1 &&
+        inverseResult.passed === false &&
+        languageAnalysis?.status === "completed" &&
+        languageAnalysis.syntax === true &&
+        languageAnalysis.spellingErrors === 5 &&
+        languageAnalysis.punctuationErrors === 1 &&
+        feedbackHasCorrection &&
+        correctedAnswer ===
+          "Wasser hat eine größere Dichte als Eis, da Eis durch die " +
+            "Wasserstoffbrückenbindung sich beim Gefrieren besonders anordnet und " +
+            "somit mehr Volumen pro Molekül braucht. Durch die geringere Dichte von " +
+            "Eis schwimmt es auf dem Wasser.",
+      compactFeedbackHasCriteria: false,
+      languageAnalysis: languageAnalysis ?? null,
+      statusBefore,
+      statusAfter,
+      cacheBefore,
+      contentResult,
+      inverseResult,
+      contentProgress,
+      languageProgress,
+      feedbackHasCorrection,
+      correctedAnswer,
+      debug: {
+        outcome: report.outcome,
+        primaryCause: report.primaryCause,
+        findings: report.findings.map(finding => ({
+          code: finding.code,
+          severity: finding.severity,
+          message: finding.message,
+        })),
+        failures: report.events
+          .filter(event => event.kind === "failure")
+          .map(event => ({
+            stage: event.stage,
+            errorName: event.errorName,
+            message: event.message,
+          })),
+      },
+    })
+    document.querySelector("#output").textContent = JSON.stringify(
+      window.__liaCalibration,
+      null,
+      2,
+    )
+  } catch (error) {
+    window.__liaCalibrationError =
+      error instanceof Error ? error.stack : String(error)
+  } finally {
+    window.__liaCalibrationDone = true
+  }
+})()
+</script>

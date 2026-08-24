@@ -149,6 +149,30 @@ export interface NormalizedLanguageAnalysisOptions {
   syntax: boolean
 }
 
+export type OrthographyCorrectionKind = "spelling" | "punctuation"
+
+export interface OrthographyCorrectionEdit {
+  kind: OrthographyCorrectionKind
+  /** Zero-based line in the normalized original answer. */
+  line: number
+  /** Zero-based Unicode-codepoint column in that original line. */
+  column: number
+  source: string
+  replacement: string
+}
+
+export interface OrthographyCorrectionPart {
+  text: string
+  changed: boolean
+  kind?: OrthographyCorrectionKind
+  /** Original text removed at this position; never rendered as markup. */
+  removedText?: string
+}
+
+export interface OrthographyCorrection {
+  parts: OrthographyCorrectionPart[]
+}
+
 export interface LanguageAnalysisResult
   extends NormalizedLanguageAnalysisOptions {
   status: "completed" | "unavailable"
@@ -157,6 +181,8 @@ export interface LanguageAnalysisResult
   spellingErrors?: number
   punctuationErrors?: number
   syntaxErrors?: number
+  /** Validated spelling and punctuation preview; never includes syntax edits. */
+  orthographyCorrection?: OrthographyCorrection
 }
 
 export type EvaluationProgressPhase =
@@ -291,6 +317,24 @@ export interface EvaluationResult {
 export interface LearnerFeedback {
   code: LearnerFeedbackCode
   message: string
+  orthographyCorrection?: OrthographyCorrection
+}
+
+export interface FeedbackLanguageCheckResult {
+  message: string
+  completed: boolean
+  orthographyCorrection?: OrthographyCorrection
+}
+
+export interface FeedbackLanguageCheckRequest {
+  runId: string
+  kind: "orthography" | "syntax"
+  run(signal: AbortSignal): Promise<FeedbackLanguageCheckResult>
+}
+
+export interface FeedbackDisplayOptions {
+  orthographyCorrection?: OrthographyCorrection
+  languageCheck?: FeedbackLanguageCheckRequest
 }
 
 export interface RuntimeConfig {
@@ -460,6 +504,11 @@ export interface LiaLLMApi {
     request: EvaluationRequest,
     options?: EvaluationOptions,
   ): Promise<EvaluationResult>
+  /** Runs only the optional language analysis; it never reassesses content. */
+  evaluateLanguage(
+    request: EvaluationRequest,
+    options?: EvaluationOptions,
+  ): Promise<LanguageAnalysisResult | undefined>
   getStatus(): RuntimeStatus
   getCacheInfo(): Promise<ModelCacheInfo>
   debugReport(options?: DebugReportOptions): Promise<LiaLLMDebugReport>
@@ -474,7 +523,11 @@ export interface LiaLLMApi {
   ): string
   feedbackForResult(result: EvaluationResult, locale?: string): LearnerFeedback | null
   feedbackForError(error: unknown, locale?: string): LearnerFeedback | null
-  showFeedback(id: string, message: string): void
+  showFeedback(
+    id: string,
+    message: string,
+    options?: FeedbackDisplayOptions,
+  ): void
   showActivity(
     id: string,
     runId: string,

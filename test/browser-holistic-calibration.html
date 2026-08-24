@@ -34,12 +34,16 @@ window.__liaCalibrationExpected = expected.length
         contradictionThreshold: 0.65,
       })
       const compactFeedback = window.LiaLLM.formatResult(result, "de-DE")
+      const usesQualityModel =
+        result.model.id === "Qwen3-1.7B-q4f16_1-MLC" &&
+        result.model.device === "webgpu" &&
+        result.model.task === "generative-assessment"
       window.__liaCalibration.push({
         answer: index + 1,
         status: result.status,
         passed: result.passed,
         expected: expected[index],
-        matches: result.passed === expected[index],
+        matches: result.passed === expected[index] && usesQualityModel,
         entailment: result.criteria[0]?.entailment,
         neutral: result.criteria[0]?.neutral,
         contradiction: result.criteria[0]?.contradiction,
@@ -47,6 +51,7 @@ window.__liaCalibrationExpected = expected.length
         diagnostic: result.diagnostic?.code,
         compactFeedbackHasCriteria:
           /Gesamtantwort|Bestätigung:|Sicher bestätigte Abdeckung/.test(compactFeedback),
+        usesQualityModel,
         model: result.model,
       })
       document.querySelector("#output").textContent = JSON.stringify(window.__liaCalibration, null, 2)

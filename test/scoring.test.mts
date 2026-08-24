@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { createHash } from "node:crypto"
 import { readFileSync } from "node:fs"
 import { test } from "node:test"
 
@@ -23,7 +24,12 @@ import {
   getSolutionVariant,
   setSolutionVariant,
 } from "../src/solution-element.ts"
-import { countWords } from "../src/language-analysis.ts"
+import {
+  buildOrthographyCorrection,
+  countWords,
+  MAX_ORTHOGRAPHY_CORRECTION_EDITS,
+} from "../src/language-analysis.ts"
+import { GERMAN_DICTIONARY_ASSET } from "../src/german-spellcheck.ts"
 import {
   PINNED_RUNTIME_ASSET_BASE_URL,
   RUNTIME_ASSETS,
@@ -88,6 +94,7 @@ import {
   classifyQualityDecision,
   clearLegacyQualityCache,
   completeLanguageAnalysis,
+  contextualOrthographyOptions,
   finalizeQualityAssessment,
   hasAssessmentManipulationAttempt,
   hasPinnedQualityWeightsInCache,
@@ -95,12 +102,18 @@ import {
   isQualityOutputError,
   isRecoverableQualityRequestError,
   LANGUAGE_ANALYSIS_POST_DATA_INSTRUCTION,
+  LANGUAGE_ANALYSIS_RESPONSE_SCHEMA,
   LANGUAGE_ANALYSIS_SYSTEM_PROMPT,
+  ORTHOGRAPHY_CORRECTION_POST_DATA_INSTRUCTION,
+  ORTHOGRAPHY_CORRECTION_RESPONSE_SCHEMA,
+  ORTHOGRAPHY_CORRECTION_SYSTEM_PROMPT,
   parseLanguageJudgeOutput,
+  parseOrthographyCorrectionOutput,
   parseQualityJudgeOutput,
   prefetchQualityArtifacts,
   QualityOutputError,
   QualityEvaluator,
+  referenceAnchoredSpelling,
   qualityDiagnosticForCriteria,
   QUALITY_POST_DATA_INSTRUCTION,
   QUALITY_SYSTEM_PROMPT,
@@ -2464,6 +2477,462 @@ test("language judge accepts only complete non-negative integer counts", () => {
   )
 })
 
+test("orthography correction parser accepts only bounded positional edits", () => {
+  const edits = [
+    {
+      kind: "spelling" as const,
+      line: 0,
+      column: 10,
+      source: "schwimt",
+      replacement: "schwimmt",
+    },
+    {
+      kind: "punctuation" as const,
+      line: 0,
+      column: 27,
+      source: "",
+      replacement: ".",
+    },
+  ]
+  assert.deepEqual(
+    parseOrthographyCorrectionOutput(JSON.stringify({ edits })),
+    edits,
+  )
+  assert.deepEqual(parseOrthographyCorrectionOutput('{"edits":[]}'), [])
+
+  for (const invalid of [
+    { edits: null },
+    {
+      edits: [
+        {
+          kind: "syntax",
+          line: 0,
+          column: 0,
+          source: "Heute ich",
+          replacement: "Ich heute",
+        },
+      ],
+    },
+    {
+      edits: [
+        {
+          kind: "spelling",
+          line: -1,
+          column: 0,
+          source: "a",
+          replacement: "b",
+        },
+      ],
+    },
+    {
+      edits: [
+        {
+          kind: "spelling",
+          line: 0,
+          column: 0.5,
+          source: "a",
+          replacement: "b",
+        },
+      ],
+    },
+    {
+      edits: [
+        {
+          kind: "spelling",
+          line: 0,
+          column: 0,
+          source: "a",
+          replacement: "b",
+          explanation: "nicht Teil des Vertrags",
+        },
+      ],
+    },
+    { edits: [], comment: "nicht Teil des Vertrags" },
+  ]) {
+    assert.throws(
+      () => parseOrthographyCorrectionOutput(JSON.stringify(invalid)),
+      undefined,
+      JSON.stringify(invalid),
+    )
+  }
+
+  const excessiveEdits = Array.from(
+    { length: MAX_ORTHOGRAPHY_CORRECTION_EDITS + 1 },
+    (_, column) => ({
+      kind: "punctuation",
+      line: 0,
+      column,
+      source: "",
+      replacement: ".",
+    }),
+  )
+  assert.throws(() =>
+    parseOrthographyCorrectionOutput(
+      JSON.stringify({ edits: excessiveEdits }),
+    ),
+  )
+})
+
+test("orthography correction prompt forbids sentence and paragraph rewrites", () => {
+  assert.match(
+    ORTHOGRAPHY_CORRECTION_SYSTEM_PROMPT,
+    /keine Grammatik, keinen Satzbau, keine Wortstellung/u,
+  )
+  assert.match(
+    ORTHOGRAPHY_CORRECTION_SYSTEM_PROMPT,
+    /nur sichere Korrekturstellen für Rechtschreibung und Zeichensetzung/u,
+  )
+  assert.match(
+    ORTHOGRAPHY_CORRECTION_POST_DATA_INSTRUCTION,
+    /\{"edits":\[\.\.\.\]\}.*kind, line, column, source und replacement/u,
+  )
+})
+
+test("bounded orthography context catches the causal clause without touching prose-like code", () => {
+  const answer =
+    "Wasser hat eie grössere Dichte als Eis da Eis sich beim gefrieren besonders anordnet."
+  const reference =
+    "Wasser hat eine größere Dichte als Eis. Beim Gefrieren ordnen sich die Moleküle an."
+  const options = contextualOrthographyOptions(answer, reference)
+  const capitalization = options.filter(
+    (option) => option.mode === "capitalization",
+  )
+  const punctuation = options.filter(
+    (option) => option.mode === "punctuation",
+  )
+  assert.equal(capitalization.length, 1)
+  assert.equal(capitalization[0]?.source, "gefrieren")
+  assert.equal(capitalization[0]?.preferred, "Gefrieren")
+  assert.equal(punctuation.length, 1)
+  assert.equal(punctuation[0]?.source, "")
+  assert.equal(punctuation[0]?.preferred, ",")
+
+  assert.deepEqual(
+    contextualOrthographyOptions("Ich sehe da Wasser.", reference),
+    [],
+  )
+  assert.deepEqual(
+    contextualOrthographyOptions("Kein Wenn und Aber.", reference),
+    [],
+  )
+  assert.deepEqual(
+    contextualOrthographyOptions(
+      "Code \x60x weil y ist\x60 bleibt unverändert.",
+      reference,
+    ),
+    [],
+  )
+  assert.deepEqual(
+    contextualOrthographyOptions(
+      "wasser ist kalt.",
+      "Wasser ist kalt.",
+    ).map((option) => [option.source, option.preferred]),
+    [["wasser", "Wasser"]],
+  )
+  assert.deepEqual(
+    contextualOrthographyOptions(
+      "Das wasser ist kalt.",
+      "Das Wasser ist kalt.",
+    ).map((option) => [option.source, option.preferred]),
+    [["wasser", "Wasser"]],
+  )
+})
+
+test("reference context resolves an ambiguous single-word typo without copying prose", () => {
+  const answer = "Wasser hat eie grössere Dichte."
+  const start = answer.indexOf("eie")
+  assert.equal(
+    referenceAnchoredSpelling(
+      answer,
+      "Flüssiges Wasser hat eine größere Dichte.",
+      {
+        token: {
+          source: "eie",
+          line: 0,
+          column: start,
+          start,
+          end: start + 3,
+        },
+        candidates: ["eibe", "eile", "eine", "eis"],
+      },
+    ),
+    "eine",
+  )
+})
+
+test("orthography patches preserve paragraphs and leave sentence structure untouched", () => {
+  const answer =
+    "Heute ich schwimt im Wasser\n\nDann Eis oben treibt."
+  const correction = buildOrthographyCorrection(
+    answer,
+    [
+      {
+        kind: "spelling",
+        line: 0,
+        column: 10,
+        source: "schwimt",
+        replacement: "schwimmt",
+      },
+      {
+        kind: "punctuation",
+        line: 0,
+        column: 27,
+        source: "",
+        replacement: ".",
+      },
+    ],
+    1,
+    1,
+  )
+  const correctedText = correction.parts.map((part) => part.text).join("")
+
+  assert.equal(
+    correctedText,
+    "Heute ich schwimmt im Wasser.\n\nDann Eis oben treibt.",
+  )
+  assert.ok(
+    correction.parts.some(
+      (part) => !part.changed && part.text.includes("\n\n"),
+    ),
+  )
+  assert.deepEqual(
+    correction.parts
+      .filter((part) => part.changed)
+      .map((part) => ({
+        text: part.text,
+        kind: part.kind,
+        removedText: part.removedText,
+      })),
+    [
+      {
+        text: "schwimmt",
+        kind: "spelling",
+        removedText: "schwimt",
+      },
+      { text: ".", kind: "punctuation", removedText: undefined },
+    ],
+  )
+  assert.match(correctedText, /^Heute ich /u)
+  assert.match(correctedText, /\n\nDann Eis oben treibt\.$/u)
+
+  const unchanged = buildOrthographyCorrection(answer, [], 0, 0)
+  assert.equal(unchanged.parts.map((part) => part.text).join(""), answer)
+  assert.equal(unchanged.parts.some((part) => part.changed), false)
+
+  const unicodeCorrection = buildOrthographyCorrection(
+    "🤓 Eis schwimt.",
+    [
+      {
+        kind: "spelling",
+        line: 0,
+        column: 6,
+        source: "schwimt",
+        replacement: "schwimmt",
+      },
+    ],
+    1,
+    0,
+  )
+  assert.equal(
+    unicodeCorrection.parts.map((part) => part.text).join(""),
+    "🤓 Eis schwimmt.",
+  )
+
+  const misanchoredCorrection = buildOrthographyCorrection(
+    "Eis schwimt.",
+    [
+      {
+        kind: "spelling",
+        line: 1,
+        column: 16,
+        source: "schwimt",
+        replacement: "schwimmt",
+      },
+    ],
+    1,
+    0,
+  )
+  assert.equal(
+    misanchoredCorrection.parts.map((part) => part.text).join(""),
+    "Eis schwimmt.",
+  )
+})
+
+test("orthography patches reject structural, mismatched, and unsafe edits", () => {
+  const answer = "Heute ich schwimt im Wasser."
+
+  assert.throws(() =>
+    buildOrthographyCorrection(
+      "schwimt und schwimt",
+      [
+        {
+          kind: "spelling",
+          line: 1,
+          column: 16,
+          source: "schwimt",
+          replacement: "schwimmt",
+        },
+      ],
+      1,
+      0,
+    ),
+  )
+
+  for (const edits of [
+    [
+      {
+        kind: "spelling" as const,
+        line: 0,
+        column: 0,
+        source: "Heute ich",
+        replacement: "Ich heute",
+      },
+    ],
+    [
+      {
+        kind: "spelling" as const,
+        line: 0,
+        column: 10,
+        source: "schwimmt",
+        replacement: "schwimmt",
+      },
+    ],
+    [
+      {
+        kind: "spelling" as const,
+        line: 0,
+        column: 10,
+        source: "schwimt",
+        replacement: "schwimmt\njetzt",
+      },
+    ],
+    [
+      {
+        kind: "punctuation" as const,
+        line: 0,
+        column: 6,
+        source: "",
+        replacement: "wirklich ",
+      },
+    ],
+  ]) {
+    assert.throws(() =>
+      buildOrthographyCorrection(answer, edits, 1, 0),
+    )
+  }
+
+  assert.throws(() =>
+    buildOrthographyCorrection(
+      answer,
+      [
+        {
+          kind: "spelling",
+          line: 0,
+          column: 10,
+          source: "schwimt",
+          replacement: "schwimmt",
+        },
+      ],
+      2,
+      0,
+    ),
+  )
+  assert.throws(() =>
+    buildOrthographyCorrection(
+      answer,
+      [
+        {
+          kind: "spelling",
+          line: 0,
+          column: 10,
+          source: "schwimt",
+          replacement: "schwimmt",
+        },
+        {
+          kind: "spelling",
+          line: 0,
+          column: 13,
+          source: "wimt",
+          replacement: "wimmt",
+        },
+      ],
+      2,
+      0,
+    ),
+  )
+  assert.throws(() =>
+    buildOrthographyCorrection(
+      "Nutze <img src=x> unverändert.",
+      [
+        {
+          kind: "spelling",
+          line: 0,
+          column: 7,
+          source: "img",
+          replacement: "Img",
+        },
+      ],
+      1,
+      0,
+    ),
+  )
+  assert.throws(() =>
+    buildOrthographyCorrection(
+      "wort-feler",
+      [
+        {
+          kind: "spelling",
+          line: 0,
+          column: 5,
+          source: "feler",
+          replacement: "fehler",
+        },
+      ],
+      1,
+      0,
+    ),
+  )
+  assert.throws(() =>
+    buildOrthographyCorrection(
+      "```text\nschwimt\n```",
+      [
+        {
+          kind: "spelling",
+          line: 1,
+          column: 0,
+          source: "schwimt",
+          replacement: "schwimmt",
+        },
+      ],
+      1,
+      0,
+    ),
+  )
+  for (const [protectedAnswer, source, replacement, column] of [
+    ["1945 bleibt.", "1945", "1949", 0],
+    ["H2O bleibt.", "H2O", "H20", 0],
+    ["wieder sehen", "wieder sehen", "wiedersehen", 0],
+    ["<code>schwimt</code>", "schwimt", "schwimmt", 6],
+  ] as const) {
+    assert.throws(() =>
+      buildOrthographyCorrection(
+        protectedAnswer,
+        [
+          {
+            kind: "spelling",
+            line: 0,
+            column,
+            source,
+            replacement,
+          },
+        ],
+        1,
+        0,
+      ),
+    )
+  }
+})
+
 test("completeLanguageAnalysis returns only requested advisory categories", () => {
   assert.deepEqual(
     completeLanguageAnalysis(
@@ -3345,6 +3814,7 @@ test("QualityEvaluator analyzes language exactly once after all content criteria
     '{"decision":"pass","confidence":0.99,"feedback_code":"none","operator_criterion_id":""}',
     '{"decision":"pass","confidence":0.98,"feedback_code":"none","operator_criterion_id":""}',
     '{"spelling_errors":2,"punctuation_errors":1,"syntax_errors":1}',
+    '{"edits":[{"kind":"spelling","line":0,"column":4,"source":"schwimt","replacement":"schwimmt"}]}',
   ]
   const systemPrompts: string[] = []
   const engine = {
@@ -3389,20 +3859,95 @@ test("QualityEvaluator analyzes language exactly once after all content criteria
     ).length,
     1,
   )
+  assert.equal(
+    systemPrompts.filter(
+      (prompt) => prompt === ORTHOGRAPHY_CORRECTION_SYSTEM_PROMPT,
+    ).length,
+    1,
+  )
   assert.equal(result.passed, true)
   assert.deepEqual(result.languageAnalysis, {
     spelling: true,
     syntax: true,
     status: "completed",
     wordCount: 7,
-    spellingErrors: 2,
-    punctuationErrors: 1,
+    spellingErrors: 1,
+    punctuationErrors: 0,
     syntaxErrors: 1,
+    orthographyCorrection: {
+      parts: [
+        { text: "Eis ", changed: false },
+        {
+          text: "schwimmt",
+          changed: true,
+          kind: "spelling",
+          removedText: "schwimt",
+        },
+        {
+          text: ", weil seine Dichte geringer ist.",
+          changed: false,
+        },
+      ],
+    },
   })
 })
 
-test("QualityEvaluator language-only analysis skips content judges", async () => {
+test("QualityEvaluator preserves completed content after a fatal language failure", async () => {
   let calls = 0
+  const engine = {
+    unload: async () => undefined,
+    chat: {
+      completions: {
+        create: async () => {
+          calls += 1
+          if (calls === 1) {
+            return {
+              choices: [
+                {
+                  finish_reason: "stop",
+                  message: {
+                    content:
+                      '{"decision":"pass","confidence":0.97,"feedback_code":"none","operator_criterion_id":""}',
+                  },
+                },
+              ],
+            }
+          }
+          const error = new Error("The WebGPU device was lost.")
+          error.name = "DeviceLostError"
+          throw error
+        },
+      },
+    },
+  }
+  const evaluator = new QualityEvaluator()
+  ;(evaluator as unknown as { engine: typeof engine | null }).engine = engine
+
+  const result = await evaluator.evaluate(
+    {
+      question: "Warum schwimmt Eis?",
+      answer: "Eis schwimmt wegen seiner Dichte.",
+      reference: "Eis schwimmt wegen seiner geringeren Dichte.",
+      languageAnalysis: { spelling: true, syntax: false },
+    },
+    { maxThinkingTimeMs: 0 },
+  )
+
+  assert.equal(calls, 2)
+  assert.equal(result.passed, true)
+  assert.equal(result.model.id, QUALITY_MODEL_ID)
+  assert.deepEqual(result.languageAnalysis, {
+    spelling: true,
+    syntax: false,
+    status: "unavailable",
+    wordCount: 5,
+  })
+  assert.equal(evaluator.getStatus().phase, "error")
+})
+
+test("QualityEvaluator language-only analysis skips content judges and applies safe patches", async () => {
+  let calls = 0
+  const systemPrompts: string[] = []
   const engine = {
     chat: {
       completions: {
@@ -3410,17 +3955,16 @@ test("QualityEvaluator language-only analysis skips content judges", async () =>
           messages: Array<{ role: string; content: string }>
         }) => {
           calls += 1
-          assert.equal(
-            request.messages[0]?.content,
-            LANGUAGE_ANALYSIS_SYSTEM_PROMPT,
-          )
+          systemPrompts.push(request.messages[0]?.content ?? "")
           return {
             choices: [
               {
                 finish_reason: "stop",
                 message: {
                   content:
-                    '{"spelling_errors":1,"punctuation_errors":0,"syntax_errors":0}',
+                    calls === 1
+                      ? '{"spelling_errors":1,"punctuation_errors":0,"syntax_errors":0}'
+                      : '{"edits":[{"kind":"spelling","line":0,"column":4,"source":"schwimt","replacement":"schwimmt"}]}',
                 },
               },
             ],
@@ -3443,7 +3987,11 @@ test("QualityEvaluator language-only analysis skips content judges", async () =>
     languageAnalysis: { spelling: true, syntax: true },
   })
 
-  assert.equal(calls, 1)
+  assert.equal(calls, 2)
+  assert.deepEqual(systemPrompts, [
+    LANGUAGE_ANALYSIS_SYSTEM_PROMPT,
+    ORTHOGRAPHY_CORRECTION_SYSTEM_PROMPT,
+  ])
   assert.deepEqual(analysis, {
     spelling: true,
     syntax: true,
@@ -3452,6 +4000,64 @@ test("QualityEvaluator language-only analysis skips content judges", async () =>
     spellingErrors: 1,
     punctuationErrors: 0,
     syntaxErrors: 0,
+    orthographyCorrection: {
+      parts: [
+        { text: "Eis ", changed: false },
+        {
+          text: "schwimmt",
+          changed: true,
+          kind: "spelling",
+          removedText: "schwimt",
+        },
+        {
+          text: ", weil seine Dichte geringer ist.",
+          changed: false,
+        },
+      ],
+    },
+  })
+})
+
+test("QualityEvaluator never reports partial spelling counts as completed", async () => {
+  let calls = 0
+  const engine = {
+    chat: {
+      completions: {
+        create: async () => {
+          calls += 1
+          return {
+            choices: [
+              {
+                finish_reason: "stop",
+                message: {
+                  content:
+                    calls === 1
+                      ? '{"spelling_errors":1,"punctuation_errors":0,"syntax_errors":0}'
+                      : '{"edits":[{"kind":"spelling","line":0,"column":4,"source":"anderes","replacement":"schwimmt"}]}',
+                },
+              },
+            ],
+          }
+        },
+      },
+    },
+  }
+  const evaluator = new QualityEvaluator()
+  ;(evaluator as unknown as { engine: typeof engine | null }).engine = engine
+
+  const analysis = await evaluator.evaluateLanguage({
+    question: "Warum schwimmt Eis?",
+    answer: "Eis schwimt.",
+    reference: "Eis schwimmt.",
+    languageAnalysis: { spelling: true, syntax: true },
+  })
+
+  assert.equal(calls, 3)
+  assert.deepEqual(analysis, {
+    spelling: true,
+    syntax: true,
+    status: "unavailable",
+    wordCount: 2,
   })
 })
 
@@ -3465,6 +4071,7 @@ test("QualityEvaluator repairs invalid language output and accepts a complete le
   const outputs = [
     '{"spelling_errors":1',
     '{"spelling_errors":1,"punctuation_errors":0,"syntax_errors":0}',
+    '{"edits":[{"kind":"spelling","line":1,"column":16,"source":"schwimt","replacement":"schwimmt"},{"kind":"spelling","line":0,"column":0,"source":"Eis","replacement":"Eis"}]}',
   ]
   const engine = {
     chat: {
@@ -3506,8 +4113,20 @@ test("QualityEvaluator repairs invalid language output and accepts a complete le
     spellingErrors: 1,
     punctuationErrors: 0,
     syntaxErrors: 0,
+    orthographyCorrection: {
+      parts: [
+        { text: "Eis ", changed: false },
+        {
+          text: "schwimmt",
+          changed: true,
+          kind: "spelling",
+          removedText: "schwimt",
+        },
+        { text: ".", changed: false },
+      ],
+    },
   })
-  assert.equal(requests.length, 2)
+  assert.equal(requests.length, 3)
   assert.match(
     requests[0]?.messages[1]?.content ?? "",
     /BEGIN_UNTRUSTED_LANGUAGE_DATA_JSON/u,
@@ -3530,7 +4149,26 @@ test("QualityEvaluator repairs invalid language output and accepts a complete le
   assert.equal(requests[0]?.seed, 19)
   assert.equal(requests[1]?.seed, 29)
   assert.equal(requests[0]?.max_tokens, 160)
-  assert.equal(requests[0]?.response_format, undefined)
+  assert.deepEqual(requests[0]?.response_format, {
+    type: "json_object",
+    schema: JSON.stringify(LANGUAGE_ANALYSIS_RESPONSE_SCHEMA),
+  })
+  assert.equal(
+    requests[2]?.messages[0]?.content,
+    ORTHOGRAPHY_CORRECTION_SYSTEM_PROMPT,
+  )
+  assert.equal(
+    (requests[2]?.messages[1]?.content ?? "").includes(
+      ORTHOGRAPHY_CORRECTION_POST_DATA_INSTRUCTION,
+    ),
+    true,
+  )
+  assert.equal(requests[2]?.seed, 37)
+  assert.equal(requests[2]?.max_tokens, 384)
+  assert.deepEqual(requests[2]?.response_format, {
+    type: "json_object",
+    schema: JSON.stringify(ORTHOGRAPHY_CORRECTION_RESPONSE_SCHEMA),
+  })
 })
 
 test("terminal language output failure is diagnosed without learner or response text", async () => {
@@ -4186,6 +4824,28 @@ test("pinned runtime assets pass exact integrity checks", async () => {
   assert.match(RUNTIME_ASSET_CACHE_KEY, /0838e25f4da7ec8267637966ef747ef568517748/u)
 })
 
+test("bundled German dictionary matches its pinned integrity metadata", () => {
+  const dictionary = readFileSync(
+    new URL(
+      "../dist/" + GERMAN_DICTIONARY_ASSET.filename,
+      import.meta.url,
+    ),
+  )
+  assert.equal(dictionary.byteLength, GERMAN_DICTIONARY_ASSET.byteLength)
+  assert.equal(
+    createHash("sha256").update(dictionary).digest("hex"),
+    GERMAN_DICTIONARY_ASSET.sha256,
+  )
+  const packageJson = JSON.parse(
+    readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+  ) as { dependencies?: Record<string, string> }
+  assert.equal(
+    packageJson.dependencies?.["@cspell/dict-de-de"],
+    "1.1.32",
+  )
+  assert.equal(packageJson.dependencies?.["cspell-trie-lib"], "10.1.0")
+})
+
 test("runtime integrity checks reject portal HTML and truncated WASM", async () => {
   const portal = new TextEncoder().encode(
     "<!doctype html><title>Schulproxy-Anmeldung</title>",
@@ -4223,6 +4883,13 @@ test("quality weights and WebLLM runtime both use immutable revisions", () => {
   assert.match(
     prebuiltRecord.model_lib,
     /\/v0_2_84\/base\/Qwen3-1\.7B-q4f16_1_cs1k-webgpu\.wasm$/u,
+  )
+  const pinnedPrebuiltRecord = createQualityAppConfig(
+    webLlm.prebuiltAppConfig,
+  ).model_list.find((candidate) => candidate.model_id === QUALITY_MODEL_ID)
+  assert.equal(
+    pinnedPrebuiltRecord?.overrides?.context_window_size,
+    4_096,
   )
   const appConfig = createQualityAppConfig({
     model_list: [
@@ -5942,6 +6609,22 @@ test("automatic evaluator defaults to compact and uses quality only for explicit
     })
     assert.equal(second.model.id, "quality-test")
 
+    const compactCallsBeforeLanguage = compact.evaluateCalls
+    const qualityContentCallsBeforeLanguage = quality.evaluateCalls
+    const languageOnly = await automatic.evaluateLanguage({
+      ...request,
+      languageAnalysis: { spelling: true, syntax: false },
+    })
+    assert.deepEqual(languageOnly, {
+      spelling: true,
+      syntax: false,
+      status: "unavailable",
+      wordCount: 8,
+    })
+    assert.equal(quality.languageEvaluateCalls, 1)
+    assert.equal(quality.evaluateCalls, qualityContentCallsBeforeLanguage)
+    assert.equal(compact.evaluateCalls, compactCallsBeforeLanguage)
+
     quality.failEvaluation = true
     const fallback = await automatic.evaluate({
       ...request,
@@ -7218,6 +7901,18 @@ test("learner feedback stays short and never exposes criteria or scores", () => 
 
 test("language feedback is ordered, visible on passing answers, and advisory", () => {
   const passed = evaluation("passed", [result("secret", "met")])
+  const orthographyCorrection = {
+    parts: [
+      { text: "Eis ", changed: false },
+      {
+        text: "schwimmt",
+        changed: true,
+        kind: "spelling" as const,
+        removedText: "schwimt",
+      },
+      { text: ".", changed: false },
+    ],
+  }
   passed.languageAnalysis = {
     spelling: true,
     syntax: true,
@@ -7226,12 +7921,14 @@ test("language feedback is ordered, visible on passing answers, and advisory", (
     punctuationErrors: 2,
     spellingErrors: 3,
     syntaxErrors: 1,
+    orthographyCorrection,
   }
 
   assert.deepEqual(feedbackForResult(passed), {
     code: "language-analysis",
     message:
       "Sprachstatistik (Fehlerzahlen als Modellschätzung):\nWörter insgesamt: 42 · Rechtschreibfehler: 3 · Zeichensetzungsfehler: 2 · Satzbaufehler: 1",
+    orthographyCorrection,
   })
   assert.equal(passed.passed, true)
   assert.equal(passed.status, "passed")
@@ -7243,6 +7940,7 @@ test("language feedback is ordered, visible on passing answers, and advisory", (
     status: "completed",
     wordCount: 7,
     syntaxErrors: 0,
+    orthographyCorrection,
   }
   assert.deepEqual(feedbackForResult(syntaxOnly), {
     code: "language-analysis",
@@ -7256,6 +7954,7 @@ test("language feedback is ordered, visible on passing answers, and advisory", (
     syntax: true,
     status: "unavailable",
     wordCount: 42,
+    orthographyCorrection,
   }
   assert.deepEqual(feedbackForResult(unavailable), {
     code: "language-analysis-unavailable",
@@ -7263,6 +7962,21 @@ test("language feedback is ordered, visible on passing answers, and advisory", (
       "Sprachstatistik: Wörter insgesamt: 42 · die angeforderte Fehlerzählung ist derzeit nicht verfügbar.",
   })
   assert.equal(unavailable.passed, true)
+
+  const zeroErrors = evaluation("passed", [result("secret", "met")])
+  const unchangedCorrection = {
+    parts: [{ text: "Fehlerfreier Text.\n\nZweiter Absatz.", changed: false }],
+  }
+  zeroErrors.languageAnalysis = {
+    spelling: true,
+    syntax: false,
+    status: "completed",
+    wordCount: 4,
+    spellingErrors: 0,
+    punctuationErrors: 0,
+    orthographyCorrection: unchangedCorrection,
+  }
+  assert.deepEqual(feedbackForResult(zeroErrors)?.orthographyCorrection, unchangedCorrection)
 })
 
 test("language statistics append to content feedback without changing grading", () => {
@@ -7275,6 +7989,18 @@ test("language statistics append to content feedback without changing grading", 
     punctuationErrors: 2,
     spellingErrors: 3,
     syntaxErrors: 1,
+    orthographyCorrection: {
+      parts: [
+        { text: "Eis ", changed: false },
+        {
+          text: "schwimmt",
+          changed: true,
+          kind: "spelling",
+          removedText: "schwimt",
+        },
+        { text: ".", changed: false },
+      ],
+    },
   }
 
   const feedback = feedbackForResult(failed)
@@ -7282,6 +8008,10 @@ test("language statistics append to content feedback without changing grading", 
   assert.equal(
     feedback?.message,
     "Die Antwort enthält inhaltliche Fehler. Sprachstatistik (Fehlerzahlen als Modellschätzung):\nWörter insgesamt: 6 · Rechtschreibfehler: 3 · Zeichensetzungsfehler: 2 · Satzbaufehler: 1",
+  )
+  assert.deepEqual(
+    feedback?.orthographyCorrection,
+    failed.languageAnalysis.orthographyCorrection,
   )
   assert.equal(failed.passed, false)
   assert.equal(failed.status, "failed")
@@ -7381,7 +8111,7 @@ test("solution variant registry validates identifiers and indices", () => {
   clearSolutionVariant(" solution ", " run ")
 })
 
-test("the public version remains pinned exactly to 0.5.11", () => {
+test("the public version remains pinned exactly to 0.5.12", () => {
   const packageJson = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   ) as { version?: string }
@@ -7391,12 +8121,17 @@ test("the public version remains pinned exactly to 0.5.11", () => {
   const entry = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8")
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8")
 
-  assert.equal(packageJson.version, "0.5.11")
-  assert.equal(packageLock.version, "0.5.11")
-  assert.equal(packageLock.packages?.[""]?.version, "0.5.11")
-  assert.match(entry, /const VERSION = "0\.5\.11"/u)
-  assert.match(readme, /^version:\s+0\.5\.11$/mu)
-  assert.match(readme, /^script:\s+\.\/dist\/index\.js\?v=0\.5\.11$/mu)
+  assert.equal(packageJson.version, "0.5.12")
+  assert.equal(packageLock.version, "0.5.12")
+  assert.equal(packageLock.packages?.[""]?.version, "0.5.12")
+  assert.match(entry, /const VERSION = "0\.5\.12"/u)
+  assert.match(readme, /^version:\s+0\.5\.12$/mu)
+  assert.match(readme, /^script:\s+\.\/dist\/index\.js$/mu)
+  assert.doesNotMatch(
+    readme,
+    /^script:\s+\.\/dist\/index\.js[?#]/mu,
+    "the VS Code LiaScript server treats query strings as part of the file path",
+  )
 })
 
 test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper", () => {
@@ -7452,9 +8187,24 @@ test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper
   assert.match(readme, /criterionThreshold: options\.passThreshold/u)
   assert.match(readme, /assessmentEngine:\s*options\.assessmentEngine/u)
   assert.match(readme, /operator: options\.operator \?\? undefined/u)
-  assert.match(readme, /languageAnalysis:/u)
-  assert.match(readme, /spelling: options\.rechtschreibung/u)
-  assert.match(readme, /syntax: options\.satzbau/u)
+  const initialEvaluationStart = readme.indexOf(
+    "return window.LiaLLM.evaluate({",
+  )
+  const initialEvaluationEnd = readme.indexOf("}, {", initialEvaluationStart)
+  assert.ok(initialEvaluationStart >= 0 && initialEvaluationEnd > initialEvaluationStart)
+  assert.doesNotMatch(
+    readme.slice(initialEvaluationStart, initialEvaluationEnd),
+    /languageAnalysis/u,
+  )
+  assert.match(readme, /window\.LiaLLM\.evaluateLanguage\(\{/u)
+  assert.match(readme, /spelling: quizOptions\.rechtschreibung/u)
+  assert.match(readme, /syntax: quizOptions\.satzbau/u)
+  assert.match(readme, /kind: quizOptions\.rechtschreibung \? "orthography" : "syntax"/u)
+  assert.match(readme, /showLearnerFeedback\(feedback, languageCheck\)/u)
+  assert.ok(
+    readme.indexOf("showLearnerFeedback(feedback, languageCheck)") <
+      readme.indexOf('finishQuiz(result.passed ? "true" : "false")'),
+  )
   assert.match(
     readme,
     /<lia-llm-load-overlay-host><\/lia-llm-load-overlay-host>/u,
@@ -7938,13 +8688,11 @@ test("parseMacroOptions rejects ambiguous or invalid input", () => {
     () => parseMacroOptions("0.66;assessmentengine=compact;operator=erklaeren"),
     /assessmentengine=quality/u,
   )
-  assert.throws(
-    () =>
-      parseMacroOptions(
-        "0.66;feedback=1;assessmentengine=compact;Rechtschreibung=1",
-      ),
-    /assessmentengine=quality/u,
+  const compactSpelling = parseMacroOptions(
+    "0.66;feedback=1;assessmentengine=compact;Rechtschreibung=1",
   )
+  assert.equal(compactSpelling.assessmentEngine, "compact")
+  assert.equal(compactSpelling.rechtschreibung, true)
   assert.throws(
     () => parseMacroOptions("0.66;assessmentengine=compact;maxthinkingtime=5s"),
     /assessmentengine=quality/u,

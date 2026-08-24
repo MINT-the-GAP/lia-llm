@@ -31,7 +31,7 @@ import {
 } from "./solution-element.ts"
 import type { LiaLLMApi } from "./types.ts"
 
-const VERSION = "0.5.11"
+const VERSION = "0.5.12"
 
 interface LiaLLMGlobal {
   LiaLLM?: LiaLLMApi
@@ -48,6 +48,8 @@ if (!api) {
     configure: (config) => evaluator.configure(config),
     preload: () => evaluator.preload(),
     evaluate: (request, options) => evaluator.evaluate(request, options),
+    evaluateLanguage: (request, options) =>
+      evaluator.evaluateLanguage(request, options),
     getStatus: () => evaluator.getStatus(),
     getCacheInfo: () => evaluator.getCacheInfo(),
     debugReport: (options) =>

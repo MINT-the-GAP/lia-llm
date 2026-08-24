@@ -159,6 +159,19 @@ function canonicalErrorSignature(
   const rawMessage = rawDebugString(errorMessage)
   const haystack = rawName + " " + rawMessage
 
+  const orthographyFailure = haystack.match(
+    /Orthography correction validation failed \(([-a-z]+)\)/iu,
+  )?.[1]
+  if (orthographyFailure) {
+    return {
+      name: "DataError",
+      message:
+        "Orthography correction validation failed (" +
+        orthographyFailure +
+        ").",
+    }
+  }
+
   if (
     rawName.toLowerCase() === "aborterror" ||
     /\bAbortError\b|\b(?:operation|vorgang|download|request|anfrage)\s+(?:was\s+)?(?:aborted|cancelled|canceled|abgebrochen)\b/iu
@@ -294,6 +307,27 @@ function canonicalErrorSignature(
           ? "LinkError"
           : "OperationError",
       message: "Die ONNX- oder WebAssembly-Laufzeit konnte nicht initialisiert werden.",
+    }
+  }
+  if (
+    /Orthografi|Korrektureintrag|Quelltext|Spaltenposition|Zeilenposition|Wortersatz|Wortgrenzen|nderungskategorien/iu
+      .test(haystack)
+  ) {
+    const reason =
+      /Quelltext/iu.test(haystack)
+        ? "anchor-mismatch"
+        : /Spaltenposition|Zeilenposition/iu.test(haystack)
+          ? "position-invalid"
+          : /Zahl der|nderungskategorien/iu.test(haystack)
+            ? "count-mismatch"
+            : /Wortersatz|Wortgrenzen|Wort ersetzen/iu.test(haystack)
+              ? "unsafe-spelling-edit"
+              : /sortiert|berlapp/iu.test(haystack)
+                ? "overlapping-edits"
+                : "invalid-output"
+    return {
+      name: "DataError",
+      message: "Orthography correction validation failed (" + reason + ").",
     }
   }
   const httpStatus = haystack.match(

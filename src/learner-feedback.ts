@@ -201,6 +201,9 @@ function languageFeedback(
         ? "Sprachstatistik (Fehlerzahlen als Modellschätzung):\n"
         : "Language statistics (error counts are model estimates):\n") +
       values.join(" · "),
+    ...(analysis.spelling && analysis.orthographyCorrection
+      ? { orthographyCorrection: analysis.orthographyCorrection }
+      : {}),
   }
 }
 
@@ -215,6 +218,9 @@ export function feedbackForResult(
   return {
     ...content,
     message: content.message + " " + language.message,
+    ...(language.orthographyCorrection
+      ? { orthographyCorrection: language.orthographyCorrection }
+      : {}),
   }
 }
 
@@ -238,6 +244,9 @@ export function feedbackForError(
       ? {
           ...content,
           message: content.message + " " + language.message,
+          ...(language.orthographyCorrection
+            ? { orthographyCorrection: language.orthographyCorrection }
+            : {}),
         }
       : content
   }
