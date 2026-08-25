@@ -1,6 +1,6 @@
 {
   "name": "lia-llm",
-  "version": "0.5.12",
+  "version": "0.5.13",
   "private": true,
   "description": "Local semantic assessment for open-ended LiaScript questions",
   "license": "MIT",

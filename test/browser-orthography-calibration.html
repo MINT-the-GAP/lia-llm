@@ -7,6 +7,19 @@
 window.__liaCalibrationDone = false
 window.__liaCalibration = []
 window.__liaCalibrationExpected = 1
+const acceptedModelDownloads = []
+window.addEventListener("lia-llm:download-consent", event => {
+  const detail = event.detail
+  if (
+    detail &&
+    typeof detail.respond === "function" &&
+    (detail.engine === "quality" || detail.engine === "compact")
+  ) {
+    detail.handled = true
+    acceptedModelDownloads.push(detail.engine)
+    detail.respond(true)
+  }
+})
 ;(async () => {
   try {
     const statusBefore = window.LiaLLM.getStatus()
@@ -56,6 +69,44 @@ window.__liaCalibrationExpected = 1
     }, {
       onProgress: update => languageProgress.push(update),
     })
+    const grammarQuestion = "Beschreibe, wem die Schülerin hilft."
+    const grammarReference = "Dem Lehrer wird von der Schülerin geholfen."
+    const grammarAnalysis = await window.LiaLLM.evaluateLanguage({
+      question: grammarQuestion,
+      answer: "Die Schülerin hilft den Lehrer.",
+      reference: grammarReference,
+      languageAnalysis: { spelling: false, syntax: true },
+    })
+    const grammarCorrectedAnswer =
+      grammarAnalysis?.orthographyCorrection?.parts
+        ?.map(part => part.text)
+        .join("") ?? null
+    const accusativeControl = await window.LiaLLM.evaluateLanguage({
+      question: "Beschreibe, wen die Schülerin sieht.",
+      answer: "Die Schülerin sieht den Lehrer.",
+      reference: "Die Schülerin sieht den Lehrer.",
+      languageAnalysis: { spelling: false, syntax: true },
+    })
+    const agreementAnalysis = await window.LiaLLM.evaluateLanguage({
+      question: "Beschreibe, ob die Kinder bereit sind.",
+      answer: "Die Kinder ist bereit.",
+      reference: "Die Kinder sind bereit.",
+      languageAnalysis: { spelling: false, syntax: true },
+    })
+    const agreementCorrectedAnswer =
+      agreementAnalysis?.orthographyCorrection?.parts
+        ?.map(part => part.text)
+        .join("") ?? null
+    const homonymAnalysis = await window.LiaLLM.evaluateLanguage({
+      question: "Was ist auf dem Foto zu sehen?",
+      answer: "Das ist die Leiter.",
+      reference: "Das ist der Leiter.",
+      languageAnalysis: { spelling: false, syntax: true },
+    })
+    const homonymCorrectedAnswer =
+      homonymAnalysis?.orthographyCorrection?.parts
+        ?.map(part => part.text)
+        .join("") ?? null
     const statusAfter = window.LiaLLM.getStatus()
     const correctedAnswer =
       languageAnalysis?.orthographyCorrection?.parts
@@ -79,7 +130,33 @@ window.__liaCalibrationExpected = 1
           "Wasser hat eine größere Dichte als Eis, da Eis durch die " +
             "Wasserstoffbrückenbindung sich beim Gefrieren besonders anordnet und " +
             "somit mehr Volumen pro Molekül braucht. Durch die geringere Dichte von " +
-            "Eis schwimmt es auf dem Wasser.",
+            "Eis schwimmt es auf dem Wasser." &&
+        grammarAnalysis?.status === "completed" &&
+        grammarAnalysis.syntaxErrors === 1 &&
+        grammarCorrectedAnswer === "Die Schülerin hilft dem Lehrer." &&
+        grammarAnalysis.orthographyCorrection?.parts?.some(
+          part =>
+            part.changed === true &&
+            part.kind === "grammar" &&
+            part.removedText === "den" &&
+            part.text === "dem"
+        ) === true &&
+        accusativeControl?.status === "completed" &&
+        accusativeControl.syntaxErrors === 0 &&
+        accusativeControl.orthographyCorrection === undefined &&
+        agreementAnalysis?.status === "completed" &&
+        agreementAnalysis.syntaxErrors === 1 &&
+        agreementCorrectedAnswer === "Die Kinder sind bereit." &&
+        agreementAnalysis.orthographyCorrection?.parts?.some(
+          part =>
+            part.changed === true &&
+            part.kind === "grammar" &&
+            part.removedText === "ist" &&
+            part.text === "sind"
+        ) === true &&
+        homonymAnalysis?.status === "completed" &&
+        homonymAnalysis.orthographyCorrection === undefined &&
+        homonymCorrectedAnswer === null,
       compactFeedbackHasCriteria: false,
       languageAnalysis: languageAnalysis ?? null,
       statusBefore,
@@ -89,8 +166,16 @@ window.__liaCalibrationExpected = 1
       inverseResult,
       contentProgress,
       languageProgress,
+      acceptedModelDownloads,
       feedbackHasCorrection,
       correctedAnswer,
+      grammarAnalysis: grammarAnalysis ?? null,
+      grammarCorrectedAnswer,
+      accusativeControl: accusativeControl ?? null,
+      agreementAnalysis: agreementAnalysis ?? null,
+      agreementCorrectedAnswer,
+      homonymAnalysis: homonymAnalysis ?? null,
+      homonymCorrectedAnswer,
       debug: {
         outcome: report.outcome,
         primaryCause: report.primaryCause,

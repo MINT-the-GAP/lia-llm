@@ -939,9 +939,11 @@ export class AutomaticEvaluator {
       this.reportProgress(options, run, {
         phase: "evaluating-quality",
         engine: "quality",
-        message: languageOptions.spelling
-          ? "Rechtschreibung und Zeichensetzung werden geprüft …"
-          : "Satzbau wird geprüft …",
+        message: languageOptions.spelling && languageOptions.syntax
+          ? "Rechtschreibung, Zeichensetzung, Grammatik und Satzbau werden geprüft …"
+          : languageOptions.spelling
+            ? "Rechtschreibung und Zeichensetzung werden geprüft …"
+            : "Grammatik und Satzbau werden geprüft …",
       })
 
       const generation = run.generation

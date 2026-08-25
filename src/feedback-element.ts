@@ -70,7 +70,11 @@ function registerFeedbackLayoutStyles(): void {
 }
 
 function isCorrectionKind(value: unknown): value is OrthographyCorrectionKind {
-  return value === "spelling" || value === "punctuation"
+  return (
+    value === "spelling" ||
+    value === "punctuation" ||
+    value === "grammar"
+  )
 }
 
 function normalizedCorrection(
@@ -83,21 +87,32 @@ function normalizedCorrection(
     if (
       !part ||
       typeof part.text !== "string" ||
-      typeof part.changed !== "boolean" ||
-      (part.kind !== undefined && !isCorrectionKind(part.kind)) ||
-      (part.removedText !== undefined &&
-        typeof part.removedText !== "string")
+      typeof part.changed !== "boolean"
     ) {
       return undefined
     }
-    parts.push({
-      text: part.text,
-      changed: part.changed,
-      ...(part.kind ? { kind: part.kind } : {}),
-      ...(part.removedText !== undefined
-        ? { removedText: part.removedText }
-        : {}),
-    })
+    if (part.changed) {
+      if (
+        !isCorrectionKind(part.kind) ||
+        (part.removedText !== undefined &&
+          typeof part.removedText !== "string")
+      ) {
+        return undefined
+      }
+      parts.push({
+        text: part.text,
+        changed: true,
+        kind: part.kind,
+        ...(part.removedText !== undefined
+          ? { removedText: part.removedText }
+          : {}),
+      })
+    } else {
+      if (part.kind !== undefined || part.removedText !== undefined) {
+        return undefined
+      }
+      parts.push({ text: part.text, changed: false })
+    }
   }
 
   const hasContent = parts.some(
@@ -117,7 +132,9 @@ function normalizedLanguageCheck(
     Array.isArray(value) ||
     typeof value.runId !== "string" ||
     !value.runId.trim() ||
-    (value.kind !== "orthography" && value.kind !== "syntax") ||
+    (value.kind !== "orthography" &&
+      value.kind !== "syntax" &&
+      value.kind !== "language") ||
     typeof value.run !== "function"
   ) {
     throw new Error("languageCheck benötigt runId, kind und eine run-Funktion.")
@@ -142,15 +159,24 @@ function normalizedLanguageCheckResult(
   ) {
     throw new Error("Die Sprachprüfung hat kein gültiges UI-Ergebnis geliefert.")
   }
-  if (
-    (!value.completed || kind === "syntax") &&
-    value.orthographyCorrection !== undefined
-  ) {
-    throw new Error("Diese Sprachprüfung darf keine Orthografiekorrektur liefern.")
+  if (!value.completed && value.orthographyCorrection !== undefined) {
+    throw new Error("Eine unvollständige Sprachprüfung darf keine Korrektur liefern.")
   }
   const correction = normalizedCorrection(value.orthographyCorrection)
   if (value.orthographyCorrection !== undefined && !correction) {
-    throw new Error("Die Sprachprüfung hat keine gültige Orthografiekorrektur geliefert.")
+    throw new Error("Die Sprachprüfung hat keine gültige Korrektur geliefert.")
+  }
+  const hasMismatchedCorrectionKind = correction?.parts.some((part) => {
+    if (!part.changed) return false
+    if (!part.kind) return true
+    if (kind === "orthography") return part.kind === "grammar"
+    if (kind === "syntax") return part.kind !== "grammar"
+    return false
+  })
+  if (hasMismatchedCorrectionKind) {
+    throw new Error(
+      "Die Sprachprüfung hat eine Korrektur aus der falschen Kategorie geliefert.",
+    )
   }
   return {
     message: value.message,
@@ -166,25 +192,33 @@ function abortFeedbackState(state: FeedbackState): void {
 }
 
 function initialActionLabel(kind: FeedbackLanguageCheckRequest["kind"]): string {
-  return kind === "orthography" ? "Rechtschreibung prüfen" : "Satzbau prüfen"
+  if (kind === "orthography") return "Rechtschreibung prüfen"
+  if (kind === "syntax") return "Grammatik und Satzbau prüfen"
+  return "Sprache prüfen"
 }
 
 function loadingActionLabel(kind: FeedbackLanguageCheckRequest["kind"]): string {
-  return kind === "orthography"
-    ? "Rechtschreibung wird geprüft …"
-    : "Satzbau wird geprüft …"
+  if (kind === "orthography") return "Rechtschreibung wird geprüft …"
+  if (kind === "syntax") return "Grammatik und Satzbau werden geprüft …"
+  return "Sprache wird geprüft …"
 }
 
 function loadingStatus(kind: FeedbackLanguageCheckRequest["kind"]): string {
-  return kind === "orthography"
-    ? "Rechtschreibung und Zeichensetzung werden geprüft …"
-    : "Der Satzbau wird geprüft …"
+  if (kind === "orthography") {
+    return "Rechtschreibung und Zeichensetzung werden geprüft …"
+  }
+  if (kind === "syntax") return "Grammatik und Satzbau werden geprüft …"
+  return "Rechtschreibung, Zeichensetzung, Grammatik und Satzbau werden geprüft …"
 }
 
 function failureStatus(kind: FeedbackLanguageCheckRequest["kind"]): string {
-  return kind === "orthography"
-    ? "Die Rechtschreibprüfung ist derzeit nicht verfügbar."
-    : "Die Satzbauprüfung ist derzeit nicht verfügbar."
+  if (kind === "orthography") {
+    return "Die Rechtschreibprüfung ist derzeit nicht verfügbar."
+  }
+  if (kind === "syntax") {
+    return "Die Grammatik- und Satzbauprüfung ist derzeit nicht verfügbar."
+  }
+  return "Die Sprachprüfung ist derzeit nicht verfügbar."
 }
 
 function renderCorrection(
@@ -389,7 +423,7 @@ function ensureFeedbackShadow(element: HTMLElement): FeedbackShadow {
   panel.setAttribute("role", "region")
   panel.setAttribute(
     "aria-label",
-    "Korrigierter Text. Unterstrichene Stellen wurden korrigiert; ein Minuszeichen kennzeichnet eine Entfernung.",
+    "Korrigierter Text. Unterstrichene Stellen markieren Rechtschreib-, Zeichensetzungs- oder Grammatikkorrekturen; ein Minuszeichen kennzeichnet eine Entfernung.",
   )
   panel.hidden = true
 

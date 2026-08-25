@@ -274,6 +274,18 @@
           }
         ]
       }
+      const grammarCorrection = {
+        parts: [
+          { text: "Sie hilft ", changed: false },
+          {
+            text: "dem",
+            changed: true,
+            kind: "grammar",
+            removedText: "den"
+          },
+          { text: " Kind.", changed: false }
+        ]
+      }
       const feedbackResult = languageAnalysis =>
         window.LiaLLM?.feedbackForResult({
           status: "passed",
@@ -306,7 +318,7 @@
         status: "completed",
         wordCount: 9,
         syntaxErrors: 2,
-        orthographyCorrection
+        orthographyCorrection: grammarCorrection
       })
       showResultFeedback("feedback-syntax-only-probe", syntaxOnlyFeedback)
 
@@ -353,12 +365,12 @@
       const unavailableToggle = document.getElementById(
         "feedback-unavailable-probe"
       )?.shadowRoot?.querySelector(".lia-llm-feedback-correction-toggle")
-      const orthographyButtonIsStrictlyGated =
+      const correctionButtonIsStrictlyGated =
         correctionToggle instanceof HTMLButtonElement &&
         correctionToggle.hidden === false &&
         correctionToggle.getAttribute("aria-expanded") === "false" &&
         correctionPanel?.hidden === true &&
-        syntaxOnlyToggle?.hidden === true &&
+        syntaxOnlyToggle?.hidden === false &&
         unavailableToggle?.hidden === true
 
       correctionToggle?.click()
@@ -480,7 +492,7 @@
         {
           languageCheck: {
             runId: "orthography-action-run",
-            kind: "orthography",
+            kind: "language",
             run(signal) {
               orthographyRuns += 1
               orthographySignal = signal
@@ -515,7 +527,7 @@
         languageActionButton instanceof HTMLButtonElement &&
         languageActionButton.hidden === false &&
         languageActionButton.disabled === false &&
-        languageActionButton.textContent === "Rechtschreibung pr\u00fcfen" &&
+        languageActionButton.textContent === "Sprache pr\u00fcfen" &&
         languageActionStatus?.hidden === true &&
         orthographyRuns === 0
 
@@ -531,7 +543,7 @@
         languageActionButton?.getAttribute("aria-busy") === "true" &&
         languageActionStatus?.hidden === false &&
         languageActionStatus?.textContent ===
-          "Rechtschreibung und Zeichensetzung werden gepr\u00fcft \u2026"
+          "Rechtschreibung, Zeichensetzung, Grammatik und Satzbau werden gepr\u00fcft \u2026"
 
       const correctedLanguageText =
         "Der Hund ist da. " +
@@ -861,7 +873,8 @@
               syntaxRuns += 1
               return Promise.resolve({
                 message: "SatzbauprÃ¼fung abgeschlossen.",
-                completed: true
+                completed: true,
+                orthographyCorrection: grammarCorrection
               })
             }
           }
@@ -885,21 +898,143 @@
       const syntaxStartsWithoutCorrectionToggle =
         syntaxRuns === 0 &&
         syntaxAction?.hidden === false &&
-        syntaxAction?.textContent === "Satzbau pr\u00fcfen" &&
+        syntaxAction?.textContent === "Grammatik und Satzbau pr\u00fcfen" &&
         syntaxCorrectionToggle?.hidden === true
       syntaxAction?.click()
       syntaxAction?.click()
       await flushLanguageCheckUi()
-      const syntaxLanguageCheckHasNoCorrection =
+      const syntaxLanguageCheckShowsGrammarCorrection =
         syntaxStartsWithoutCorrectionToggle &&
         syntaxRuns === 1 &&
         syntaxAction?.hidden === true &&
         syntaxContent?.textContent === "SatzbauprÃ¼fung abgeschlossen." &&
         syntaxStatus?.hidden === true &&
         syntaxStatus?.textContent === "" &&
-        syntaxCorrectionToggle?.hidden === true &&
-        syntaxCorrectionPanel?.hidden === true &&
-        syntaxCorrectionPanel?.hasChildNodes() === false
+        syntaxCorrectionToggle?.hidden === false &&
+        syntaxCorrectionToggle?.getAttribute("aria-expanded") === "true" &&
+        syntaxCorrectionPanel?.hidden === false &&
+        syntaxCorrectionPanel?.textContent === "Sie hilft dem Kind." &&
+        syntaxCorrectionPanel?.querySelector(
+          '.lia-llm-feedback-correction-mark[data-kind="grammar"]'
+        )?.textContent === "dem"
+
+      const orthographyMismatchProbe =
+        document.createElement("lia-llm-feedback")
+      orthographyMismatchProbe.id = "feedback-orthography-mismatch-probe"
+      const syntaxMismatchProbe = document.createElement("lia-llm-feedback")
+      syntaxMismatchProbe.id = "feedback-syntax-mismatch-probe"
+      const kindlessMismatchProbe = document.createElement("lia-llm-feedback")
+      kindlessMismatchProbe.id = "feedback-kindless-mismatch-probe"
+      document.body.append(
+        orthographyMismatchProbe,
+        syntaxMismatchProbe,
+        kindlessMismatchProbe
+      )
+      window.LiaLLM?.showFeedback(
+        orthographyMismatchProbe.id,
+        "",
+        {
+          languageCheck: {
+            runId: "orthography-mismatch-run",
+            kind: "orthography",
+            async run() {
+              return {
+                message: "Darf nicht angezeigt werden.",
+                completed: true,
+                orthographyCorrection: grammarCorrection
+              }
+            }
+          }
+        }
+      )
+      window.LiaLLM?.showFeedback(
+        syntaxMismatchProbe.id,
+        "",
+        {
+          languageCheck: {
+            runId: "syntax-mismatch-run",
+            kind: "syntax",
+            async run() {
+              return {
+                message: "Darf nicht angezeigt werden.",
+                completed: true,
+                orthographyCorrection
+              }
+            }
+          }
+        }
+      )
+      window.LiaLLM?.showFeedback(
+        kindlessMismatchProbe.id,
+        "",
+        {
+          languageCheck: {
+            runId: "kindless-mismatch-run",
+            kind: "language",
+            async run() {
+              return {
+                message: "Darf nicht angezeigt werden.",
+                completed: true,
+                orthographyCorrection: {
+                  parts: [
+                    {
+                      text: "Korrektur ohne Kategorie",
+                      changed: true
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      )
+      const orthographyMismatchAction =
+        orthographyMismatchProbe.shadowRoot?.querySelector(
+          ".lia-llm-feedback-language-action"
+        )
+      const syntaxMismatchAction =
+        syntaxMismatchProbe.shadowRoot?.querySelector(
+          ".lia-llm-feedback-language-action"
+        )
+      const kindlessMismatchAction =
+        kindlessMismatchProbe.shadowRoot?.querySelector(
+          ".lia-llm-feedback-language-action"
+        )
+      orthographyMismatchAction?.click()
+      syntaxMismatchAction?.click()
+      kindlessMismatchAction?.click()
+      await flushLanguageCheckUi()
+      const orthographyMismatchStatus =
+        orthographyMismatchProbe.shadowRoot?.querySelector(
+          ".lia-llm-feedback-language-status"
+        )
+      const syntaxMismatchStatus =
+        syntaxMismatchProbe.shadowRoot?.querySelector(
+          ".lia-llm-feedback-language-status"
+        )
+      const kindlessMismatchStatus =
+        kindlessMismatchProbe.shadowRoot?.querySelector(
+          ".lia-llm-feedback-language-status"
+        )
+      const languageCheckRejectsMismatchedCorrectionKinds =
+        orthographyMismatchAction?.textContent === "Erneut versuchen" &&
+        syntaxMismatchAction?.textContent === "Erneut versuchen" &&
+        kindlessMismatchAction?.textContent === "Erneut versuchen" &&
+        orthographyMismatchStatus?.textContent ===
+          "Die Rechtschreibpr\u00fcfung ist derzeit nicht verf\u00fcgbar." &&
+        syntaxMismatchStatus?.textContent ===
+          "Die Grammatik- und Satzbaupr\u00fcfung ist derzeit nicht verf\u00fcgbar." &&
+        kindlessMismatchStatus?.textContent ===
+          "Die Sprachpr\u00fcfung ist derzeit nicht verf\u00fcgbar." &&
+        orthographyMismatchProbe.shadowRoot?.querySelector(
+          ".lia-llm-feedback-correction-toggle"
+        )?.hidden === true &&
+        syntaxMismatchProbe.shadowRoot?.querySelector(
+          ".lia-llm-feedback-correction-toggle"
+        )?.hidden === true &&
+        kindlessMismatchProbe.shadowRoot?.querySelector(
+          ".lia-llm-feedback-correction-toggle"
+        )?.hidden === true
 
       const quizSpacingIsCompacted =
         getComputedStyle(
@@ -1632,7 +1767,7 @@
 
       const matches = Boolean(
         window.LiaLLM &&
-        window.LiaLLM.version === "0.5.12" &&
+        window.LiaLLM.version === "0.5.13" &&
         typeof window.LiaLLM.evaluate === "function" &&
         typeof window.LiaLLM.debugReport === "function" &&
         typeof window.LiaLLM.feedbackForResult === "function" &&
@@ -1685,7 +1820,7 @@
         feedbackPreservesLineBreaks &&
         feedbackUsesCompactThemeStyle &&
         legacyFeedbackHasNoCorrectionButton &&
-        orthographyButtonIsStrictlyGated &&
+        correctionButtonIsStrictlyGated &&
         correctionExpandedAccessibly &&
         onlyCorrectedSegmentsAreMarked &&
         correctionMarksUseThemeAndRedundantEmphasis &&
@@ -1703,7 +1838,8 @@
         emptyFeedbackAbortsAndRejectsStale &&
         newRunIdAbortsAndRejectsStale &&
         disconnectAbortsAndRejectsStale &&
-        syntaxLanguageCheckHasNoCorrection &&
+        syntaxLanguageCheckShowsGrammarCorrection &&
+        languageCheckRejectsMismatchedCorrectionKinds &&
         quizSpacingIsCompacted &&
         resultSeparatorMatchesTheme &&
         quizPresenceStartsOnce &&
@@ -1783,7 +1919,7 @@
         feedbackPreservesLineBreaks,
         feedbackUsesCompactThemeStyle,
         legacyFeedbackHasNoCorrectionButton,
-        orthographyButtonIsStrictlyGated,
+        correctionButtonIsStrictlyGated,
         correctionExpandedAccessibly,
         onlyCorrectedSegmentsAreMarked,
         correctionMarksUseThemeAndRedundantEmphasis,
@@ -1801,7 +1937,8 @@
         emptyFeedbackAbortsAndRejectsStale,
         newRunIdAbortsAndRejectsStale,
         disconnectAbortsAndRejectsStale,
-        syntaxLanguageCheckHasNoCorrection,
+        syntaxLanguageCheckShowsGrammarCorrection,
+        languageCheckRejectsMismatchedCorrectionKinds,
         orthographyRuns,
         retryRuns,
         syntaxRuns,

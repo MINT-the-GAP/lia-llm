@@ -189,8 +189,8 @@ function languageFeedback(
   if (analysis.syntax) {
     values.push(
       german
-        ? "Satzbaufehler: " + analysis.syntaxErrors
-        : "sentence-structure errors: " + analysis.syntaxErrors,
+        ? "Grammatik-/Satzbaufehler: " + analysis.syntaxErrors
+        : "grammar/sentence-structure errors: " + analysis.syntaxErrors,
     )
   }
 
@@ -201,7 +201,7 @@ function languageFeedback(
         ? "Sprachstatistik (Fehlerzahlen als Modellschätzung):\n"
         : "Language statistics (error counts are model estimates):\n") +
       values.join(" · "),
-    ...(analysis.spelling && analysis.orthographyCorrection
+    ...(analysis.orthographyCorrection
       ? { orthographyCorrection: analysis.orthographyCorrection }
       : {}),
   }

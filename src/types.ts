@@ -140,7 +140,7 @@ export interface EvaluationRequest {
 export interface LanguageAnalysisOptions {
   /** Count spelling and punctuation errors separately. */
   spelling?: boolean
-  /** Count sentence-structure errors. */
+  /** Count unequivocal grammar and sentence-structure errors. */
   syntax?: boolean
 }
 
@@ -149,7 +149,10 @@ export interface NormalizedLanguageAnalysisOptions {
   syntax: boolean
 }
 
-export type OrthographyCorrectionKind = "spelling" | "punctuation"
+export type OrthographyCorrectionKind =
+  | "spelling"
+  | "punctuation"
+  | "grammar"
 
 export interface OrthographyCorrectionEdit {
   kind: OrthographyCorrectionKind
@@ -161,13 +164,20 @@ export interface OrthographyCorrectionEdit {
   replacement: string
 }
 
-export interface OrthographyCorrectionPart {
-  text: string
-  changed: boolean
-  kind?: OrthographyCorrectionKind
-  /** Original text removed at this position; never rendered as markup. */
-  removedText?: string
-}
+export type OrthographyCorrectionPart =
+  | {
+      text: string
+      changed: false
+      kind?: never
+      removedText?: never
+    }
+  | {
+      text: string
+      changed: true
+      kind: OrthographyCorrectionKind
+      /** Original text removed at this position; never rendered as markup. */
+      removedText?: string
+    }
 
 export interface OrthographyCorrection {
   parts: OrthographyCorrectionPart[]
@@ -181,7 +191,7 @@ export interface LanguageAnalysisResult
   spellingErrors?: number
   punctuationErrors?: number
   syntaxErrors?: number
-  /** Validated spelling and punctuation preview; never includes syntax edits. */
+  /** Validated spelling, punctuation, and bounded one-word grammar preview. */
   orthographyCorrection?: OrthographyCorrection
 }
 
@@ -328,7 +338,7 @@ export interface FeedbackLanguageCheckResult {
 
 export interface FeedbackLanguageCheckRequest {
   runId: string
-  kind: "orthography" | "syntax"
+  kind: "orthography" | "syntax" | "language"
   run(signal: AbortSignal): Promise<FeedbackLanguageCheckResult>
 }
 

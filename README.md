@@ -1,6 +1,6 @@
 <!--
 author:      MINT-the-GAP, Martin Lommatzsch
-version:     0.5.12
+version:     0.5.13
 language:    de
 narrator:    Deutsch Female
 comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
@@ -110,8 +110,8 @@ Promise.resolve()
     if (!window.LiaLLM) {
       throw new Error("lia-llm konnte nicht geladen werden.")
     }
-    if (window.LiaLLM.version !== "0.5.12") {
-      throw new Error(`lia-llm 0.5.12 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
+    if (window.LiaLLM.version !== "0.5.13") {
+      throw new Error(`lia-llm 0.5.13 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
     }
 
     const options = window.LiaLLM.parseMacroOptions(optionSource)
@@ -172,7 +172,12 @@ Promise.resolve()
       (quizOptions.rechtschreibung || quizOptions.satzbau)
         ? {
             runId,
-            kind: quizOptions.rechtschreibung ? "orthography" : "syntax",
+            kind:
+              quizOptions.rechtschreibung && quizOptions.satzbau
+                ? "language"
+                : quizOptions.rechtschreibung
+                  ? "orthography"
+                  : "syntax",
             run: async signal => {
               if (!active) throw stoppedError()
               const languageAnalysis = await window.LiaLLM.evaluateLanguage({
@@ -369,7 +374,7 @@ Optionsschreibweise sind gleichwertig:
 | `assessmentengine=compact|quality` | Engine ausschließlich für die Inhaltsprüfung festlegen; ohne Angabe nutzt normaler Inhalt `compact`, die spätere optionale Sprachprüfung unabhängig davon `quality` |
 | `operator=...` / vierter Wert | zusätzlich die verlangte Antwortform des gesetzten Operators prüfen |
 | `Rechtschreibung=1` | nach der fertigen Inhaltsprüfung einen Button für Rechtschreibung, Zeichensetzung und die sichere Korrekturansicht anbieten |
-| `Satzbau=1` | nach der fertigen Inhaltsprüfung einen Button für Wortzahl und geschätzte Satzbaufehler anbieten; ohne Textkorrektur |
+| `Satzbau=1` | nach der fertigen Inhaltsprüfung eindeutige Grammatikfehler (einschließlich Kasus, Kongruenz und Flexion) sowie Satzbaufehler prüfen; sichere Einwort-Grammatikkorrekturen werden markiert |
 | `maxthinkingtime=...` | maximale zusätzliche Denkzeit: `0s`, `5s`, `10s`, `15s`, `20s` oder `30s`; Standard ist `15s` |
 | `maxthinkingtokens=...` | maximales Thinking-Ausgabebudget: `low`, `medium`, `high`, `ultra` oder experimentell `extreme`; Standard ist `medium` |
 
@@ -499,7 +504,9 @@ Lernendenantworten oder Modellantworten; es findet keine Speicherung für späte
 
 Mit `Rechtschreibung=1` ergänzt das Kurzfeedback die Gesamtzahl der Wörter sowie getrennte
 Zählungen für Zeichensetzungs- und Rechtschreibfehler. `Satzbau=1` ergänzt die Zahl der
-Satzbaufehler. Beide Modi können einzeln oder gemeinsam verwendet werden:
+eindeutigen Grammatik-/Satzbaufehler. Dazu zählen insbesondere falscher Kasus (zum Beispiel
+Akkusativ statt Dativ), Kongruenz, Flexion und Wortstellung. Beide Modi können einzeln oder
+gemeinsam verwendet werden:
 
 ```` markdown
 Aufgabe: Erkläre, warum Eis auf flüssigem Wasser schwimmt.
@@ -517,50 +524,100 @@ Makroparameter. Enthält er ein Komma, schützen die Backticks den vollständige
 Parametertrennung.
 
 Der erste Prüfen-Klick übergibt ausschließlich die unveränderte Lernendenantwort zur fachlichen
-Bewertung. Er enthält keinen Auftrag zur Rechtschreib-, Zeichensetzungs- oder Satzbauanalyse.
+Bewertung. Er enthält keinen Auftrag zur Rechtschreib-, Zeichensetzungs-, Grammatik- oder
+Satzbauanalyse.
 Das Richtig/Falsch-Ergebnis und gegebenenfalls die Musterlösung werden vollständig ausgegeben,
 bevor irgendeine Sprachprüfung gestartet werden kann. Erkennbare Schreibfehler soll der
 Quality-Inhaltsjudge bei seiner fachlichen Entscheidung ausdrücklich ignorieren.
 Die Optionen `Rechtschreibung` und `Satzbau` verändern weder die gewählte Inhaltsengine noch
 deren Zeit- oder Tokenbudget.
 
-Erst danach erscheint bei `Rechtschreibung=1` die Schaltfläche **Rechtschreibung prüfen**,
-bei reinem `Satzbau=1` entsprechend **Satzbau prüfen**. Nur dieser zusätzliche Klick startet
-den lokalen Sprachmodelllauf. Bei kombinierten Optionen entstehen Rechtschreib-, Zeichensetzungs-
-und Satzbaustatistik gemeinsam nach diesem Klick. Der Lauf besitzt ein eigenes Abbruchsignal und
-kein Inhalts-Thinking-Budget. Das bereits ausgegebene Inhaltsurteil, seine Qualität und die
-ausgewählte Musterlösung werden dadurch nicht mehr verändert. Währenddessen kann weitergearbeitet
-oder die Folie gewechselt werden; eine neue Inhaltsprüfung beendet einen noch laufenden optionalen
-Sprachjob, während ein bereits erlaubter Download und der Modellcache erhalten bleiben.
+Erst danach erscheint bei reinem `Rechtschreibung=1` die Schaltfläche
+**Rechtschreibung prüfen**, bei reinem `Satzbau=1` **Grammatik und Satzbau prüfen** und bei
+kombinierten Optionen **Sprache prüfen**. Nur dieser zusätzliche Klick startet den lokalen
+Sprachmodelllauf. Die angeforderten Fehlerstatistiken entstehen gemeinsam nach diesem Klick. Der
+Lauf besitzt ein eigenes Abbruchsignal und kein Inhalts-Thinking-Budget. Das bereits ausgegebene
+Inhaltsurteil, seine Qualität und die ausgewählte Musterlösung werden dadurch nicht mehr verändert.
+Währenddessen kann weitergearbeitet oder die Folie gewechselt werden; eine neue Inhaltsprüfung
+beendet einen noch laufenden optionalen Sprachjob, während ein bereits erlaubter Download und der
+Modellcache erhalten bleiben.
+
+Die Grammatikprüfung darf bewusst länger dauern als die bisherige Statistik: Nach der allgemeinen
+Sprachanalyse erzeugt der Browser selbst sichere Wortpositionen und Optionen. Stimmen Worttoken,
+Satzzeichen und Zwischenräume einer Musterlösung bis auf freigegebene Wortformen bytegenau
+überein, kann dieser strenge Referenzanker die Kandidaten lokal eingrenzen; er bestätigt aber
+keine Änderung. Ohne einen solchen Anker wählt das Modell ausschließlich zwischen den lokal
+erzeugten IDs. Es erhält höchstens 24 Kandidaten je Abschnitt und bis zu 512 Ausgabetokens pro Versuch.
+Bei ungültiger Ausgabe ist pro Abschnitt genau ein weiterer Reparaturversuch mit demselben Budget
+von 512 Ausgabetokens pro Versuch erlaubt. Der erste Durchgang umfasst höchstens vier Abschnitte
+mit insgesamt maximal 96 unterschiedlichen Kandidaten. Für jede `candidate_id` muss das
+schemaerzwungene Ergebnis genau eine `option_id` enthalten; `0` bedeutet unverändertes Original.
+Enthält der erste Durchgang trotz gemeldeter Grammatikfehler ausschließlich Originaloptionen,
+folgt genau ein gezielter zweiter Durchgang über dieselben höchstens vier Abschnitte; auch er darf
+sicher ausschließlich Originaloptionen bestätigen. Im theoretischen Grenzfall sind damit
+einschließlich der Reparaturversuche höchstens 16 Kandidatenaufrufe möglich. Diese
+96-Kandidaten-Grenze gilt für die Discovery ohne strengen Referenzanker. Oberhalb davon bleibt die
+gültige Grammatikstatistik sichtbar, die Grammatikvorschau gilt jedoch als fehlgeschlagen; bei
+kombinierter Prüfung wird deshalb keine unvollständige Korrekturfassung gezeigt. Ein strenger
+Referenzanker überspringt die Discovery und darf unabhängig von der Gesamtzahl lokaler Kandidaten
+höchstens acht bytegenau eingegrenzte Stellen einzeln bestätigen. Höchstens acht durch eine
+Nicht-Originaloption nominierte
+Stellen werden anschließend einzeln in einer auf alle lokal erzeugten Wortformen begrenzten
+schemaerzwungenen Entscheidung mit bis zu 96 Tokens pro Versuch geprüft. Erst dieser begrenzte
+Bestätigungslauf entscheidet anhand markierter Satzvarianten über die tatsächliche Form; die vorläufige
+Discovery-Option ist nicht bindend. Bei einem referenzverankerten Kandidaten wird trotzdem nur die
+exakte Referenzform akzeptiert. Auch hier ist genau ein weiterer Reparaturversuch möglich.
+Discovery und Bestätigung verwenden keinen freien Denktext, und keiner der Grammatikläufe besitzt
+ein kurzes zusätzliches Zeitlimit; der Lauf
+bleibt über Folienwechsel oder eine neue Prüfung abbrechbar.
 
 Die Wortzahl wird nach dem Klick im Browser nach einer festen Segmentierungsregel bestimmt und ist
 keine Modellschätzung. Für Rechtschreibung wird erst jetzt zusätzlich ein lokal ausgeliefertes
 de-DE-Wörterbuch geladen. Es prüft die gesamte Antwort tokenweise und sichert eindeutige Tippfehler
 ab; das lokale Quality-Modell ergänzt kontextabhängige Entscheidungen, Groß-/Kleinschreibung und
 Zeichensetzung. Mehrdeutige Wörter dürfen nur zwischen geprüften Einzelwort-Kandidaten gewählt
-werden. Die Fehlerzahlen sind Hinweise für die Überarbeitung, keine verbindliche Korrektur.
-Schlägt die nachgelagerte Prüfung fehl, bleibt das Inhaltsurteil erhalten und der Button bietet
-einen neuen Versuch an.
+werden. Bei `Satzbau=1` zählt das Quality-Modell zusätzlich eindeutige Grammatik- und
+Satzbaufehler. Für die Korrekturansicht erzeugt der Browser ausschließlich einzelne Formen aus
+lokal hinterlegten, geschlossenen Gruppen deutscher Artikel, Begleiter und Pronomen sowie von
+`sein` und `haben`. Das Modell kann weder Worttexte noch Positionen erzeugen, sondern muss für jede
+vorhandene `candidate_id` genau eine lokal vorgegebene `option_id` auswählen. Adjektiv-,
+Substantiv- und freie
+Verbflexionen können in der Statistik erscheinen, werden aber wegen möglicher Bedeutungsänderungen
+nicht automatisch ersetzt. Jede ausgewählte Änderung muss zusätzlich eine begrenzte Modellauswahl
+zwischen dem Original und allen lokal freigegebenen Formen bestehen; bei einem bytegenau
+referenzverankerten Kandidaten wird dabei ausschließlich die exakte Referenzform akzeptiert. Die
+Fehlerzahlen sind Hinweise für die Überarbeitung, keine verbindliche
+Korrektur. Schlägt die
+gesamte Sprachprüfung einschließlich der Statistik fehl, bleibt das Inhaltsurteil erhalten und der
+Button bietet einen neuen Versuch an.
 
-Nach einer erfolgreichen Rechtschreibprüfung wird die vorgeschlagene Fassung automatisch
+Nach einer erfolgreichen Sprachprüfung wird eine vorhandene vorgeschlagene Fassung automatisch
 eingeblendet; danach lässt sie sich mit **Korrigierten Text anzeigen/ausblenden** umschalten.
-Darin sind ausschließlich korrigierte
-Rechtschreib- und Zeichensetzungsstellen türkis, fett und unterstrichen markiert. Der
-Korrekturlauf berücksichtigt keine Satzbaufehler und ist ausdrücklich angewiesen, Wortstellung,
-Stil und Inhalt nicht zu verändern. Zusätzlich lässt die lokale Validierung keine ergänzten,
+Darin sind korrigierte Rechtschreib-, Zeichensetzungs- und sichere Einwort-Grammatikstellen türkis,
+fett und unterstrichen markiert. Breitere Satzbau- oder Wortstellungsfehler können in der Statistik
+erscheinen, werden aber nicht automatisch umgestellt. Die lokale Validierung lässt keine ergänzten,
 gelöschten oder umgestellten Wörter, keine Zahlenänderungen und keine veränderten Absätze zu.
-Da die richtige Schreibung eines einzelnen Wortes trotzdem modellgestützt beurteilt wird, bleibt
-die eingeblendete Fassung ein Vorschlag. Die ursprünglich eingegebene Antwort wird weder
-überschrieben noch als LiaScript ausgeführt. Bei einer fehlerfreien Antwort kann die unveränderte
-Fassung zur Kontrolle eingeblendet werden.
+Grammatikvorschläge müssen innerhalb genau einer lokal freigegebenen geschlossenen Wortformgruppe
+bleiben; eine bloße Ähnlichkeit des Wortstamms reicht ausdrücklich nicht. Da die richtige Form
+trotzdem modellgestützt beurteilt wird, bleibt die eingeblendete Fassung ein Vorschlag. Die
+ursprünglich eingegebene Antwort wird weder überschrieben noch als LiaScript ausgeführt. Bei einer
+fehlerfreien reinen Rechtschreibprüfung kann die unveränderte Fassung zur Kontrolle eingeblendet
+werden.
 
 Die Korrekturansicht ist eine zusätzliche, abgesicherte Modellhilfe. Sie wird nicht angezeigt,
-wenn mehr als 24 Korrekturstellen entstehen oder ein Patch nicht eindeutig auf
-die Originalantwort passt. In diesem Fall werden Rechtschreib- und Zeichensetzungszahlen nicht
-als vermeintlich vollständiges Teilergebnis ausgegeben. Zum Schutz von Inhalt und Notation werden
-Zahlen/Formeln, Codebereiche und Änderungen über mehrere Worttoken hinweg nicht automatisch
-korrigiert; auch dadurch kann die Ansicht entfallen. `Satzbau=1` allein erzeugt niemals eine
-Korrekturansicht.
+wenn mehr als 24 Korrekturstellen oder mehr als acht tatsächliche Grammatikänderungen ausgewählt
+werden, die bestätigte Änderungszahl der zuvor ermittelten Fehlerzahl widerspricht, eine Auswahl-ID
+ungültig ist oder ein Patch nicht eindeutig auf die Originalantwort passt. Überlappen sich eine
+Orthografie- und eine Grammatikänderung, entfällt
+die kombinierte Vorschau ebenfalls vollständig. Zum Schutz von Inhalt und Notation
+werden Zahlen/Formeln, Codebereiche und Änderungen über mehrere Worttoken hinweg nicht automatisch
+korrigiert. Schlägt der vollständige Orthografiepatch fehl, werden Rechtschreib- und
+Zeichensetzungszahlen nicht als vermeintlich vollständiges Teilergebnis ausgegeben. Scheitert nur
+die zusätzliche Grammatikvorschau, bleibt eine bereits gültige Grammatik-/Satzbaustatistik dagegen
+sichtbar; bei einer kombinierten Prüfung wird dann keine unvollständige Korrekturfassung angezeigt.
+`Satzbau=1` allein zeigt nur dann eine Korrekturansicht, wenn mindestens eine sichere
+Einwort-Grammatikkorrektur bestätigt wurde. Bei null gemeldeten Grammatikfehlern wird kein
+separater Grammatik-Patchlauf gestartet.
 
 Für die Fehlerzählung muss das Quality-Modell lokal verfügbar sein; bei Bedarf gelten dafür
 dieselben Download-, Cache- und WebGPU-Bedingungen wie für die gründliche Inhaltsprüfung. Ist diese
@@ -725,7 +782,7 @@ copy(JSON.stringify(await LiaLLM.debugReport({ print: false }), null, 2))
 
 Die DebugNotiz enthält Browser-, Netzwerk-, Speicher-, Cache- und Artefaktmetadaten, aber keine
 Aufgabenstellung, Musterlösung, Schülerantwort, Response-Bodies, URL-Queryparameter oder
-Zugangsdaten. Sie weist außerdem eine fehlgeschlagene Rechtschreib-/Satzbauausgabe aus, auch wenn
+Zugangsdaten. Sie weist außerdem eine fehlgeschlagene Rechtschreib-/Grammatik-/Satzbauausgabe aus, auch wenn
 das Quality-Modell selbst weiterhin bereit ist. Für eine Fehlermeldung bitte den vollständigen
 Block zwischen `BEGIN LIA-LLM DEBUGNOTIZ` und `END LIA-LLM DEBUGNOTIZ` mitsenden.
 
