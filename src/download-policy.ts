@@ -12,7 +12,11 @@ export interface NetworkSnapshot {
   mobile: boolean
 }
 
-export type DownloadPolicyDecision = "auto" | "consent" | "skip"
+export type DownloadPolicyDecision =
+  | "auto"
+  | "consent"
+  | "skip"
+  | "insufficient-storage"
 
 export interface DownloadPolicyInput {
   engine: AssessmentEngine
@@ -24,6 +28,7 @@ export interface DownloadConsentRequest {
   engine: AssessmentEngine
   modelName: string
   estimatedBytes: number
+  qualitySelection?: ModelDownloadConsentDetail["qualitySelection"]
 }
 
 interface NetworkInformationLike {
@@ -74,6 +79,10 @@ export function decideModelDownload({
 }: DownloadPolicyInput): DownloadPolicyDecision {
   if (cached) return "auto"
   if (!network.online) return "skip"
+  // Quality models are optional, large downloads. An uncached Quality
+  // payload therefore always requires an explicit choice, including on Wi-Fi
+  // and Ethernet.
+  if (engine === "quality") return "consent"
   if (
     network.saveData ||
     network.connectionType === "cellular" ||
@@ -87,7 +96,6 @@ export function decideModelDownload({
   ) {
     return "auto"
   }
-  if (engine === "quality") return "consent"
   return network.mobile ? "consent" : "auto"
 }
 

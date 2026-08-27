@@ -1348,6 +1348,25 @@
         engine: "quality",
         modelName: "Qwen3-1.7B Test",
         estimatedBytes: 984000000,
+        qualitySelection: {
+          model: {
+            tier: "small",
+            id: "Qwen3-1.7B-q4f16_1-MLC",
+            revision: "quality-test-revision",
+            estimatedBytes: 984000000
+          },
+          sufficient: true,
+          reason: "small-fits",
+          payloadCached: false,
+          storage: {
+            kind: "known",
+            quotaBytes: 2000000000,
+            usageBytes: 400000000,
+            availableBytes: 1600000000,
+            safetyReserveBytes: 536870912,
+            usableBytes: 1063129088
+          }
+        },
         handled: false,
         respond: value => {
           consentResponse = value
@@ -1363,7 +1382,9 @@
         overlay?.dataset.background === "0" &&
         overlay?.getAttribute("role") === "alertdialog" &&
         overlay?.querySelector(".lia-llm-consent-cancel")?.textContent ===
-          "Beim kleinen Modell bleiben"
+          "Nicht herunterladen" &&
+        overlay?.querySelector(".lia-llm-consent-text")?.textContent
+          ?.includes("Sicherheitsreserve") === true
       document.documentElement.classList.add("lia-variant-dark")
       await new Promise(resolve => requestAnimationFrame(resolve))
       const darkOverlayStyle = overlay ? getComputedStyle(overlay) : null
@@ -1381,6 +1402,57 @@
         getComputedStyle(consentDownloadLabel).color === "rgb(50, 50, 50)"
       )
       document.documentElement.classList.remove("lia-variant-dark")
+      overlay?.querySelector(".lia-llm-consent-cancel")?.click()
+
+      let replacementConsentResponse = null
+      const replacementConsentDetail = {
+        id: "browser-replacement-consent-probe",
+        engine: "quality",
+        modelName: "Qwen3-4B-q4f16_1-MLC",
+        estimatedBytes: 2280000000,
+        qualitySelection: {
+          model: {
+            tier: "large",
+            id: "Qwen3-4B-q4f16_1-MLC",
+            revision: "quality-large-test-revision",
+            estimatedBytes: 2280000000
+          },
+          sufficient: true,
+          reason: "large-fits-after-small-removal",
+          payloadCached: false,
+          replacedModel: {
+            tier: "small",
+            id: "Qwen3-1.7B-q4f16_1-MLC",
+            revision: "quality-small-test-revision",
+            estimatedBytes: 984000000
+          },
+          storage: {
+            kind: "known",
+            quotaBytes: 4000000000,
+            usageBytes: 1362614439,
+            availableBytes: 2637385561,
+            safetyReserveBytes: 536870912,
+            usableBytes: 2100514649
+          }
+        },
+        handled: false,
+        respond: value => {
+          replacementConsentResponse = value
+        }
+      }
+      window.dispatchEvent(
+        new CustomEvent("lia-llm:download-consent", {
+          detail: replacementConsentDetail
+        })
+      )
+      const replacementConsentWasVisible =
+        overlay?.dataset.consent === "1" &&
+        overlay?.querySelector(".lia-llm-consent-title")?.textContent ===
+          "Großes Qualitätsmodell herunterladen?" &&
+        overlay?.querySelector(".lia-llm-consent-text")?.textContent
+          ?.includes("erst nach deiner Bestätigung") === true &&
+        overlay?.querySelector(".lia-llm-consent-download span")?.textContent
+          ?.includes("2,3 GB") === true
       overlay?.querySelector(".lia-llm-consent-cancel")?.click()
 
       const [ortFactoryResponse, ortWasmResponse] = await Promise.all([
@@ -1765,9 +1837,15 @@
             report.runId !== staleRunReport?.runId
         )
 
+      const selectedQualityBytes =
+        cacheInfo?.engines?.quality?.qualitySelection?.model.estimatedBytes
+      const selectedQualityIsValid =
+        (selectedQualityBytes === 984000000 ||
+          selectedQualityBytes === 2280000000) &&
+        cacheInfo?.engines?.quality?.estimatedBytes === selectedQualityBytes
       const matches = Boolean(
         window.LiaLLM &&
-        window.LiaLLM.version === "0.5.13" &&
+        window.LiaLLM.version === "0.5.14" &&
         typeof window.LiaLLM.evaluate === "function" &&
         typeof window.LiaLLM.debugReport === "function" &&
         typeof window.LiaLLM.feedbackForResult === "function" &&
@@ -1868,10 +1946,13 @@
         consentWasVisible &&
         darkConsentTracksTheme &&
         consentResponse === false &&
+        replacementConsentDetail.handled === true &&
+        replacementConsentWasVisible &&
+        replacementConsentResponse === false &&
         overlay?.dataset.consent === "0" &&
-        cacheInfo?.estimatedBytes === 1362614439 &&
+        cacheInfo?.estimatedBytes === 378614439 + selectedQualityBytes &&
         cacheInfo?.engines?.compact?.estimatedBytes === 378614439 &&
-        cacheInfo?.engines?.quality?.estimatedBytes === 984000000
+        selectedQualityIsValid
       )
       window.__liaCalibration.push({
         matches,
@@ -1961,6 +2042,8 @@
         consentWasVisible,
         darkConsentTracksTheme,
         consentResponse,
+        replacementConsentWasVisible,
+        replacementConsentResponse,
         cacheInfo
       })
     } catch (error) {

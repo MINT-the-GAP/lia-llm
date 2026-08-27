@@ -380,6 +380,7 @@ export class AutomaticEvaluator {
           engine,
           modelName: status.modelId,
           estimatedBytes: cache.estimatedBytes,
+          qualitySelection: cache.qualitySelection,
         },
         controller.signal,
       )
@@ -416,15 +417,22 @@ export class AutomaticEvaluator {
   ): Promise<LoadAuthorization> {
     const downloadCached = cache.downloadCached ?? cache.cached
     const network = captureNetworkSnapshot()
-    const decision = decideModelDownload({
-      engine,
-      // Offline startup requires every runtime and metadata component, not
-      // only the large model payload represented by downloadCached.
-      cached: cache.cached,
-      network,
-    })
+    const decision: DownloadPolicyDecision =
+      engine === "quality" &&
+      !downloadCached &&
+      cache.qualitySelection?.sufficient === false
+        ? "insufficient-storage"
+        : decideModelDownload({
+            engine,
+            // Offline startup requires every runtime and metadata component,
+            // not only the large payload represented by downloadCached.
+            cached: cache.cached,
+            network,
+          })
     recordDebugPolicy(engine, decision, cache, network)
-    if (decision === "skip") return { allowed: false, decision }
+    if (decision === "skip" || decision === "insufficient-storage") {
+      return { allowed: false, decision }
+    }
 
     const allowed =
       decision === "auto" ||
@@ -845,6 +853,8 @@ export class AutomaticEvaluator {
       }
     }
 
+    const qualityUpgrade = this.startQualityUpgrade(qualityCache)
+
     if (!compactResult) {
       compactResult = operatorSafeCompactResult(
         request,
@@ -852,7 +862,6 @@ export class AutomaticEvaluator {
       )
       assertRunActive(run)
     }
-    const qualityUpgrade = this.startQualityUpgrade(qualityCache)
 
     this.reportProgress(evaluationOptions, run, {
       phase: "preparing-quality",

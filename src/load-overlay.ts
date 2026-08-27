@@ -154,8 +154,12 @@ export function progressPercent(progress: ModelProgress | null): number | null {
 
 function formatBytes(value: number): string {
   const formatter = new Intl.NumberFormat("de-DE", {
-    maximumFractionDigits: value >= 10_000_000 ? 0 : 1,
+    maximumFractionDigits:
+      value >= 1_000_000_000 ? 1 : value >= 10_000_000 ? 0 : 1,
   })
+  if (value >= 1_000_000_000) {
+    return formatter.format(value / 1_000_000_000) + " GB"
+  }
   if (value >= 1_000_000) return formatter.format(value / 1_000_000) + " MB"
   if (value >= 1_000) return formatter.format(value / 1_000) + " kB"
   return formatter.format(value) + " B"
@@ -535,17 +539,42 @@ export function registerLoadOverlay(api: LiaLLMApi): void {
     overlay!.setAttribute("aria-describedby", "lia-llm-consent-text")
     consentTitle.textContent =
       detail.engine === "quality"
-        ? "Qualit\u00e4tsmodell herunterladen?"
+        ? detail.qualitySelection?.model.tier === "large"
+          ? "Gro\u00dfes Qualit\u00e4tsmodell herunterladen?"
+          : "Qualit\u00e4tsmodell herunterladen?"
         : "Kompaktmodell herunterladen?"
+    let storageExplanation = ""
+    const selection = detail.qualitySelection
+    if (selection?.storage.kind === "known") {
+      storageExplanation =
+        " Der Browser meldet rund " +
+        formatBytes(selection.storage.availableBytes) +
+        " freien Origin-Speicher; " +
+        formatBytes(selection.storage.safetyReserveBytes) +
+        " bleiben als Sicherheitsreserve frei." +
+        (selection.reason === "small-fits"
+          ? " Deshalb wird die kleinere Quality-Variante verwendet."
+          : selection.reason === "large-fits-after-small-removal"
+            ? " Das vorhandene kleinere Quality-Modell wird erst nach deiner Bestätigung durch die große Variante ersetzt."
+            : "")
+    } else if (selection?.reason === "estimate-unavailable") {
+      storageExplanation =
+        " Der freie Origin-Speicher konnte nicht verl\u00e4sslich ermittelt werden; deshalb wird vorsichtshalber die kleinere Quality-Variante verwendet."
+    }
     consentText.textContent =
       detail.modelName +
       " ben\u00f6tigt rund " +
       formatBytes(detail.estimatedBytes) +
-      " und bleibt anschlie\u00dfend im Browsercache."
-    consentCancel.textContent =
-      detail.engine === "quality"
-        ? "Beim kleinen Modell bleiben"
-        : "Abbrechen"
+      " und bleibt anschlie\u00dfend im Browsercache." +
+      storageExplanation
+    consentCancel.textContent = "Nicht herunterladen"
+    const downloadLabel = consentDownload.querySelector("span")
+    if (downloadLabel) {
+      downloadLabel.textContent =
+        detail.engine === "quality"
+          ? formatBytes(detail.estimatedBytes) + " herunterladen"
+          : "Herunterladen"
+    }
     show(false)
 
     detail.signal?.addEventListener(

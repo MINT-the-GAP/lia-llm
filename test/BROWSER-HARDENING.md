@@ -394,21 +394,36 @@ Die vorhandenen PASS-Reports erzwingen das Kompaktmodell. Ihre WebLLM-Caches
 `webllm/model`, `webllm/config` und `webllm/wasm` waren leer. Sie belegen daher
 nichts für das Quality-Modell.
 
-Das konfigurierte, optionale Quality-Modell ist `Qwen3-1.7B-q4f16_1-MLC` mit gepinnter
-Modellrevision `80b3abcec6c3b3f5355dc0cc99cc4fb578f192bc` und gepinnter
-Modellbibliothek `025bcaf3780fa8254f5e5efd3bfea0a5397248f4`. Seine konfigurierte
-Downloadschätzung beträgt 984.000.000 B. Zusammen mit 378.614.439 B für das
-Kompaktmodell samt ONNX-Laufzeit ergibt das 1.362.614.439 B (ca. 1.299,5 MiB).
-Ein freies Origin-Speicherbudget von 2 GiB liegt damit deutlich über der konfigurierten
-Gesamtschätzung und lässt rechnerisch etwa 748,5 MiB Abstand. Das belegt jedoch weder ausreichenden
-GPU-Speicher noch ein stabiles WebGPU-Gerät. Compact bleibt der sichere Standard; Quality muss
-ausdrücklich oder über eine dokumentierte erweiterte Funktion gewählt werden.
+Konfiguriert sind zwei optionale Quality-Stufen mit unveränderlichen Revisionen:
+`Qwen3-1.7B-q4f16_1-MLC` mit
+`80b3abcec6c3b3f5355dc0cc99cc4fb578f192bc` und 984.000.000 B sowie
+`Qwen3-4B-q4f16_1-MLC` mit
+`a5c9fab855e3ccbdfed2e7e69683d75f30332161` und 2.280.000.000 B. Beide verwenden die gepinnte
+Modellbibliotheksrevision `025bcaf3780fa8254f5e5efd3bfea0a5397248f4`.
+
+Vor einem ungecacheten Quality-Download wählt das Template anhand von
+`navigator.storage.estimate()` und einer Reserve von `max(512 MiB, 10 % der quota)` die größte
+passende Stufe. Bei unbekannter Quote wird 1.7B gewählt; reicht eine bekannte Quote für keine
+Stufe, startet kein Quality-Download. Eine gemeldete Origin-Quote von 4.000.000.000 B reicht
+rechnerisch auch bei bereits vorhandenem Kompaktmodell für die 4B-Stufe einschließlich Reserve.
+Ein vorhandener 1.7B-Cache wird bei Bedarf als nach Zustimmung freigebbarer Platz berücksichtigt
+und erst nach dieser Zustimmung gezielt entfernt; anschließend wird die Quote erneut geprüft.
+Eine als vollständig gecacht freigegebene Aktivierung bleibt netzwerkgesperrt: Verschwundene oder
+beschädigte Artefakte dürfen erst nach einer neuen Bestätigung nachgeladen werden.
+Das belegt jedoch weder ausreichenden GPU-Speicher noch ein stabiles WebGPU-Gerät. Compact bleibt
+der sichere Standard; Quality muss ausdrücklich oder über eine dokumentierte erweiterte Funktion
+gewählt werden.
+
+Die WebLLM-Konfiguration nennt rund 2.036,66 MB benötigten VRAM für 1.7B und rund 3.431,59 MB
+für 4B. Diese Angaben sind keine Messung freien GPU-Speichers; eine dafür verlässliche Browser-API
+steht nicht zur Verfügung. Beide Stufen, insbesondere 4B, benötigen daher einen separaten Lauf auf
+der tatsächlich eingesetzten Schulhardware.
 
 ### Lokaler WebGPU-Stresstest
 
 Auf dem tatsächlich getesteten lokalen Host liefen Microsoft Edge 151 und eine NVIDIA GeForce
 RTX 2070 SUPER (Turing, 8 GB VRAM; gemeldetes maximales WebGPU-Pufferlimit ca. 2 GiB).
-Das nun konfigurierte Qwen3-1.7B reproduzierte in vier von vier warmen Minimalläufen dieselbe
+Die getestete Qwen3-1.7B-Stufe reproduzierte in vier von vier warmen Minimalläufen dieselbe
 Fehlerkette:
 `DXGI_ERROR_DEVICE_HUNG` → verlorenes WebGPU-Gerät → `Object has already been disposed`.
 Modellcache und Plattenspeicher waren dabei vollständig beziehungsweise ausreichend. Der
@@ -428,7 +443,7 @@ abweisen, ersetzt aber keine ausreichende semantische Modellleistung.
 
 Der reproduzierbare Inhalts-Stresstest wird nach einem aktuellen Build mit
 `npm run test:browser-adversarial` ausgeführt. Ein technisch erfolgreicher Lauf beweist nur die
-dort geprüften Fälle. Für die aktuelle 1.7B-Konfiguration liegt wegen des reproduzierten
+dort geprüften Fälle. Für die getestete 1.7B-Stufe liegt wegen des reproduzierten
 Geräteverlusts auf dem lokalen Testhost noch kein erfolgreicher Browser-Stresstest vor.
 
 Eine Quality-Freigabe braucht pro Browser/OS-Paar weiterhin denselben

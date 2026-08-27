@@ -132,12 +132,12 @@ in einer Aufgabe sind ebenfalls noch nicht Teil des Makrovertrags.
 
 `npm run test:browser-operators` führt für jedes aktive Profil einen Positiv- und einen
 gezielten Gegenfall mit dem WebGPU-Qualitätsmodell aus. Der Lauf prüft zusätzlich kanonische
-Operator-ID, Quality-Engine und den erwarteten Fehlercode der Gegenfälle. Wegen des derzeit etwa
-984 MB großen Quality-Modell-Downloads und der WebGPU-Abhängigkeit gehört diese Kalibrierung
-bewusst nicht zum hardwareunabhängigen `npm run check`. In einem vollständig neuen Profil beträgt
-die konfigurierte Schätzung für Quality- und Kompaktmodell zusammen 1.362.614.439 B
-(ca. 1.299,5 MiB). Compact bleibt der sichere Standard; Qwen3-1.7B ist eine optionale
-Quality-Engine und benötigt eine eigene Freigabe für das konkrete Browser-/GPU-System.
+Operator-ID, Quality-Engine und den erwarteten Fehlercode der Gegenfälle. Wegen des je nach
+Origin-Speicher etwa 984 MB beziehungsweise 2,28 GB großen Quality-Modell-Downloads und der
+WebGPU-Abhängigkeit gehört diese Kalibrierung bewusst nicht zum hardwareunabhängigen
+`npm run check`. Das Template wählt mit Sicherheitsreserve zwischen Qwen3-1.7B und Qwen3-4B;
+Compact bleibt der sichere Standard. Beide Quality-Stufen benötigen eine eigene Freigabe für das
+konkrete Browser-/GPU-System.
 
 ## Neue Operatoren ergänzen
 

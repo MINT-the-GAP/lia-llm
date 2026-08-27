@@ -49,7 +49,10 @@ import {
   SemanticEvaluator,
 } from "../src/evaluator.ts"
 import { formatResult } from "../src/format.ts"
-import { decideModelDownload } from "../src/download-policy.ts"
+import {
+  decideModelDownload,
+  DOWNLOAD_CONSENT_EVENT,
+} from "../src/download-policy.ts"
 import {
   beginDebugLoad,
   classifyDebugFindings,
@@ -86,12 +89,22 @@ import { progressPercent } from "../src/load-overlay.ts"
 import { ResilientFetchSession } from "../src/resilient-fetch.ts"
 import {
   createQualityAppConfig,
+  LARGE_QUALITY_MODEL,
   LEGACY_QUALITY_CACHE_TARGETS,
   QUALITY_MODEL_ESTIMATED_BYTES,
   QUALITY_MODEL_ID,
   QUALITY_MODEL_LIB_REVISION,
   QUALITY_MODEL_REVISION,
+  QUALITY_MODELS,
+  SMALL_QUALITY_MODEL,
 } from "../src/quality-model-config.ts"
+import {
+  estimateAndSelectQualityModel,
+  estimateStorageAvailability,
+  selectQualityModel,
+  STORAGE_SAFETY_RESERVE_BYTES,
+  storageAvailabilityFromEstimate,
+} from "../src/quality-model-selection.ts"
 import {
   classifyQualityDecision,
   clearLegacyQualityCache,
@@ -140,9 +153,44 @@ import type {
   EvaluationRequest,
   EvaluationResult,
   ModelCacheInfo,
+  ModelDownloadConsentDetail,
   NliEvidence,
   RuntimeStatus,
 } from "../src/types.ts"
+
+function installDownloadConsent(
+  allow: boolean,
+  onRequest?: (detail: ModelDownloadConsentDetail) => void,
+): () => void {
+  const descriptor = Object.getOwnPropertyDescriptor(
+    globalThis,
+    "dispatchEvent",
+  )
+  const previous =
+    typeof globalThis.dispatchEvent === "function"
+      ? globalThis.dispatchEvent.bind(globalThis)
+      : undefined
+  Object.defineProperty(globalThis, "dispatchEvent", {
+    configurable: true,
+    value: (event: Event) => {
+      if (event.type === DOWNLOAD_CONSENT_EVENT) {
+        const detail = (event as CustomEvent<ModelDownloadConsentDetail>).detail
+        onRequest?.(detail)
+        detail.handled = true
+        detail.respond(allow)
+        return true
+      }
+      return previous?.(event) ?? true
+    },
+  })
+  return () => {
+    if (descriptor) {
+      Object.defineProperty(globalThis, "dispatchEvent", descriptor)
+    } else {
+      Reflect.deleteProperty(globalThis, "dispatchEvent")
+    }
+  }
+}
 
 function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return bytes.buffer.slice(
@@ -199,6 +247,30 @@ class MemoryRuntimeCache {
   async keys(): Promise<readonly Request[]> {
     this.keysCalls += 1
     return Array.from(this.entries.keys(), (url) => new Request(url))
+  }
+}
+
+class BlockingDeleteMemoryRuntimeCache extends MemoryRuntimeCache {
+  private blockNextDelete = true
+  private releaseBlockedDelete: () => void = () => undefined
+  private signalDeleteStarted: () => void = () => undefined
+  readonly deleteStarted = new Promise<void>((resolve) => {
+    this.signalDeleteStarted = resolve
+  })
+
+  releaseDelete(): void {
+    this.releaseBlockedDelete()
+  }
+
+  override async delete(request: RequestInfo | URL): Promise<boolean> {
+    if (this.blockNextDelete) {
+      this.blockNextDelete = false
+      this.signalDeleteStarted()
+      await new Promise<void>((resolve) => {
+        this.releaseBlockedDelete = resolve
+      })
+    }
+    return super.delete(request)
   }
 }
 
@@ -1007,7 +1079,7 @@ test("debug diagnostics flag an uncached model larger than the remaining origin 
   )
 })
 
-test("current quality model fits the reported school-browser quota", () => {
+test("small quality tier plus compact model fits the reported school-browser quota", () => {
   const qualityCache: ModelCacheInfo = {
     supported: true,
     cached: false,
@@ -5976,6 +6048,26 @@ test("quality weights and WebLLM runtime both use immutable revisions", () => {
     pinnedPrebuiltRecord?.overrides?.context_window_size,
     4_096,
   )
+  for (const model of QUALITY_MODELS) {
+    const selectedConfig = createQualityAppConfig(
+      webLlm.prebuiltAppConfig,
+      model,
+    )
+    assert.equal(selectedConfig.model_list.length, 1)
+    const selectedRecord = selectedConfig.model_list[0]
+    assert.equal(selectedRecord?.model_id, model.id)
+    assert.match(selectedRecord?.model ?? "", new RegExp(model.revision, "u"))
+    assert.match(
+      selectedRecord?.model_lib ?? "",
+      new RegExp(
+        model.tier === "large"
+          ? "Qwen3-4B-q4f16_1_cs1k-webgpu\\.wasm$"
+          : "Qwen3-1\\.7B-q4f16_1_cs1k-webgpu\\.wasm$",
+        "u",
+      ),
+    )
+    assert.doesNotMatch(selectedRecord?.model_lib ?? "", /\/main\//u)
+  }
   const appConfig = createQualityAppConfig({
     model_list: [
       {
@@ -6458,22 +6550,19 @@ test("quality cache clear removes current and legacy pinned model artifacts", as
   storage.cachesByName.set("webllm/config", configCache)
   storage.cachesByName.set("webllm/wasm", wasmCache)
 
-  const currentModelUrl =
-    "https://huggingface.co/mlc-ai/" +
-    QUALITY_MODEL_ID +
-    "/resolve/" +
-    QUALITY_MODEL_REVISION +
-    "/"
-  const currentModelRecord = createQualityAppConfig(
-    webLlm.prebuiltAppConfig,
-  ).model_list[0]
-  assert.ok(currentModelRecord)
-  const currentModelLibUrl = currentModelRecord.model_lib
-  const currentTargets = [
-    [modelCache, currentModelUrl + "tensor-cache.json"],
-    [configCache, currentModelUrl + "mlc-chat-config.json"],
-    [wasmCache, currentModelLibUrl],
-  ] as const
+  const activeTargets = QUALITY_MODELS.flatMap((model) => {
+    const record = createQualityAppConfig(
+      webLlm.prebuiltAppConfig,
+      model,
+    ).model_list[0]
+    assert.ok(record)
+    const modelUrl = record.model.endsWith("/") ? record.model : record.model + "/"
+    return [
+      [modelCache, modelUrl + "tensor-cache.json"] as const,
+      [configCache, modelUrl + "mlc-chat-config.json"] as const,
+      [wasmCache, record.model_lib] as const,
+    ]
+  })
   const legacyTargets = LEGACY_QUALITY_CACHE_TARGETS.flatMap((legacy) => [
     [modelCache, legacy.modelUrl + "params/params_shard_0.bin"] as const,
     [configCache, legacy.modelUrl + "tokenizer.json"] as const,
@@ -6484,17 +6573,17 @@ test("quality cache clear removes current and legacy pinned model artifacts", as
     [
       "https://huggingface.co/mlc-ai/Qwen3-0.6B-q4f16_1-MLC/resolve/" +
         "8c14ce481d4c692769976ad52afea453a102df19/",
-      "https://huggingface.co/mlc-ai/Qwen3-4B-q4f16_1-MLC/resolve/" +
-        "a5c9fab855e3ccbdfed2e7e69683d75f30332161/",
     ],
   )
-  assert.equal(
-    LEGACY_QUALITY_CACHE_TARGETS.some(
-      (legacy) => legacy.modelUrl === currentModelUrl,
-    ),
-    false,
-  )
-  const targets = [...currentTargets, ...legacyTargets] as const
+  for (const model of QUALITY_MODELS) {
+    assert.equal(
+      LEGACY_QUALITY_CACHE_TARGETS.some((legacy) =>
+        legacy.modelUrl.includes("/" + model.id + "/"),
+      ),
+      false,
+    )
+  }
+  const targets = [...activeTargets, ...legacyTargets] as const
   for (const [cache, url] of targets) {
     cache.seed(url, new Response("cached"))
   }
@@ -6512,7 +6601,7 @@ test("quality cache clear removes current and legacy pinned model artifacts", as
     clearLegacyQualityCache,
   )
   assert.equal(migrated, legacyTargets.length)
-  for (const [cache, url] of currentTargets) assert.equal(cache.has(url), true)
+  for (const [cache, url] of activeTargets) assert.equal(cache.has(url), true)
   for (const [cache, url] of legacyTargets) assert.equal(cache.has(url), false)
   for (const [cache, url] of unrelated) assert.equal(cache.has(url), true)
   for (const [cache, url] of legacyTargets) {
@@ -6526,6 +6615,319 @@ test("quality cache clear removes current and legacy pinned model artifacts", as
   assert.equal(deleted, targets.length)
   for (const [cache, url] of targets) assert.equal(cache.has(url), false)
   for (const [cache, url] of unrelated) assert.equal(cache.has(url), true)
+})
+
+test("QualityEvaluator removes a reclaimable small tier only when large preload starts", async () => {
+  const storage = new RuntimeCacheStorageStub()
+  const modelCache = new MemoryRuntimeCache()
+  const configCache = new MemoryRuntimeCache()
+  const wasmCache = new MemoryRuntimeCache()
+  storage.cachesByName.set("webllm/model", modelCache)
+  storage.cachesByName.set("webllm/config", configCache)
+  storage.cachesByName.set("webllm/wasm", wasmCache)
+
+  const smallRecord = createQualityAppConfig(
+    webLlm.prebuiltAppConfig,
+    SMALL_QUALITY_MODEL,
+  ).model_list[0]
+  assert.ok(smallRecord)
+  const smallUrl = smallRecord.model.endsWith("/")
+    ? smallRecord.model
+    : smallRecord.model + "/"
+  const smallTargets = [
+    [modelCache, smallUrl + "tensor-cache.json"],
+    [configCache, smallUrl + "mlc-chat-config.json"],
+    [wasmCache, smallRecord.model_lib],
+  ] as const
+  for (const [cache, url] of smallTargets) {
+    cache.seed(url, new Response("cached-small"))
+  }
+
+  const selection = selectQualityModel({
+    storage: storageAvailabilityFromEstimate({
+      quota: 4_000_000_000,
+      usage: 378_614_439 + SMALL_QUALITY_MODEL.estimatedBytes,
+    }),
+    cache: { small: { payloadCached: true } },
+  })
+  assert.equal(selection.reason, "large-fits-after-small-removal")
+  for (const [cache, url] of smallTargets) assert.equal(cache.has(url), true)
+
+  let networkAuthorized: boolean | undefined
+  const navigatorObject = globalThis.navigator
+  const storageDescriptor = Object.getOwnPropertyDescriptor(
+    navigatorObject,
+    "storage",
+  )
+  let refreshedEstimateCalls = 0
+  Object.defineProperty(navigatorObject, "storage", {
+    configurable: true,
+    value: {
+      estimate: async () => {
+        refreshedEstimateCalls += 1
+        return { quota: 4_000_000_000, usage: 378_614_439 }
+      },
+    },
+  })
+  try {
+    await withCacheStorage(storage.asCacheStorage(), async () => {
+      const evaluator = new QualityEvaluator()
+      const internals = evaluator as unknown as {
+        createEngine(networkAuthorized: boolean): Promise<{ unload(): Promise<void> }>
+        model: typeof LARGE_QUALITY_MODEL
+        modelSelection: typeof selection
+      }
+      internals.model = LARGE_QUALITY_MODEL
+      internals.modelSelection = selection
+      internals.createEngine = async (allowed) => {
+        networkAuthorized = allowed
+        return { unload: async () => undefined }
+      }
+      const status = await evaluator.preload(
+        {
+          supported: true,
+          cached: false,
+          downloadCached: false,
+          filesCached: 0,
+          filesTotal: 4,
+          estimatedBytes: LARGE_QUALITY_MODEL.estimatedBytes,
+          qualitySelection: selection,
+        },
+        true,
+      )
+      assert.equal(status.modelId, LARGE_QUALITY_MODEL.id)
+    })
+  } finally {
+    if (storageDescriptor) {
+      Object.defineProperty(navigatorObject, "storage", storageDescriptor)
+    } else {
+      delete (navigatorObject as Navigator & { storage?: StorageManager }).storage
+    }
+  }
+
+  assert.equal(networkAuthorized, true)
+  assert.equal(refreshedEstimateCalls, 1)
+  for (const [cache, url] of smallTargets) assert.equal(cache.has(url), false)
+})
+
+test("QualityEvaluator keeps a cache-only preload network-blocked", async () => {
+  const selection = selectQualityModel({
+    storage: { kind: "unknown", reason: "unsupported" },
+    cache: { small: { cached: true } },
+  })
+  assert.equal(selection.reason, "small-cached")
+
+  const evaluator = new QualityEvaluator()
+  let networkAuthorized: boolean | undefined
+  const internals = evaluator as unknown as {
+    createEngine(networkAuthorized: boolean): Promise<{ unload(): Promise<void> }>
+    model: typeof SMALL_QUALITY_MODEL
+    modelSelection: typeof selection
+  }
+  internals.model = SMALL_QUALITY_MODEL
+  internals.modelSelection = selection
+  internals.createEngine = async (allowed) => {
+    networkAuthorized = allowed
+    return { unload: async () => undefined }
+  }
+
+  await evaluator.preload(
+    {
+      supported: true,
+      cached: true,
+      downloadCached: true,
+      filesCached: 4,
+      filesTotal: 4,
+      estimatedBytes: SMALL_QUALITY_MODEL.estimatedBytes,
+      qualitySelection: selection,
+    },
+    true,
+  )
+  assert.equal(networkAuthorized, false)
+})
+
+test("QualityEvaluator requires fresh consent when a cached artifact is corrupt", async () => {
+  const storage = new RuntimeCacheStorageStub()
+  const configCache = new MemoryRuntimeCache()
+  storage.cachesByName.set("webllm/model", new MemoryRuntimeCache())
+  storage.cachesByName.set("webllm/config", configCache)
+  storage.cachesByName.set("webllm/wasm", new MemoryRuntimeCache())
+
+  const record = createQualityAppConfig(
+    webLlm.prebuiltAppConfig,
+    SMALL_QUALITY_MODEL,
+  ).model_list[0]
+  assert.ok(record)
+  const modelUrl = record.model.endsWith("/") ? record.model : record.model + "/"
+  configCache.seed(
+    new URL("mlc-chat-config.json", modelUrl).href,
+    new Response("not-json", { status: 200 }),
+  )
+
+  const selection = selectQualityModel({
+    storage: { kind: "unknown", reason: "unsupported" },
+    cache: { small: { cached: true } },
+  })
+  const evaluator = new QualityEvaluator()
+  const internals = evaluator as unknown as {
+    model: typeof SMALL_QUALITY_MODEL
+    modelSelection: typeof selection
+  }
+  internals.model = SMALL_QUALITY_MODEL
+  internals.modelSelection = selection
+
+  const navigatorObject = globalThis.navigator
+  const gpuDescriptor = Object.getOwnPropertyDescriptor(navigatorObject, "gpu")
+  Object.defineProperty(navigatorObject, "gpu", {
+    configurable: true,
+    value: {},
+  })
+  let networkCalls = 0
+  try {
+    await withCacheStorage(storage.asCacheStorage(), () =>
+      withGlobalFetch(
+        async () => {
+          networkCalls += 1
+          throw new Error("network must stay blocked without fresh consent")
+        },
+        () =>
+          assert.rejects(
+            evaluator.preload(
+              {
+                supported: true,
+                cached: true,
+                downloadCached: true,
+                filesCached: 4,
+                filesTotal: 4,
+                estimatedBytes: SMALL_QUALITY_MODEL.estimatedBytes,
+                qualitySelection: selection,
+              },
+              true,
+            ),
+            /neue Bestätigung erforderlich/u,
+          ),
+      ),
+    )
+  } finally {
+    if (gpuDescriptor) {
+      Object.defineProperty(navigatorObject, "gpu", gpuDescriptor)
+    } else {
+      delete (navigatorObject as Navigator & { gpu?: unknown }).gpu
+    }
+  }
+  assert.equal(networkCalls, 0)
+  assert.equal(configCache.has(new URL("mlc-chat-config.json", modelUrl).href), false)
+})
+
+test("QualityEvaluator rejects a stale cache selection without changing tiers", async () => {
+  const largeSelection = selectQualityModel({
+    storage: storageAvailabilityFromEstimate({
+      quota: 4_000_000_000,
+      usage: 378_614_439,
+    }),
+  })
+  const staleSmallSelection = selectQualityModel({
+    storage: storageAvailabilityFromEstimate({
+      quota: 2_000_000_000,
+      usage: 0,
+    }),
+  })
+  assert.equal(largeSelection.model.id, LARGE_QUALITY_MODEL.id)
+  assert.equal(staleSmallSelection.model.id, SMALL_QUALITY_MODEL.id)
+
+  const evaluator = new QualityEvaluator()
+  let createCalls = 0
+  const internals = evaluator as unknown as {
+    createEngine(): Promise<{ unload(): Promise<void> }>
+    model: typeof LARGE_QUALITY_MODEL
+    modelSelection: typeof largeSelection
+  }
+  internals.model = LARGE_QUALITY_MODEL
+  internals.modelSelection = largeSelection
+  internals.createEngine = async () => {
+    createCalls += 1
+    return { unload: async () => undefined }
+  }
+
+  await assert.rejects(
+    evaluator.preload(
+      {
+        supported: true,
+        cached: false,
+        downloadCached: false,
+        filesCached: 0,
+        filesTotal: 4,
+        estimatedBytes: SMALL_QUALITY_MODEL.estimatedBytes,
+        qualitySelection: staleSmallSelection,
+      },
+      true,
+    ),
+    /Cacheprüfung ist veraltet/u,
+  )
+  assert.equal(createCalls, 0)
+  assert.equal(evaluator.getStatus().modelId, LARGE_QUALITY_MODEL.id)
+})
+
+test("QualityEvaluator clearCache cancels a preload before its download starts", async () => {
+  const storage = new RuntimeCacheStorageStub()
+  const modelCache = new BlockingDeleteMemoryRuntimeCache()
+  storage.cachesByName.set("webllm/model", modelCache)
+  storage.cachesByName.set("webllm/config", new MemoryRuntimeCache())
+  storage.cachesByName.set("webllm/wasm", new MemoryRuntimeCache())
+
+  const smallRecord = createQualityAppConfig(
+    webLlm.prebuiltAppConfig,
+    SMALL_QUALITY_MODEL,
+  ).model_list[0]
+  assert.ok(smallRecord)
+  const smallUrl = smallRecord.model.endsWith("/")
+    ? smallRecord.model
+    : smallRecord.model + "/"
+  modelCache.seed(smallUrl + "tensor-cache.json", new Response("cached-small"))
+
+  const selection = selectQualityModel({
+    storage: storageAvailabilityFromEstimate({
+      quota: 4_000_000_000,
+      usage: 378_614_439 + SMALL_QUALITY_MODEL.estimatedBytes,
+    }),
+    cache: { small: { payloadCached: true } },
+  })
+  const evaluator = new QualityEvaluator()
+  let createCalls = 0
+  const internals = evaluator as unknown as {
+    createEngine(networkAuthorized: boolean): Promise<{ unload(): Promise<void> }>
+    model: typeof LARGE_QUALITY_MODEL
+    modelSelection: typeof selection
+  }
+  internals.model = LARGE_QUALITY_MODEL
+  internals.modelSelection = selection
+  internals.createEngine = async () => {
+    createCalls += 1
+    return { unload: async () => undefined }
+  }
+
+  await withCacheStorage(storage.asCacheStorage(), async () => {
+    const preload = evaluator.preload(
+      {
+        supported: true,
+        cached: false,
+        downloadCached: false,
+        filesCached: 0,
+        filesTotal: 4,
+        estimatedBytes: LARGE_QUALITY_MODEL.estimatedBytes,
+        qualitySelection: selection,
+      },
+      true,
+    )
+    await modelCache.deleteStarted
+    const clearing = evaluator.clearCache()
+    modelCache.releaseDelete()
+    await assert.rejects(preload, { name: "AbortError" })
+    await clearing
+  })
+
+  assert.equal(createCalls, 0)
+  assert.equal(evaluator.getStatus().phase, "idle")
 })
 
 test("QualityEvaluator waits for fatal engine cleanup before reloading", async () => {
@@ -7179,7 +7581,6 @@ test("automatic evaluator does not wait for persistent storage and records later
     configurable: true,
     value: { type: "wifi", saveData: false },
   })
-
   try {
     let pendingPersistCalls = 0
     installStorage(() => {
@@ -7654,6 +8055,7 @@ test("automatic evaluator defaults to compact and uses quality only for explicit
     value: { type: "wifi", saveData: false },
   })
 
+  const restoreDownloadConsent = installDownloadConsent(true)
   try {
     const automatic = new AutomaticEvaluator(compact as never, quality as never)
     const request = {
@@ -7891,6 +8293,7 @@ test("automatic evaluator defaults to compact and uses quality only for explicit
     await clearing
     assert.equal(lifecycleQuality.evaluationAbortObserved, true)
   } finally {
+    restoreDownloadConsent()
     if (gpuDescriptor) {
       Object.defineProperty(navigatorObject, "gpu", gpuDescriptor)
     } else {
@@ -8015,6 +8418,11 @@ function foregroundWaitCache(cached: boolean): ModelCacheInfo {
 
 async function withForegroundQualityRuntime<T>(
   task: () => Promise<T>,
+  allowDownloads = true,
+  hooks: {
+    onConsent?: (detail: ModelDownloadConsentDetail) => void
+    onPersistenceCheck?: () => void
+  } = {},
 ): Promise<T> {
   const navigatorObject = globalThis.navigator
   const gpuDescriptor = Object.getOwnPropertyDescriptor(navigatorObject, "gpu")
@@ -8033,7 +8441,10 @@ async function withForegroundQualityRuntime<T>(
   Object.defineProperty(navigatorObject, "storage", {
     configurable: true,
     value: {
-      persisted: async () => true,
+      persisted: async () => {
+        hooks.onPersistenceCheck?.()
+        return true
+      },
       persist: async () => true,
     },
   })
@@ -8041,10 +8452,15 @@ async function withForegroundQualityRuntime<T>(
     configurable: true,
     value: { type: "wifi", saveData: false },
   })
+  const restoreDownloadConsent = installDownloadConsent(
+    allowDownloads,
+    hooks.onConsent,
+  )
 
   try {
     return await task()
   } finally {
+    restoreDownloadConsent()
     if (gpuDescriptor) {
       Object.defineProperty(navigatorObject, "gpu", gpuDescriptor)
     } else {
@@ -8062,6 +8478,139 @@ async function withForegroundQualityRuntime<T>(
     }
   }
 }
+
+test("automatic evaluator never downloads uncached quality after consent is denied", async () => {
+  const replacementSelection = selectQualityModel({
+    storage: storageAvailabilityFromEstimate({
+      quota: 4_000_000_000,
+      usage: 378_614_439 + SMALL_QUALITY_MODEL.estimatedBytes,
+    }),
+    cache: { small: { payloadCached: true } },
+  })
+  assert.equal(replacementSelection.reason, "large-fits-after-small-removal")
+  let consentCalls = 0
+  let persistenceChecks = 0
+  const order: string[] = []
+  await withForegroundQualityRuntime(
+    async () => {
+      const compact = new ForegroundWaitMockEvaluator(
+        "compact-consent-denied",
+        "compact",
+        foregroundWaitCache(true),
+      )
+      const quality = new ForegroundWaitMockEvaluator(
+        "quality-consent-denied",
+        "quality",
+        {
+          ...foregroundWaitCache(false),
+          estimatedBytes: LARGE_QUALITY_MODEL.estimatedBytes,
+          qualitySelection: replacementSelection,
+        },
+      )
+      const originalQualityCacheInfo = quality.getCacheInfo.bind(quality)
+      quality.getCacheInfo = async () => {
+        order.push('quality-cache-info')
+        return originalQualityCacheInfo()
+      }
+      const originalCompactEvaluate = compact.evaluate.bind(compact)
+      compact.evaluate = async (request) => {
+        order.push('compact-evaluate')
+        return originalCompactEvaluate(request)
+      }
+      const automatic = new AutomaticEvaluator(
+        compact as never,
+        quality as never,
+      )
+      const resultValue = await automatic.evaluate({
+        question: "Warum schwimmt Eis?",
+        answer: "Eis besitzt eine geringere Dichte als flüssiges Wasser.",
+        reference: "Eis besitzt eine geringere Dichte als flüssiges Wasser.",
+        assessmentEngine: "quality",
+      })
+
+      assert.equal(resultValue.model.id, "compact-consent-denied")
+      assert.equal(quality.preloadCalls, 0)
+      assert.equal(quality.evaluateCalls, 0)
+    },
+    false,
+    {
+      onConsent: (detail) => {
+        consentCalls += 1
+        order.push('consent')
+        assert.equal(detail.qualitySelection, replacementSelection)
+      },
+      onPersistenceCheck: () => {
+        persistenceChecks += 1
+      },
+    },
+  )
+  assert.equal(consentCalls, 1)
+  assert.equal(persistenceChecks, 0)
+  assert.deepEqual(order, [
+    'quality-cache-info',
+    'consent',
+    'compact-evaluate',
+  ])
+})
+
+test("automatic evaluator blocks quality before consent when storage is insufficient", async () => {
+  const insufficientSelection = selectQualityModel({
+    storage: storageAvailabilityFromEstimate({
+      quota:
+        SMALL_QUALITY_MODEL.estimatedBytes +
+        STORAGE_SAFETY_RESERVE_BYTES -
+        1,
+      usage: 0,
+    }),
+  })
+  assert.equal(insufficientSelection.sufficient, false)
+  let consentCalls = 0
+  let persistenceChecks = 0
+
+  await withForegroundQualityRuntime(
+    async () => {
+      const compact = new ForegroundWaitMockEvaluator(
+        "compact-insufficient-storage",
+        "compact",
+        foregroundWaitCache(true),
+      )
+      const quality = new ForegroundWaitMockEvaluator(
+        "quality-insufficient-storage",
+        "quality",
+        {
+          ...foregroundWaitCache(false),
+          estimatedBytes: SMALL_QUALITY_MODEL.estimatedBytes,
+          qualitySelection: insufficientSelection,
+        },
+      )
+      const automatic = new AutomaticEvaluator(
+        compact as never,
+        quality as never,
+      )
+      const resultValue = await automatic.evaluate({
+        question: "Warum schwimmt Eis?",
+        answer: "Eis besitzt eine geringere Dichte als flüssiges Wasser.",
+        reference: "Eis besitzt eine geringere Dichte als flüssiges Wasser.",
+        assessmentEngine: "quality",
+      })
+
+      assert.equal(resultValue.model.id, "compact-insufficient-storage")
+      assert.equal(quality.preloadCalls, 0)
+      assert.equal(quality.evaluateCalls, 0)
+    },
+    true,
+    {
+      onConsent: () => {
+        consentCalls += 1
+      },
+      onPersistenceCheck: () => {
+        persistenceChecks += 1
+      },
+    },
+  )
+  assert.equal(consentCalls, 0)
+  assert.equal(persistenceChecks, 0)
+})
 
 async function waitForQualityReady(
   automatic: AutomaticEvaluator,
@@ -8130,6 +8679,7 @@ test("automatic evaluator preserves loading status after an uncached quality wai
       globalThis,
       "dispatchEvent",
     )
+    const forwardEvent = globalThis.dispatchEvent.bind(globalThis)
     const emittedStatuses: RuntimeStatus[] = []
     Object.defineProperty(globalThis, "dispatchEvent", {
       configurable: true,
@@ -8137,7 +8687,7 @@ test("automatic evaluator preserves loading status after an uncached quality wai
         if (event.type === "lia-llm:status") {
           emittedStatuses.push((event as CustomEvent<RuntimeStatus>).detail)
         }
-        return true
+        return forwardEvent(event)
       },
     })
 
@@ -8605,6 +9155,7 @@ test("automatic evaluator retries a transient quality preload in the same sessio
     configurable: true,
     value: { type: "wifi", saveData: false },
   })
+  const restoreDownloadConsent = installDownloadConsent(true)
 
   try {
     const automatic = new AutomaticEvaluator(compact as never, quality as never)
@@ -8634,6 +9185,7 @@ test("automatic evaluator retries a transient quality preload in the same sessio
     assert.equal(automatic.getStatus().assessmentEngine, "quality")
     assert.equal(automatic.getStatus().phase, "ready")
   } finally {
+    restoreDownloadConsent()
     if (gpuDescriptor) {
       Object.defineProperty(navigatorObject, "gpu", gpuDescriptor)
     } else {
@@ -8781,6 +9333,7 @@ test("automatic evaluator rechecks an explicit quality request after the compact
     configurable: true,
     value: { type: "wifi", saveData: false },
   })
+  const restoreDownloadConsent = installDownloadConsent(true)
 
   const request: EvaluationRequest = {
     question: "Erkläre, warum Eis auf flüssigem Wasser schwimmt.",
@@ -8855,6 +9408,7 @@ test("automatic evaluator rechecks an explicit quality request after the compact
     releaseAbortedUpgrade()
     await new Promise((resolve) => setTimeout(resolve, 0))
   } finally {
+    restoreDownloadConsent()
     if (gpuDescriptor) {
       Object.defineProperty(navigatorObject, "gpu", gpuDescriptor)
     } else {
@@ -9209,7 +9763,7 @@ test("solution variant registry validates identifiers and indices", () => {
   clearSolutionVariant(" solution ", " run ")
 })
 
-test("the public version remains pinned exactly to 0.5.13", () => {
+test("the public version remains pinned exactly to 0.5.14", () => {
   const packageJson = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   ) as { version?: string }
@@ -9219,11 +9773,11 @@ test("the public version remains pinned exactly to 0.5.13", () => {
   const entry = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8")
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8")
 
-  assert.equal(packageJson.version, "0.5.13")
-  assert.equal(packageLock.version, "0.5.13")
-  assert.equal(packageLock.packages?.[""]?.version, "0.5.13")
-  assert.match(entry, /const VERSION = "0\.5\.13"/u)
-  assert.match(readme, /^version:\s+0\.5\.13$/mu)
+  assert.equal(packageJson.version, "0.5.14")
+  assert.equal(packageLock.version, "0.5.14")
+  assert.equal(packageLock.packages?.[""]?.version, "0.5.14")
+  assert.match(entry, /const VERSION = "0\.5\.14"/u)
+  assert.match(readme, /^version:\s+0\.5\.14$/mu)
   assert.match(readme, /^script:\s+\.\/dist\/index\.js$/mu)
   assert.doesNotMatch(
     readme,
@@ -9573,7 +10127,10 @@ test("browser adversarial calibration distinguishes the deterministic guard from
     /id: 'prompt-injection'[\s\S]{0,800}expectedExecution: 'deterministic-guard'/u,
   )
   assert.match(html, /assessmentEngine: 'quality'/u)
-  assert.match(html, /result\.model\.revision === QUALITY_MODEL_REVISION/u)
+  assert.match(
+    html,
+    /QUALITY_MODEL_REVISIONS\.get\(result\.model\.id\) ===\s*result\.model\.revision/u,
+  )
   assert.match(html, /result\.model\.task === 'deterministic-guard'/u)
   assert.match(html, /result\.diagnostic\?\.source === 'deterministic'/u)
   assert.match(
@@ -9912,6 +10469,175 @@ test("download policy asks before mobile or uncertain large downloads", () => {
   )
 })
 
+test("quality model selection uses the large model when the safe school quota permits it", async () => {
+  const quota = 4 * 1024 * 1024 * 1024
+  const usage = 378_614_439
+  const selected = await estimateAndSelectQualityModel({
+    source: {
+      estimate: async () => ({ quota, usage }),
+    },
+  })
+
+  assert.equal(selected.model, LARGE_QUALITY_MODEL)
+  assert.equal(selected.sufficient, true)
+  assert.equal(selected.reason, "large-fits")
+  assert.equal(selected.payloadCached, false)
+  assert.equal(selected.storage.kind, "known")
+  if (selected.storage.kind === "known") {
+    assert.equal(selected.storage.availableBytes, quota - usage)
+    assert.equal(selected.storage.safetyReserveBytes, STORAGE_SAFETY_RESERVE_BYTES)
+    assert.ok(selected.storage.usableBytes > LARGE_QUALITY_MODEL.estimatedBytes)
+  }
+})
+
+test("quality model selection chooses small between thresholds and large at its exact boundary", () => {
+  const mediumStorage = storageAvailabilityFromEstimate({
+    quota: 2_500_000_000,
+    usage: 500_000_000,
+  })
+  const medium = selectQualityModel({ storage: mediumStorage })
+  assert.equal(mediumStorage.kind, "known")
+  assert.equal(medium.model, SMALL_QUALITY_MODEL)
+  assert.equal(medium.sufficient, true)
+  assert.equal(medium.reason, "small-fits")
+
+  const exactLargeBoundary = storageAvailabilityFromEstimate({
+    quota: LARGE_QUALITY_MODEL.estimatedBytes + STORAGE_SAFETY_RESERVE_BYTES,
+    usage: 0,
+  })
+  const exact = selectQualityModel({ storage: exactLargeBoundary })
+  assert.equal(exactLargeBoundary.kind, "known")
+  if (exactLargeBoundary.kind === "known") {
+    assert.equal(
+      exactLargeBoundary.usableBytes,
+      LARGE_QUALITY_MODEL.estimatedBytes,
+    )
+  }
+  assert.equal(exact.model, LARGE_QUALITY_MODEL)
+  assert.equal(exact.sufficient, true)
+  assert.equal(exact.reason, "large-fits")
+})
+
+test("quality model selection reports insufficient storage below the small boundary", () => {
+  const storage = storageAvailabilityFromEstimate({
+    quota:
+      SMALL_QUALITY_MODEL.estimatedBytes + STORAGE_SAFETY_RESERVE_BYTES - 1,
+    usage: 0,
+  })
+  const selected = selectQualityModel({ storage })
+
+  assert.equal(storage.kind, "known")
+  assert.equal(selected.model, SMALL_QUALITY_MODEL)
+  assert.equal(selected.sufficient, false)
+  assert.equal(selected.reason, "insufficient-storage")
+})
+
+test("quality model selection falls back to small for invalid and unsupported estimates", async () => {
+  const invalidStorage = storageAvailabilityFromEstimate({
+    quota: 1_000,
+    usage: 1_001,
+  })
+  const invalid = selectQualityModel({ storage: invalidStorage })
+  assert.deepEqual(invalidStorage, { kind: "unknown", reason: "invalid" })
+  assert.equal(invalid.model, SMALL_QUALITY_MODEL)
+  assert.equal(invalid.sufficient, true)
+  assert.equal(invalid.reason, "estimate-unavailable")
+
+  const unsupported = await estimateAndSelectQualityModel({ source: null })
+  assert.deepEqual(unsupported.storage, {
+    kind: "unknown",
+    reason: "unsupported",
+  })
+  assert.equal(unsupported.model, SMALL_QUALITY_MODEL)
+  assert.equal(unsupported.sufficient, true)
+  assert.equal(unsupported.reason, "estimate-unavailable")
+})
+
+test("quality model selection keeps a cached large payload despite low free storage", () => {
+  const storage = storageAvailabilityFromEstimate({
+    quota: STORAGE_SAFETY_RESERVE_BYTES,
+    usage: STORAGE_SAFETY_RESERVE_BYTES,
+  })
+  const selected = selectQualityModel({
+    storage,
+    cache: { large: { payloadCached: true } },
+  })
+
+  assert.equal(selected.model, LARGE_QUALITY_MODEL)
+  assert.equal(selected.sufficient, true)
+  assert.equal(selected.reason, "large-payload-cached")
+  assert.equal(selected.payloadCached, true)
+})
+
+test("quality model selection prefers a complete small cache over an incomplete large cache", () => {
+  const selected = selectQualityModel({
+    storage: storageAvailabilityFromEstimate({
+      quota: STORAGE_SAFETY_RESERVE_BYTES,
+      usage: STORAGE_SAFETY_RESERVE_BYTES,
+    }),
+    cache: {
+      large: { payloadCached: true },
+      small: { cached: true, payloadCached: true },
+    },
+  })
+
+  assert.equal(selected.model, SMALL_QUALITY_MODEL)
+  assert.equal(selected.reason, "small-cached")
+  assert.equal(selected.payloadCached, true)
+})
+
+test("quality model selection replaces a cached small tier only when its released bytes make large fit", () => {
+  const schoolStorage = storageAvailabilityFromEstimate({
+    quota: 4_000_000_000,
+    usage: 378_614_439 + SMALL_QUALITY_MODEL.estimatedBytes,
+  })
+  const upgrade = selectQualityModel({
+    storage: schoolStorage,
+    cache: { small: { payloadCached: true } },
+  })
+  assert.equal(upgrade.model, LARGE_QUALITY_MODEL)
+  assert.equal(upgrade.reason, "large-fits-after-small-removal")
+  assert.equal(upgrade.replacedModel, SMALL_QUALITY_MODEL)
+
+  const oneByteShort = storageAvailabilityFromEstimate({
+    quota:
+      LARGE_QUALITY_MODEL.estimatedBytes -
+      SMALL_QUALITY_MODEL.estimatedBytes +
+      STORAGE_SAFETY_RESERVE_BYTES -
+      1,
+    usage: 0,
+  })
+  const retained = selectQualityModel({
+    storage: oneByteShort,
+    cache: { small: { payloadCached: true } },
+  })
+  assert.equal(retained.model, SMALL_QUALITY_MODEL)
+  assert.equal(retained.reason, "small-payload-cached")
+  assert.equal(retained.replacedModel, undefined)
+})
+
+test("storage estimate errors and timeouts stay bounded and select the small fallback", async () => {
+  const failed = await estimateStorageAvailability({
+    source: {
+      estimate: async () => {
+        throw new Error("storage estimate failed")
+      },
+    },
+  })
+  assert.deepEqual(failed, { kind: "unknown", reason: "error" })
+  assert.equal(selectQualityModel({ storage: failed }).model, SMALL_QUALITY_MODEL)
+
+  const timedOut = await estimateAndSelectQualityModel({
+    source: {
+      estimate: () => new Promise(() => undefined),
+    },
+    timeoutMs: 0,
+  })
+  assert.deepEqual(timedOut.storage, { kind: "unknown", reason: "timeout" })
+  assert.equal(timedOut.model, SMALL_QUALITY_MODEL)
+  assert.equal(timedOut.reason, "estimate-unavailable")
+})
+
 test("download policy reuses cache offline and auto-loads only safe cases", () => {
   const offline = {
     online: false,
@@ -9941,7 +10667,7 @@ test("download policy reuses cache offline and auto-loads only safe cases", () =
       cached: false,
       network: { ...offline, online: true, connectionType: "wifi" },
     }),
-    "auto",
+    "consent",
   )
   assert.equal(
     decideModelDownload({

@@ -433,6 +433,11 @@ export function recordDebugPolicy(
       downloadCached: cache.downloadCached ?? cache.cached,
       filesCached: cache.filesCached,
       filesTotal: cache.filesTotal,
+      qualityModelId: cache.qualitySelection?.model.id ?? null,
+      qualityModelTier: cache.qualitySelection?.model.tier ?? null,
+      storageSelectionReason: cache.qualitySelection?.reason ?? null,
+      storageSelectionSufficient:
+        cache.qualitySelection?.sufficient ?? null,
     },
   })
 }
@@ -679,6 +684,7 @@ function sanitizeCacheInfo(cache: ModelCacheInfo): ModelCacheInfo {
     estimatedBytes: Number.isFinite(cache.estimatedBytes)
       ? cache.estimatedBytes
       : 0,
+    qualitySelection: cache.qualitySelection,
     persistent: cache.persistent,
     engines,
     error: cache.error

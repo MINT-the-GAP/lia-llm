@@ -1,3 +1,5 @@
+import type { QualityModelSelectionDecision } from "./quality-model-selection.ts"
+
 export type AssessmentStatus = "passed" | "uncertain" | "failed"
 export type CriterionStatus = "met" | "uncertain" | "missed" | "contradicted"
 export type EvidenceKind = "entailment" | "contradiction"
@@ -8,6 +10,7 @@ export interface ModelDownloadConsentDetail {
   engine: AssessmentEngine
   modelName: string
   estimatedBytes: number
+  qualitySelection?: QualityModelSelectionDecision
   handled: boolean
   signal?: AbortSignal
   respond(allow: boolean): void
@@ -390,6 +393,8 @@ export interface ModelCacheInfo {
   filesCached: number
   filesTotal: number
   estimatedBytes: number
+  /** Storage-based Quality-model choice made before an uncached download. */
+  qualitySelection?: QualityModelSelectionDecision
   persistent?: boolean
   engines?: Partial<Record<AssessmentEngine, ModelCacheInfo>>
   error?: string

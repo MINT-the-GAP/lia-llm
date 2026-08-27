@@ -4,8 +4,10 @@
 <script src="../dist/index.js"></script>
 <pre id="output">waiting for diagnostic runner</pre>
 <script>
-const QUALITY_MODEL_ID = 'Qwen3-1.7B-q4f16_1-MLC'
-const QUALITY_MODEL_REVISION = '80b3abcec6c3b3f5355dc0cc99cc4fb578f192bc'
+const QUALITY_MODEL_REVISIONS = new Map([
+  ['Qwen3-1.7B-q4f16_1-MLC', '80b3abcec6c3b3f5355dc0cc99cc4fb578f192bc'],
+  ['Qwen3-4B-q4f16_1-MLC', 'a5c9fab855e3ccbdfed2e7e69683d75f30332161']
+])
 
 function serializeError(value, seen = new WeakSet()) {
   if (value === null || typeof value !== 'object') return String(value)
@@ -88,8 +90,8 @@ window.addEventListener('lia-llm:download-consent', event => {
       }
     )
     const exactQualityModel =
-      result.model.id === QUALITY_MODEL_ID &&
-      result.model.revision === QUALITY_MODEL_REVISION &&
+      QUALITY_MODEL_REVISIONS.get(result.model.id) ===
+        result.model.revision &&
       result.model.task === 'generative-assessment' &&
       result.model.device === 'webgpu'
     window.__liaCalibration.push({

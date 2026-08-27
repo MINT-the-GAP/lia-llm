@@ -19,11 +19,17 @@ import {
 
 import {
   createQualityAppConfig,
+  LARGE_QUALITY_MODEL,
   LEGACY_QUALITY_CACHE_TARGETS,
-  QUALITY_MODEL_ESTIMATED_BYTES,
-  QUALITY_MODEL_ID,
-  QUALITY_MODEL_REVISION,
+  QUALITY_MODELS,
+  SMALL_QUALITY_MODEL,
+  type QualityModelDefinition,
 } from "./quality-model-config.ts"
+import {
+  estimateAndSelectQualityModel,
+  estimateStorageAvailability,
+  type QualityModelSelectionDecision,
+} from "./quality-model-selection.ts"
 import {
   buildOrthographyCorrection,
   countWords,
@@ -2053,6 +2059,15 @@ class QualityArtifactHttpError extends Error {
   }
 }
 
+class QualityDownloadConsentRequiredError extends Error {
+  constructor() {
+    super(
+      "Der zuvor vollständig gecachte Quality-Stand ist nicht mehr verfügbar. Vor einem Download ist eine neue Bestätigung erforderlich.",
+    )
+    this.name = "QualityDownloadConsentRequiredError"
+  }
+}
+
 class QualityDownloadProgress {
   private readonly expected = new Map<string, number>()
   private readonly loaded = new Map<string, number>()
@@ -2117,11 +2132,14 @@ class QualityDownloadProgress {
 }
 
 function qualityModelRecord(appConfig: AppConfig): ModelRecord {
-  const record = appConfig.model_list.find(
-    (candidate) => candidate.model_id === QUALITY_MODEL_ID,
-  )
+  if (appConfig.model_list.length !== 1) {
+    throw new Error(
+      "Die WebLLM-Konfiguration muss genau ein Qualitätsmodell enthalten.",
+    )
+  }
+  const record = appConfig.model_list[0]
   if (!record) {
-    throw new Error(`WebLLM enth\u00e4lt keine Konfiguration f\u00fcr ${QUALITY_MODEL_ID}.`)
+    throw new Error("Die WebLLM-Konfiguration enthält kein Qualitätsmodell.")
   }
   return record
 }
@@ -2200,6 +2218,7 @@ async function matchingCachedArtifact(
 }
 
 function terminalQualityArtifactError(error: unknown): boolean {
+  if (error instanceof QualityDownloadConsentRequiredError) return true
   if (error instanceof QualityArtifactHttpError) return !error.retryable
   if (!(error instanceof Error)) return false
   return (
@@ -2696,7 +2715,32 @@ export function clearLegacyQualityCache(): Promise<number> {
   return deleteQualityCacheTargets(LEGACY_QUALITY_CACHE_TARGETS)
 }
 
+function qualityCacheTarget(
+  model: QualityModelDefinition,
+): QualityCacheTarget {
+  const record = createQualityAppConfig(
+    webLlm.prebuiltAppConfig,
+    model,
+  ).model_list[0]
+  if (!record) {
+    throw new Error(`WebLLM enthält keine Konfiguration für ${model.id}.`)
+  }
+  return { modelUrl: record.model, modelLibUrl: record.model_lib }
+}
+
+export function clearQualityModelCache(
+  model: QualityModelDefinition,
+): Promise<number> {
+  return deleteQualityCacheTargets([qualityCacheTarget(model)])
+}
+
 export class QualityEvaluator {
+  private model: QualityModelDefinition = SMALL_QUALITY_MODEL
+  private modelSelection: QualityModelSelectionDecision | null = null
+  private modelSelectionPromise: Promise<QualityModelSelectionDecision> | null =
+    null
+  private modelSelectionGeneration = 0
+  private loadedModel: QualityModelDefinition | null = null
   private phase: RuntimeStatus["phase"] = "idle"
   private loadSource: ModelLoadSource | undefined
   private lastError: string | undefined
@@ -2712,8 +2756,8 @@ export class QualityEvaluator {
       phase: this.phase,
       loadSource: this.loadSource,
       assessmentEngine: "quality",
-      modelId: QUALITY_MODEL_ID,
-      revision: QUALITY_MODEL_REVISION,
+      modelId: (this.loadedModel ?? this.model).id,
+      revision: (this.loadedModel ?? this.model).revision,
       device: "webgpu",
       dtype: "q4f16",
       error: this.lastError,
@@ -2729,6 +2773,7 @@ export class QualityEvaluator {
   private failEngine(error: unknown): void {
     const engine = this.engine
     this.engine = null
+    this.loadedModel = null
     this.loadPromise = null
     if (this.loadingEngine === engine) this.loadingEngine = null
     if (this.phase !== "error") {
@@ -2751,7 +2796,7 @@ export class QualityEvaluator {
     }
   }
 
-  private async createEngine(): Promise<MLCEngine> {
+  private async createEngine(networkAuthorized: boolean): Promise<MLCEngine> {
     if (typeof navigator === "undefined" || !navigator.gpu) {
       throw new Error(
         "Das stärkere Qualitätsmodell benötigt WebGPU; die automatische Auswertung bleibt auf dem Kompaktmodell.",
@@ -2762,12 +2807,15 @@ export class QualityEvaluator {
       throw new Error("Dieser Browser unterst\u00fctzt keine Modell-Downloads.")
     }
 
-    const diagnosticFetch = instrumentDebugFetch(
-      "quality",
-      globalThis.fetch.bind(globalThis),
-    )
+    const artifactFetch: typeof globalThis.fetch = networkAuthorized
+      ? globalThis.fetch.bind(globalThis)
+      : async () => {
+          throw new QualityDownloadConsentRequiredError()
+        }
+    const diagnosticFetch = instrumentDebugFetch("quality", artifactFetch)
     const downloadProgress = new QualityDownloadProgress()
     const session = new ResilientFetchSession(diagnosticFetch, {
+      ...(networkAuthorized ? {} : { retryDelaysMs: [0] }),
       onActivity: (activity) => {
         recordDebugActivity("quality", activity)
         downloadProgress.update(activity)
@@ -2788,7 +2836,8 @@ export class QualityEvaluator {
       __liaLlmArtifactFetch?: typeof fetch
     }
     const previousArtifactFetch = fetchGlobal.__liaLlmArtifactFetch
-    const appConfig = createQualityAppConfig(webLlm.prebuiltAppConfig)
+    const model = this.model
+    const appConfig = createQualityAppConfig(webLlm.prebuiltAppConfig, model)
     let engine: MLCEngine | null = null
     let stage = "artifact-prefetch"
 
@@ -2820,7 +2869,8 @@ export class QualityEvaluator {
         logLevel: "WARN",
       })
       this.loadingEngine = engine
-      await engine.reload(QUALITY_MODEL_ID)
+      await engine.reload(model.id)
+      this.loadedModel = model
       return engine
     } catch (error) {
       recordDebugFailure("quality", { error }, stage)
@@ -2839,13 +2889,91 @@ export class QualityEvaluator {
     cacheInfo?: ModelCacheInfo,
     diagnosticRunStarted = false,
   ): Promise<RuntimeStatus> {
+    const suppliedSelection = cacheInfo?.qualitySelection
+    if (
+      suppliedSelection &&
+      (suppliedSelection !== this.modelSelection ||
+        suppliedSelection.model.id !== this.model.id ||
+        suppliedSelection.model.revision !== this.model.revision)
+    ) {
+      throw new Error(
+        "Die Quality-Cacheprüfung ist veraltet; das Modell wird nicht geladen.",
+      )
+    }
     if (this.engine) return this.getStatus()
     if (!this.loadPromise) {
+      const preloadGeneration = this.modelSelectionGeneration
       if (!diagnosticRunStarted) beginDebugLoad("quality")
       this.loadPromise = (async () => {
         if (this.engineCleanupPromise) await this.engineCleanupPromise
-        const cache = cacheInfo ?? (await this.getCacheInfo())
+        if (preloadGeneration !== this.modelSelectionGeneration) {
+          throw abortError()
+        }
+        const cache = suppliedSelection
+          ? (cacheInfo as ModelCacheInfo)
+          : await this.getCacheInfo()
+        const selection = cache.qualitySelection
+        if (!selection || selection !== this.modelSelection) {
+          throw new Error(
+            "Die Quality-Cacheprüfung ist veraltet; das Modell wird nicht geladen.",
+          )
+        }
+        if (!selection.sufficient) {
+          throw new Error(
+            "Der verfügbare Browser-Speicher reicht für kein Quality-Modell.",
+          )
+        }
+        const assertPreloadCurrent = (): void => {
+          if (
+            preloadGeneration !== this.modelSelectionGeneration ||
+            selection !== this.modelSelection
+          ) {
+            throw abortError()
+          }
+        }
+        assertPreloadCurrent()
         if (!cache.cached) {
+          const replacedModel =
+            cache.qualitySelection?.replacedModel ??
+            this.modelSelection?.replacedModel
+          if (replacedModel && replacedModel.id !== this.model.id) {
+            try {
+              const filesDeleted = await clearQualityModelCache(replacedModel)
+              recordDebugCache(
+                "quality",
+                "quality-tier-replacement",
+                "deleted",
+                {
+                  details: {
+                    filesDeleted,
+                    replacedModelId: replacedModel.id,
+                    selectedModelId: this.model.id,
+                  },
+                },
+              )
+            } catch (error) {
+              recordDebugCache(
+                "quality",
+                "quality-tier-replacement",
+                "failed",
+                { error },
+              )
+              throw new Error(
+                "Der Speicher des kleineren Quality-Modells konnte nicht für das große Modell freigegeben werden.",
+              )
+            }
+            assertPreloadCurrent()
+            const refreshedStorage = await estimateStorageAvailability()
+            assertPreloadCurrent()
+            if (
+              refreshedStorage.kind === "known" &&
+              this.model.estimatedBytes > refreshedStorage.usableBytes
+            ) {
+              throw new Error(
+                "Auch nach dem Entfernen des kleineren Quality-Modells reicht der verfügbare Browser-Speicher nicht für das große Modell.",
+              )
+            }
+          }
           try {
             const filesDeleted = await clearLegacyQualityCache()
             if (filesDeleted > 0) {
@@ -2864,10 +2992,11 @@ export class QualityEvaluator {
               { error },
             )
           }
+          assertPreloadCurrent()
         }
         this.loadSource = cache.cached ? "cache" : "network"
         this.setPhase("loading")
-        return this.createEngine()
+        return this.createEngine(!cache.cached)
       })()
         .then((engine) => {
           this.engine = engine
@@ -4173,8 +4302,8 @@ export class QualityEvaluator {
         languageAnalysis,
         durationMs: Number((now() - started).toFixed(1)),
         model: {
-          id: QUALITY_MODEL_ID,
-          revision: QUALITY_MODEL_REVISION,
+          id: (this.loadedModel ?? this.model).id,
+          revision: (this.loadedModel ?? this.model).revision,
           device: "webgpu",
           dtype: "q4f16",
           task: "generative-assessment",
@@ -4200,7 +4329,9 @@ export class QualityEvaluator {
     }
   }
 
-  async getCacheInfo(): Promise<ModelCacheInfo> {
+  private async probeModelCache(
+    model: QualityModelDefinition,
+  ): Promise<ModelCacheInfo> {
     if (typeof caches === "undefined") {
       recordDebugCache("quality", "model-cache-probe", "unsupported")
       return {
@@ -4209,18 +4340,18 @@ export class QualityEvaluator {
         downloadCached: false,
         filesCached: 0,
         filesTotal: 4,
-        estimatedBytes: QUALITY_MODEL_ESTIMATED_BYTES,
+        estimatedBytes: model.estimatedBytes,
       }
     }
 
     let weightsCached = false
     try {
-      const appConfig = createQualityAppConfig(webLlm.prebuiltAppConfig)
+      const appConfig = createQualityAppConfig(webLlm.prebuiltAppConfig, model)
       const modelRecord = appConfig.model_list.find(
-        (candidate) => candidate.model_id === QUALITY_MODEL_ID,
+        (candidate) => candidate.model_id === model.id,
       )
       if (!modelRecord) {
-        throw new Error(`WebLLM enthält keine Konfiguration für ${QUALITY_MODEL_ID}.`)
+        throw new Error(`WebLLM enthält keine Konfiguration für ${model.id}.`)
       }
 
       const modelUrl = modelRecord.model.endsWith("/")
@@ -4282,7 +4413,7 @@ export class QualityEvaluator {
         downloadCached: weightsCached,
         filesCached,
         filesTotal: cacheParts.length,
-        estimatedBytes: QUALITY_MODEL_ESTIMATED_BYTES,
+        estimatedBytes: model.estimatedBytes,
       }
     } catch (error) {
       recordDebugCache("quality", "model-cache-probe", "error", { error })
@@ -4292,13 +4423,63 @@ export class QualityEvaluator {
         downloadCached: weightsCached,
         filesCached: 0,
         filesTotal: 4,
-        estimatedBytes: QUALITY_MODEL_ESTIMATED_BYTES,
+        estimatedBytes: model.estimatedBytes,
         error: errorMessage(error),
       }
     }
   }
 
+  private selectModel(): Promise<QualityModelSelectionDecision> {
+    if (this.modelSelection) return Promise.resolve(this.modelSelection)
+    if (this.modelSelectionPromise) return this.modelSelectionPromise
+
+    const generation = this.modelSelectionGeneration
+    const selection = Promise.all([
+      this.probeModelCache(SMALL_QUALITY_MODEL),
+      this.probeModelCache(LARGE_QUALITY_MODEL),
+    ]).then(async ([small, large]) => {
+      const result = await estimateAndSelectQualityModel({
+        cache: {
+          small: {
+            cached: small.cached,
+            payloadCached: small.downloadCached ?? small.cached,
+          },
+          large: {
+            cached: large.cached,
+            payloadCached: large.downloadCached ?? large.cached,
+          },
+        },
+      })
+      if (
+        generation === this.modelSelectionGeneration &&
+        !this.engine
+      ) {
+        this.model = result.model
+        this.modelSelection = result
+      }
+      return result
+    })
+
+    let tracked!: Promise<QualityModelSelectionDecision>
+    tracked = selection.finally(() => {
+      if (this.modelSelectionPromise === tracked) {
+        this.modelSelectionPromise = null
+      }
+    })
+    this.modelSelectionPromise = tracked
+    return tracked
+  }
+
+  async getCacheInfo(): Promise<ModelCacheInfo> {
+    const selection = await this.selectModel()
+    const cache = await this.probeModelCache(selection.model)
+    return { ...cache, qualitySelection: selection }
+  }
+
   async clearCache(): Promise<number> {
+    this.modelSelectionGeneration += 1
+    this.modelSelection = null
+    this.modelSelectionPromise = null
     this.fetchSession?.abort()
     const loadingEngine = this.loadingEngine
     const loadingUnload = loadingEngine
@@ -4319,30 +4500,36 @@ export class QualityEvaluator {
 
         const engine = this.engine
         this.engine = null
+        this.loadedModel = null
         this.loadingEngine = null
         this.loadPromise = null
         if (engine) await engine.unload().catch(() => undefined)
 
         if (typeof caches === "undefined") return 0
 
-        const appConfig = createQualityAppConfig(webLlm.prebuiltAppConfig)
-        const modelRecord = appConfig.model_list.find(
-          (candidate) => candidate.model_id === QUALITY_MODEL_ID,
-        )
-        if (!modelRecord) {
-          throw new Error(
-            `WebLLM enthält keine Konfiguration für ${QUALITY_MODEL_ID}.`,
-          )
-        }
-
-        const modelUrl = modelRecord.model.endsWith("/")
-          ? modelRecord.model
-          : `${modelRecord.model}/`
+        const activeTargets = QUALITY_MODELS.map((model) => {
+          const modelRecord = createQualityAppConfig(
+            webLlm.prebuiltAppConfig,
+            model,
+          ).model_list[0]
+          if (!modelRecord) {
+            throw new Error(
+              `WebLLM enthält keine Konfiguration für ${model.id}.`,
+            )
+          }
+          return {
+            modelUrl: modelRecord.model,
+            modelLibUrl: modelRecord.model_lib,
+          }
+        })
         return deleteQualityCacheTargets([
-          { modelUrl, modelLibUrl: modelRecord.model_lib },
+          ...activeTargets,
           ...LEGACY_QUALITY_CACHE_TARGETS,
         ])
       } finally {
+        this.model = SMALL_QUALITY_MODEL
+        this.modelSelection = null
+        this.modelSelectionPromise = null
         this.loadSource = undefined
         this.setPhase("idle")
       }

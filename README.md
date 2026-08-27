@@ -1,6 +1,6 @@
 <!--
 author:      MINT-the-GAP, Martin Lommatzsch
-version:     0.5.13
+version:     0.5.14
 language:    de
 narrator:    Deutsch Female
 comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
@@ -9,8 +9,9 @@ script:      ./dist/index.js
 
 attribute:   [WebLLM](https://webllm.mlc.ai/docs/) by MLC is licensed under
              [Apache-2.0](https://github.com/mlc-ai/web-llm/blob/main/LICENSE), and
-             [Qwen3-1.7B](https://huggingface.co/mlc-ai/Qwen3-1.7B-q4f16_1-MLC) by the Qwen Team
-             is licensed under [Apache-2.0](https://huggingface.co/Qwen/Qwen3-1.7B/blob/main/LICENSE).
+             [Qwen3-1.7B](https://huggingface.co/mlc-ai/Qwen3-1.7B-q4f16_1-MLC) and
+             [Qwen3-4B](https://huggingface.co/mlc-ai/Qwen3-4B-q4f16_1-MLC) by the Qwen Team
+             are licensed under [Apache-2.0](https://huggingface.co/Qwen/Qwen3-4B/blob/main/LICENSE).
              [Transformers.js](https://huggingface.co/docs/transformers.js/) by Hugging Face is
              licensed under [Apache-2.0](https://github.com/huggingface/transformers.js/blob/main/LICENSE),
              and [multilingual mDeBERTa-v3 NLI](https://huggingface.co/Xenova/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7)
@@ -110,8 +111,8 @@ Promise.resolve()
     if (!window.LiaLLM) {
       throw new Error("lia-llm konnte nicht geladen werden.")
     }
-    if (window.LiaLLM.version !== "0.5.13") {
-      throw new Error(`lia-llm 0.5.13 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
+    if (window.LiaLLM.version !== "0.5.14") {
+      throw new Error(`lia-llm 0.5.14 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
     }
 
     const options = window.LiaLLM.parseMacroOptions(optionSource)
@@ -643,20 +644,22 @@ Schwelle liegen. Das stärkere Quality-Modell ist eine optionale Erweiterung:
    nirgends gerendertes Makro lädt dagegen keine Modelle.
 2. Normale Aufrufe ohne Engine-Angabe und ohne erweiterte Quality-Funktion werden ausschließlich
    mit Compact geprüft. Sie laden Qwen nicht und benötigen kein WebGPU.
-3. `assessmentengine=quality` wählt Qwen3-1.7B ausdrücklich. Zur Rückwärtskompatibilität wählen
-   Operatorprüfung, Sprachanalyse und ein ausdrücklich aktivierter Thinking-Lauf Quality auch ohne
-   Engine-Angabe.
-4. Ist Qwen noch nicht lokal vorhanden, wird zunächst ein Kompaktbefund berechnet. Nach den Regeln
-   für Netzverbindung und Zustimmung startet anschließend die Quality-Vorbereitung; innerhalb der
-   dokumentierten Wartefrist kann dieselbe, zu Beginn erfasste Antwort noch mit Qwen im
-   Gesamtzusammenhang geprüft werden.
-5. Liefert Qwen kein gültiges strukturiertes Ergebnis, ist WebGPU nicht verfügbar, geht das
-   GPU-Gerät verloren oder wurde ein nötiger Download abgelehnt, bleibt der vorgesehene
-   Kompakt- beziehungsweise `uncertain`-Fallback erhalten.
+3. `assessmentengine=quality` wählt den Quality-Pfad ausdrücklich. Zur Rückwärtskompatibilität
+   wählen Operatorprüfung, Sprachanalyse und ein ausdrücklich aktivierter Thinking-Lauf Quality
+   auch ohne Engine-Angabe. Das konkrete Qwen-Modell wird vor einem nötigen Download anhand des
+   verfügbaren Origin-Speichers gewählt.
+4. Ist das gewählte Qwen-Modell noch nicht vollständig lokal vorhanden, wird zunächst ein
+   Kompaktbefund berechnet. Der Quality-Download startet erst nach ausdrücklicher Zustimmung;
+   innerhalb der dokumentierten Wartefrist kann dieselbe, zu Beginn erfasste Antwort noch mit Qwen
+   im Gesamtzusammenhang geprüft werden.
+5. Reicht ein bekanntes Speicherbudget nicht einmal für die kleinere Quality-Stufe, startet kein
+   Quality-Download. Bei Ablehnung, ungültigem Qwen-Ergebnis, fehlendem WebGPU oder Geräteverlust
+   bleibt der vorgesehene Kompakt- beziehungsweise `uncertain`-Fallback erhalten.
 
 | Stufe | Modell und Laufzeit | Erster Download | Einordnung |
 | --- | --- | ---: | --- |
-| Qualität (Opt-in) | Qwen3-1.7B über WebLLM | ca. 984 MB | stärkere generative Gesamtprüfung; benötigt WebGPU und ist ohne gerätespezifischen Test nicht für Schulrechner freigegeben |
+| Qualität (bevorzugt, Opt-in) | Qwen3-4B über WebLLM | ca. 2,28 GB (2,12 GiB) | wird bei ausreichendem Origin-Speicher gewählt; benötigt WebGPU und einen Realgerätetest |
+| Qualität (kleiner, Opt-in) | Qwen3-1.7B über WebLLM | ca. 984 MB | konservative Auswahl bei kleinerem oder unbekanntem Speicherbudget; benötigt WebGPU |
 | sicherer Standard/Fallback | mDeBERTa-v3 NLI über Transformers.js | ca. 379 MB inklusive ONNX-Laufzeit | normale Engine ohne Quality-Opt-in; läuft bei Bedarf mit WASM |
 
 Beim standardmäßigen WASM-Start laufen ONNX-Sitzung und Inferenz des
@@ -664,12 +667,35 @@ Kompaktmodells in einem Worker. Dadurch blockiert die automatische Vorbereitung 
 LiaScript-UI-Thread. Einbettende Seiten müssen dafür die unter
 `test/BROWSER-HARDENING.md` dokumentierte `worker-src`-/Blob-CSP erlauben.
 
-Die konfigurierte Downloadschätzung beträgt 984.000.000 B für das Qualitätsmodell und
-378.614.439 B für Kompaktmodell samt ONNX-Laufzeit, zusammen also 1.362.614.439 B
-(ca. 1.362,6 MB beziehungsweise 1.299,5 MiB). Die im Schulrechner-Log gemeldeten 2.048 MiB
-freier Origin-Speicher liegen über dieser Schätzung. Die tatsächliche Origin-Nutzung kann durch
-Browser-Metadaten und weitere Website-Daten abweichen. Ausreichender Browser-Speicher sagt zudem
-nichts über den getrennten GPU-Speicher und die Stabilität des WebGPU-Geräts aus.
+Vor jedem noch nicht vollständig gecachten Quality-Download wertet das Template, soweit verfügbar,
+`navigator.storage.estimate()` aus. Bei gültiger `quota` und `usage` gilt als frei
+`quota - usage`; zusätzlich bleibt eine Reserve von `max(512 MiB, 10 % der quota)` unangetastet.
+Qwen3-4B wird gewählt, wenn 2.280.000.000 B plus Reserve frei sind, andernfalls Qwen3-1.7B, wenn
+984.000.000 B plus Reserve frei sind. Reicht ein bekanntes Budget auch dafür nicht, startet kein
+Quality-Download. Fehlt die Storage-API, schlägt sie fehl oder liefert sie keine belastbaren Werte,
+wird konservativ Qwen3-1.7B gewählt. Ein vollständig gecachtes 4B-Modell kann unabhängig von der
+aktuellen Restquote wiederverwendet werden. Ist bereits 1.7B gecacht und passt 4B nur nach dessen
+Entfernung, rechnet die Auswahl diesen Platz als freigebbar ein; der Dialog weist auf den Austausch
+hin und löscht 1.7B erst nach der ausdrücklichen Bestätigung. Danach wird die Quote erneut geprüft;
+meldet der Browser weiterhin zu wenig Platz, beginnt der 4B-Download nicht.
+
+Bei einer tatsächlich für diese Herkunft gemeldeten Quote von 4.000.000.000 B und einem bereits
+belegten Kompakt-Cache von etwa 378.614.439 B besteht die 4B-Stufe diese Prüfung einschließlich
+Reserve. Erhöht eine Schulrichtlinie dagegen nur den allgemeinen HTTP-Diskcache, ohne die von
+`navigator.storage.estimate()` gemeldete Origin-Quote zu erhöhen, bleibt für die Auswahl der
+niedrigere Browserwert maßgeblich. Alle Werte sind Schätzungen; ein späteres
+`QuotaExceededError` kann der Browser trotzdem melden.
+
+Die Prüfung betrifft ausschließlich den Browsercache der aktuellen Herkunft. Sie misst weder
+Arbeitsspeicher noch freien GPU-Speicher und garantiert keine stabile WebGPU-Ausführung. Die
+WebLLM-Konfiguration nennt für Qwen3-4B rund 3.431,59 MB benötigten VRAM. Deshalb muss die 4B-Stufe
+im tatsächlich eingesetzten Browser auf dem konkreten Schulgerät geprüft werden; ein passender
+Cache allein ist keine Freigabe.
+
+Auch eine vermeintlich vollständig gecachte Quality-Stufe darf keine unbemerkte Netzwerkreparatur
+starten. Fehlt zwischen Cacheprüfung und Aktivierung ein Artefakt oder ist es beschädigt, bleibt das
+Netzwerk gesperrt; der Lauf fällt auf Compact zurück und ein späterer Versuch fordert vor dem
+Download erneut eine Bestätigung an.
 
 Auf dem lokal getesteten Edge-151-System mit einer RTX 2070 SUPER verlor Qwen3-1.7B in vier von
 vier warmen Minimalläufen das GPU-Gerät (`DXGI_ERROR_DEVICE_HUNG`). Das Modell ist deshalb
@@ -678,9 +704,10 @@ zwischenzeitlich geprüfte 0.6B-Variante blieb dort technisch stabil, bestand de
 Schutzregeln durchgeführten semantischen Stresstest aber nur in 6 von 12 Fällen. Sie wird daher
 nicht als Bewertungsmodell ausgeliefert.
 
-Seit Version 0.5.7 entfernt das Template vor einem neuen Quality-Download
-ausschließlich die exakt gepinnten ausgehenden Qwen3-0.6B- und alten Qwen3-4B-Artefakte. Das
-aktuelle Qwen3-1.7B sowie fremde WebLLM-Cacheeinträge bleiben erhalten.
+Seit Version 0.5.14 entfernt das Template vor einem neuen Quality-Download die exakt gepinnten
+ausgehenden Qwen3-0.6B-Artefakte. Ein vorhandenes Qwen3-1.7B wird zusätzlich nur dann entfernt,
+wenn nach Zustimmung auf Qwen3-4B umgestellt und sein Platz dafür benötigt wird. Ansonsten bleiben
+die aktiven Quality-Artefakte und fremde WebLLM-Cacheeinträge erhalten.
 
 Es gibt zwei bewusst getrennte Anzeigen:
 
@@ -708,13 +735,12 @@ die dadurch gestartete globale Quality-Vorbereitung läuft jedoch sichtbar bis z
 Cache weiter. Weder das Ende der Quiz-Auswertung noch deren `stop`-Signal bricht diesen
 Hintergrunddownload ab.
 
-Vor dem ersten, noch nicht gecachten Download wird bei erkanntem Mobilfunk oder Datensparmodus
-gefragt. Weil nicht jeder Browser die Verbindungsart meldet, fragt das Template beim Download des
-Qualitätsmodells auch
-bei unbekannter Verbindung; auf mobilen Geräten gilt dies vorsichtshalber ebenfalls für das
-kompakte Modell. Sobald die vollständigen Modellartefakte im Cache liegen, erscheint die
-Downloadfrage nicht erneut; lediglich der kleine Arbeitsbalken des aktuell geprüften Quiz bleibt
-während Vorbereitung und Auswertung sichtbar.
+Vor jedem noch nicht vollständig gecachten Quality-Download wird unabhängig von Verbindungsart und
+Gerät ausdrücklich gefragt. Das Dialogfeld nennt das ausgewählte Modell, die geschätzte
+Downloadgröße und – sofern verfügbar – freien Origin-Speicher sowie Sicherheitsreserve. Erst die
+Bestätigung startet den Transfer; eine Ablehnung führt zum vorgesehenen Fallback. Liegen die
+vollständigen Artefakte bereits im Cache, erscheint die Downloadfrage nicht erneut. Für das
+Kompaktmodell gelten weiterhin die netz- und geräteabhängigen Regeln.
 
 Modelldateien liegen in der Browser Cache API. Nur beim ersten ungecacheten Download bittet das
 Template den Browser zusätzlich um persistenten Website-Speicher; ein Cache-Treffer löst auch diese
