@@ -45,7 +45,11 @@ import {
   type GermanWordToken,
 } from "./german-spellcheck.ts"
 import { ResilientFetchSession } from "./resilient-fetch.ts"
-import { aggregateCriteria, normalizeRequest } from "./scoring.ts"
+import {
+  aggregateCriteria,
+  normalizeRequest,
+  normalizeText,
+} from "./scoring.ts"
 import {
   MIN_MAX_THINKING_TOKENS,
   normalizeAdaptiveThinkingLimits,
@@ -141,6 +145,8 @@ const QUALITY_NOTICE =
   "Lokaler LLM-Selbstcheck: Das Ergebnis unterstützt das Lernen, ersetzt aber keine fachliche Bewertung durch eine Lehrkraft."
 const DETERMINISTIC_GUARD_NOTICE =
   "Lokaler Sicherheitscheck: Die Antwort enthält eine ausdrückliche Manipulationsanweisung und wurde nicht an das Bewertungsmodell übergeben."
+const DETERMINISTIC_MATCH_NOTICE =
+  "Deterministischer Inhaltsabgleich: Die Antwort entspricht einer hinterlegten Musterlösung."
 
 const QUALITY_FEEDBACK_CODES = [
   "none",
@@ -1922,6 +1928,11 @@ export function finalizeQualityAssessment(
 function createDeterministicAssessmentResult(
   normalized: ReturnType<typeof normalizeRequest>,
   output: QualityJudgeOutput,
+  model: {
+    id: string
+    task: "deterministic-match" | "deterministic-guard"
+    notice: string
+  },
 ): EvaluationResult {
   const criteria = normalized.criteria.map((criterion) =>
     criterionResult(
@@ -1934,8 +1945,6 @@ function createDeterministicAssessmentResult(
   const aggregated = aggregateCriteria(criteria, normalized.passThreshold)
   return {
     ...aggregated,
-    status: "failed",
-    passed: false,
     mode: normalized.mode,
     criteria,
     selectedReferenceIndex: criteria[0]?.selectedReferenceIndex ?? 0,
@@ -1953,13 +1962,13 @@ function createDeterministicAssessmentResult(
       : undefined,
     durationMs: 0,
     model: {
-      id: "deterministic-assessment-guard",
+      id: model.id,
       revision: "1",
       device: "none",
       dtype: "none",
-      task: "deterministic-guard",
+      task: model.task,
     },
-    notice: DETERMINISTIC_GUARD_NOTICE,
+    notice: model.notice,
   }
 }
 
@@ -1973,7 +1982,46 @@ export function createAssessmentManipulationResult(
       answer: normalized.answer,
     })
   ) return undefined
-  return createDeterministicAssessmentResult(normalized, MANIPULATION_OUTPUT)
+  const result = createDeterministicAssessmentResult(
+    normalized,
+    MANIPULATION_OUTPUT,
+    {
+      id: "deterministic-assessment-guard",
+      task: "deterministic-guard",
+      notice: DETERMINISTIC_GUARD_NOTICE,
+    },
+  )
+  return {
+    ...result,
+    status: "failed",
+    passed: false,
+  }
+}
+
+export function createExactReferenceMatchResult(
+  normalized: ReturnType<typeof normalizeRequest>,
+): EvaluationResult | undefined {
+  const answer = normalizeText(normalized.answer).toLocaleLowerCase("de-DE")
+  const selectedReferenceIndex = normalized.references.findIndex(
+    (reference) =>
+      normalizeText(reference).toLocaleLowerCase("de-DE") === answer,
+  )
+  if (selectedReferenceIndex < 0) return undefined
+
+  return createDeterministicAssessmentResult(
+    normalized,
+    {
+      decision: "pass",
+      confidence: 1,
+      feedbackCode: "none",
+      selectedReferenceIndex,
+    },
+    {
+      id: "deterministic-reference-match",
+      task: "deterministic-match",
+      notice: DETERMINISTIC_MATCH_NOTICE,
+    },
+  )
 }
 
 interface QualityWeightArtifact {

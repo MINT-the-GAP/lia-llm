@@ -20,7 +20,11 @@ import { parseMacroOptions } from "./macro-options.ts"
 import { registerQuizTextareas } from "./quiz-textarea.ts"
 import { registerQuizPresenceElement } from "./quiz-presence-element.ts"
 import { QualityEvaluator } from "./quality-evaluator.ts"
-import { parseCriteria, parseReferenceVariants } from "./scoring.ts"
+import {
+  parseCriteria,
+  parseCriteriaBlock,
+  parseReferenceVariants,
+} from "./scoring.ts"
 import {
   clearSolutionVariant,
   getSolutionVariant,
@@ -31,7 +35,7 @@ import {
 } from "./solution-element.ts"
 import type { LiaLLMApi } from "./types.ts"
 
-const VERSION = "0.5.14"
+const VERSION = "0.6.0"
 
 interface LiaLLMGlobal {
   LiaLLM?: LiaLLMApi
@@ -63,6 +67,7 @@ if (!api) {
       ),
     clearCache: () => evaluator.clearCache(),
     parseCriteria,
+    parseCriteriaBlock,
     parseReferenceVariants,
     parseMacroOptions,
     formatResult,
@@ -100,6 +105,7 @@ export {
   formatResult,
   parseMacroOptions,
   parseCriteria,
+  parseCriteriaBlock,
   parseReferenceVariants,
   QualityEvaluator,
   SemanticEvaluator,

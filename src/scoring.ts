@@ -8,6 +8,7 @@ import type {
   EvaluationRequest,
   NliEvidence,
   NormalizedEvaluationRequest,
+  ParsedCriteriaBlock,
 } from "./types.ts"
 import { EvaluationInputError } from "./learner-feedback.ts"
 import {
@@ -74,6 +75,10 @@ export function normalizeAnswerText(value: string): string {
 
 const REFERENCE_VARIANT_SEPARATOR =
   /^[\t ]*<!--[\t ]*lia-llm(?::alternative|-(?:variant|variante))[\t ]*-->[\t ]*$/gimu
+const CRITERION_BLOCK_SEPARATOR =
+  /^[\t ]*<!--[\t ]*lia-llm:criterion[\t ]*-->[\t ]*$/gimu
+const CRITERIA_SOLUTION_SEPARATOR =
+  /^[\t ]*<!--[\t ]*lia-llm:solution[\t ]*-->[\t ]*$/gimu
 
 function trimReferenceBoundaryLines(value: string): string {
   return value
@@ -116,6 +121,78 @@ export function parseReferenceVariants(source: string): string[] {
     )
   }
   return variants
+}
+
+export function parseCriteriaBlock(
+  source: string,
+): ParsedCriteriaBlock | undefined {
+  if (typeof source !== "string") {
+    throw new Error("Der Erwartungshorizont muss Text sein.")
+  }
+  const normalizedSource = source
+    .normalize("NFC")
+    .replace(/\r\n?|[\u2028\u2029]/gu, "\n")
+  const solutionParts = normalizedSource.split(CRITERIA_SOLUTION_SEPARATOR)
+  if (solutionParts.length > 2) {
+    throw new Error(
+      "Der Musterlösungsmarker <!-- lia-llm:solution --> darf höchstens einmal vorkommen.",
+    )
+  }
+
+  const criteriaSource = solutionParts[0]!
+  const hasAuthoredSolution = solutionParts.length === 2
+  const authoredSolution = hasAuthoredSolution
+    ? trimReferenceBoundaryLines(solutionParts[1]!)
+    : undefined
+  const parts = criteriaSource.split(CRITERION_BLOCK_SEPARATOR)
+  if (parts.length === 1) {
+    if (hasAuthoredSolution) {
+      throw new Error(
+        "Der Musterlösungsmarker darf nur nach mindestens einem Kriterienmarker stehen.",
+      )
+    }
+    return undefined
+  }
+
+  if (parts[0]!.trim()) {
+    throw new Error(
+      "Der erste Kriterienmarker muss die erste nichtleere Zeile des Erwartungshorizonts sein.",
+    )
+  }
+  if (
+    hasAuthoredSolution &&
+    solutionParts[1]!.split(CRITERION_BLOCK_SEPARATOR).length > 1
+  ) {
+    throw new Error(
+      "Alle Kriterien müssen vor dem Musterlösungsmarker stehen.",
+    )
+  }
+  if (normalizedSource.split(REFERENCE_VARIANT_SEPARATOR).length > 1) {
+    throw new Error(
+      "Atomare Kriterien können nicht mit vollständigen Musterlösungsalternativen kombiniert werden.",
+    )
+  }
+  if (hasAuthoredSolution && !normalizeText(authoredSolution!)) {
+    throw new Error("Die Musterlösung nach dem Musterlösungsmarker ist leer.")
+  }
+
+  const statements = parts.slice(1).map(trimReferenceBoundaryLines)
+  const emptyIndex = statements.findIndex((statement) => !normalizeText(statement))
+  if (emptyIndex >= 0) {
+    throw new Error(`Kriterium ${emptyIndex + 1} ist leer.`)
+  }
+  if (statements.length > MAX_CRITERIA) {
+    throw new Error(`Es sind höchstens ${MAX_CRITERIA} Kriterien erlaubt.`)
+  }
+  const comparableStatements = statements.map(normalizeText)
+  if (new Set(comparableStatements).size !== comparableStatements.length) {
+    throw new Error("Atomare Kriterien müssen sich inhaltlich unterscheiden.")
+  }
+
+  return {
+    reference: authoredSolution ?? statements.join("\n\n"),
+    criteria: statements.map((text) => ({ text, required: true })),
+  }
 }
 
 const REFERENCE_STATUS_RANK: Record<CriterionStatus, number> = {
@@ -430,50 +507,81 @@ function splitLongChunk(value: string): string[] {
   return chunks
 }
 
-function limitOrderedChunks(chunks: readonly string[]): string[] {
+function limitOrderedChunks(
+  chunks: readonly string[],
+  maxChunks = MAX_CHUNKS,
+): string[] {
+  if (maxChunks <= 0) return []
   const unique = [...new Set(chunks.filter(Boolean))]
-  if (unique.length <= MAX_CHUNKS) return unique
+  if (unique.length <= maxChunks) return unique
+  if (maxChunks === 1) return [unique[0]!]
 
-  return Array.from({ length: MAX_CHUNKS }, (_, index) =>
+  return Array.from({ length: maxChunks }, (_, index) =>
     unique[
-      Math.round((index * (unique.length - 1)) / (MAX_CHUNKS - 1))
+      Math.round((index * (unique.length - 1)) / (maxChunks - 1))
     ]!,
   )
 }
 
-export function chunkAnswer(answer: string): string[] {
-  const normalized = normalizeAnswerText(answer)
+function criterionEvidenceContexts(normalized: string): string[] {
   const paragraphs = normalized
     .split(/\n{2,}/gu)
     .map((paragraph) => normalizeText(paragraph))
     .filter(Boolean)
-  const paragraphChunks = paragraphs.flatMap(splitLongChunk)
-  const sentences = paragraphs.flatMap((paragraph) =>
-    paragraph
-      .split(/(?<=[.!?;])\s+/gu)
+
+  return paragraphs.flatMap((paragraph) => {
+    const sentences = paragraph
+      .split(/(?<=[.!?;:])\s+/gu)
       .flatMap((part) => splitLongChunk(normalizeText(part)))
-      .filter((part) => part.length >= 4),
+      .filter((part) => part.length >= 4)
+    const contexts = [...splitLongChunk(paragraph)]
+    for (let index = 0; index < sentences.length; index += 1) {
+      const sentence = sentences[index]!
+      contexts.push(sentence)
+      const next = sentences[index + 1]
+      const nextAfter = sentences[index + 2]
+      if (next && nextAfter) {
+        contexts.push(
+          ...splitLongChunk(sentence + " " + next + " " + nextAfter),
+        )
+      } else if (next) {
+        contexts.push(...splitLongChunk(sentence + " " + next))
+      }
+    }
+    return contexts
+  })
+}
+
+function completeAnswerContexts(normalized: string): string[] {
+  if (normalized.length <= MAX_CHUNK_CHARACTERS) return [normalized]
+  return splitLongChunk(normalizeText(normalized))
+}
+
+export function chunkAnswer(answer: string): string[] {
+  const normalized = normalizeAnswerText(answer)
+  if (!normalized) return []
+
+  const completeContexts = completeAnswerContexts(normalized)
+  const completeSet = new Set(completeContexts)
+  const localContexts = criterionEvidenceContexts(normalized).filter(
+    (context) => !completeSet.has(context),
   )
+  const remainingSlots = MAX_CHUNKS - completeContexts.length
 
-  if (normalized.length > MAX_CHUNK_CHARACTERS) {
-    return limitOrderedChunks(splitLongChunk(normalizeText(normalized)))
-  }
-
-  return limitOrderedChunks([
-    normalizeText(normalized),
-    ...paragraphChunks,
-    ...sentences,
-  ])
+  return [
+    ...completeContexts,
+    ...limitOrderedChunks(localContexts, remainingSlots),
+  ]
 }
 
 export function evaluationAnswerContexts(
   answer: string,
-  _mode: EvaluationMode,
+  mode: EvaluationMode,
 ): string[] {
   const normalized = normalizeAnswerText(answer)
   if (!normalized) return []
-  if (normalized.length <= MAX_CHUNK_CHARACTERS) return [normalized]
-  return chunkAnswer(normalized)
+  if (mode === "criteria") return chunkAnswer(normalized)
+  return completeAnswerContexts(normalized)
 }
 
 function decisive(

@@ -1,6 +1,6 @@
 <!--
 author:      MINT-the-GAP, Martin Lommatzsch
-version:     0.5.14
+version:     0.6.0
 language:    de
 narrator:    Deutsch Female
 comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
@@ -41,6 +41,7 @@ let active = true
 let finished = false
 let feedbackEnabled = false
 let referenceVariants = []
+let criteriaBlock = null
 let quizOptions = null
 
 window.LiaLLM?.showFeedback?.(feedbackId, "")
@@ -87,14 +88,18 @@ function finishQuiz(value) {
   send.lia(value)
 }
 
-function finishTechnicalError(error) {
+function finishUnassessed(message) {
   if (!active || finished) return
   finished = true
   clearActivity()
   clearSolutionVariant()
   window.LiaLLM?.showFeedback?.(feedbackId, "")
-  const message = error instanceof Error ? error.message : String(error)
   send.lia(message, [], false)
+}
+
+function finishTechnicalError(error) {
+  const message = error instanceof Error ? error.message : String(error)
+  finishUnassessed(message)
 }
 
 send.handle("stop", () => {
@@ -111,14 +116,22 @@ Promise.resolve()
     if (!window.LiaLLM) {
       throw new Error("lia-llm konnte nicht geladen werden.")
     }
-    if (window.LiaLLM.version !== "0.5.14") {
-      throw new Error(`lia-llm 0.5.14 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
+    if (window.LiaLLM.version !== "0.6.0") {
+      throw new Error(`lia-llm 0.6.0 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
     }
 
     const options = window.LiaLLM.parseMacroOptions(optionSource)
     quizOptions = options
-    referenceVariants = window.LiaLLM.parseReferenceVariants(referenceSource)
+    criteriaBlock = window.LiaLLM.parseCriteriaBlock(referenceSource) ?? null
+    referenceVariants = window.LiaLLM.parseReferenceVariants(
+      criteriaBlock?.reference ?? referenceSource
+    )
     feedbackEnabled = options.feedback
+    if (criteriaBlock && options.operator) {
+      throw new Error(
+        "Der atomare Aussagenabgleich prüft Inhalte ohne technischen Operator. Entferne operator=...; das Operatorwort darf im Aufgabenwortlaut stehen bleiben."
+      )
+    }
     if (options.operator && question === "LiaScript-Freitextaufgabe") {
       throw new Error(
         "Operatoren benötigen den echten Aufgabenwortlaut. Verwende @LLMQuiz.question(...)."
@@ -132,6 +145,7 @@ Promise.resolve()
       referenceVariants: referenceVariants.slice(1),
       assessmentEngine: options.assessmentEngine,
       operator: options.operator ?? undefined,
+      criteria: criteriaBlock?.criteria,
       criterionThreshold: options.passThreshold
     }, {
       signal: evaluationController.signal,
@@ -149,6 +163,15 @@ Promise.resolve()
   })
   .then(result => {
     if (!active) return
+    if (result.status === "uncertain") {
+      const feedback =
+        window.LiaLLM?.feedbackForResult?.(result, "de-DE") ?? null
+      finishUnassessed(
+        feedback?.message ??
+          "Die Antwort konnte gerade nicht eindeutig bewertet werden. Versuche die Prüfung erneut."
+      )
+      return
+    }
     if (result.passed) {
       const selectedReferenceIndex =
         Number.isInteger(result.selectedReferenceIndex) &&
@@ -188,6 +211,7 @@ Promise.resolve()
                 referenceVariants: referenceVariants.slice(1),
                 assessmentEngine: "quality",
                 operator: quizOptions.operator ?? undefined,
+                criteria: criteriaBlock?.criteria,
                 criterionThreshold: quizOptions.passThreshold,
                 languageAnalysis: {
                   spelling: quizOptions.rechtschreibung,
@@ -212,17 +236,16 @@ Promise.resolve()
               }
             }
           }
-        : undefined
+          : undefined
     showLearnerFeedback(feedback, languageCheck)
-    finishQuiz(result.passed ? "true" : "false")
+    finishQuiz(result.status === "passed" ? "true" : "false")
   })
   .catch(error => {
     if (!active) return
     clearSolutionVariant()
     const feedback = window.LiaLLM?.feedbackForError?.(error, "de-DE") ?? null
     if (feedback) {
-      showLearnerFeedback(feedback)
-      finishQuiz("false")
+      finishUnassessed(feedback.message)
       return
     }
     finishTechnicalError(error)
@@ -240,12 +263,16 @@ const solutionResult = "@input(`lia-llm-result-@0`)"
 const solutionOptions = window.LiaLLM?.parseMacroOptions?.(`@'1`)
 const solutionVariantId = "lia-llm-solution-variant-@0"
 const solutionReferenceSource = `@'3`
+const solutionCriteriaBlock =
+  window.LiaLLM?.parseCriteriaBlock?.(solutionReferenceSource)
 const resultSeparator =
   "\n\n<lia-llm-result-separator></lia-llm-result-separator>"
 
 if (solutionResult === "true" && solutionOptions?.solution) {
   const solutionReferenceVariants =
-    window.LiaLLM.parseReferenceVariants(solutionReferenceSource)
+    window.LiaLLM.parseReferenceVariants(
+      solutionCriteriaBlock?.reference ?? solutionReferenceSource
+    )
   const storedReferenceIndex =
     window.LiaLLM?.getSolutionVariant?.(solutionVariantId)
   const selectedReferenceIndex =
@@ -277,7 +304,8 @@ Auswertung anhand einer Musterlösung. Für neue Aufgaben ist
 Die vollständige Antwort wird im Zusammenhang mit der vollständigen Musterlösung betrachtet.
 Synonyme, Umschreibungen und andere Satzstrukturen dürfen dieselbe Aussage ausdrücken. Das stärkere
 Modell achtet zugleich auf Verneinungen, fachliche Widersprüche und umgekehrte
-Ursache-Wirkungs-Beziehungen. Einzelne Sätze werden nicht automatisch zu einzelnen Kriterien.
+Ursache-Wirkungs-Beziehungen. Einzelne Sätze werden nicht automatisch zu einzelnen Kriterien;
+dafür muss ausdrücklich der unten beschriebene Kriterienmarker verwendet werden.
 
 Die Auswertung ist ein formativer Selbstcheck. Sie ist keine Prüfungsnote und kann eine fachliche
 Bewertung durch eine Lehrkraft nicht ersetzen.
@@ -298,9 +326,11 @@ weder die Bereichswiederholung noch die lokal ausgelieferte ONNX-Laufzeit.
 
 ## Verwendung
 
-Direkt nach dem normalen Textquiz folgt ein als `text` markierter Block. Sein Inhalt ist die
-vollständige Musterlösung für den lokalen Vergleich. Sie wird in der gerenderten Aufgabe zunächst
-nicht angezeigt. Mit `solution=1` erscheint sie erst, nachdem die Antwort als richtig bewertet wurde.
+Direkt nach dem normalen Textquiz folgt ein als `text` markierter Block. Im ganzheitlichen Modus
+enthält er die vollständige Musterlösung für den lokalen Vergleich. Im Kriterienmodus trennt
+`<!-- lia-llm:solution -->` die internen Kernaussagen von einer ausformulierten Musterlösung.
+Die Musterlösung wird in der gerenderten Aufgabe zunächst nicht angezeigt. Mit `solution=1`
+erscheint sie erst, nachdem die Antwort als richtig bewertet wurde.
 Bei der Anzeige wird ihr Inhalt vollständig als LiaScript neu geparst. Dadurch werden insbesondere
 Markdown-Strukturen sowie Inline- und Blockformeln in TeX gerendert und nicht als Quelltext gezeigt.
 Bei `@LLMQuiz.question` wird der echte Aufgabenwortlaut zusätzlich an die Auswertung übergeben.
@@ -349,6 +379,106 @@ höchstens 8000 Zeichen enthalten. Die Syntax ist für verschiedene vollständig
 gedacht, nicht für Teilkriterien, Teilpunkte oder unterschiedliche Qualitätsstufen eines
 Erwartungshorizonts. Alle Varianten bleiben wie die bisherige einzelne Musterlösung im
 Kursquelltext und im Browser technisch auffindbar.
+
+### Atomare Kriterien
+
+Soll eine freie Antwort nicht nur als Ganzes, sondern gegen mehrere einzeln erforderliche
+Kerninformationen geprüft werden, beginnt jede Aussage mit der allein stehenden Kommentarzeile
+`<!-- lia-llm:criterion -->`. Der erste Marker muss zugleich die erste nichtleere Zeile des
+Erwartungshorizonts sein. Ohne einen solchen Marker bleibt der bisherige ganzheitliche Vergleich
+unverändert aktiv.
+
+```` markdown
+Aufgabe: Warum hält Leyla Finn davon ab, die Blechdose aufzubrechen? Erkläre außerdem, was die
+unterschiedlichen Reaktionen über ihre Arbeitsweisen zeigen.
+
+<!-- data-solution-button="off" data-llm-textarea="6" -->
+[[Antwort]]
+```text @LLMQuiz.question(0.55;solution=1;feedback=1,`Warum hält Leyla Finn davon ab, die Blechdose aufzubrechen? Erkläre außerdem, was die unterschiedlichen Reaktionen über ihre Arbeitsweisen zeigen.`)
+<!-- lia-llm:criterion -->
+Leyla will die Dose nicht beschädigen.
+<!-- lia-llm:criterion -->
+Leyla untersucht deshalb zunächst den Zettel genau.
+<!-- lia-llm:criterion -->
+Auf der Rückseite erkennt sie Hinweise, die zu einem passenden Schlüssel führen.
+<!-- lia-llm:criterion -->
+Leyla arbeitet sorgfältig.
+<!-- lia-llm:criterion -->
+Leyla arbeitet geduldig.
+<!-- lia-llm:criterion -->
+Leyla arbeitet aufmerksam.
+<!-- lia-llm:criterion -->
+Finn ist anfangs ungeduldig.
+<!-- lia-llm:criterion -->
+Finn möchte möglichst schnell zu einem Ergebnis kommen.
+<!-- lia-llm:solution -->
+Leyla will die Dose nicht aufbrechen, weil sie sie nicht beschädigen und zunächst den Zettel genau
+untersuchen möchte. Auf dessen Rückseite erkennt sie Hinweise, die zu einem passenden Schlüssel
+führen. Leyla arbeitet sorgfältig, geduldig und aufmerksam, während Finn anfangs ungeduldig ist
+und möglichst schnell zu einem Ergebnis kommen möchte.
+```
+````
+
+Jeder mit `<!-- lia-llm:criterion -->` beginnende Abschnitt vor dem Lösungsmarker wird als eigenes
+Kriterium in der angegebenen Reihenfolge übernommen.
+Alle Kriterien sind erforderlich und gleich gewichtet; die Antwort besteht daher nur, wenn jede
+Kerninformation erfüllt ist. Ein Kriterium soll genau eine selbstständig prüfbare fachliche Aussage
+enthalten. Unabhängige Behauptungen werden getrennt; deshalb bilden im Beispiel „sorgfältig“,
+„geduldig“ und „aufmerksam“ drei Kriterien und keine Aufzählung in einem Sammelkriterium.
+
+Der allein stehende Marker `<!-- lia-llm:solution -->` folgt genau einmal auf das letzte Kriterium.
+Alles danach ist eine zusammenhängende, frei formulierte Musterlösung und wird nicht als zusätzliches
+Kriterium geprüft. Sie soll alle Pflichtaussagen fachlich korrekt wiedergeben, darf diese aber natürlich
+verbinden, umstellen und sprachlich ausformulieren.
+
+Der erste Zahlenwert des Makros, im Beispiel `0.55`, bleibt die
+Mindestkonfidenz für jedes einzelne Kriterium. Es sind höchstens 16 nichtleere und inhaltlich
+verschiedene Kriterien zulässig. Nach einer bestandenen Prüfung zeigt `solution=1` ausschließlich
+den ausformulierten Text hinter dem Lösungsmarker; Kriterien und technische Marker bleiben unsichtbar.
+`solution=0` unterdrückt die Anzeige. Fehlt der neue Lösungsmarker in einem älteren Kriterienblock,
+werden aus Kompatibilitätsgründen weiterhin die zusammengefügten Kriterien als Musterlösung verwendet.
+
+Im Kriterienmodus sucht das Kompaktmodell die stärkste inhaltliche Unterstützung im vollständigen
+Antworttext, in Absätzen, in einzelnen Sätzen sowie in benachbarten Zwei- und Drei-Satz-Fenstern.
+Dadurch dürfen Lernende die Kernaussagen frei formulieren, anders anordnen und mit einer Einleitung
+versehen. Ein starker Widerspruch in einem anderen Ausschnitt bleibt ein Veto und kann nicht durch
+einen passenden Einzelsatz überstimmt werden. `0.55` ist der kalibrierte Startwert für atomare
+Kriterien mit dem Kompaktmodell. Ein höherer Wert wie `0.66` prüft strenger, erhöht aber besonders
+bei Synonymen und umgangssprachlichen Formulierungen die Zahl fälschlich abgelehnter Antworten.
+
+Atomare Kriterien dürfen weder mit vollständigen Musterlösungsalternativen noch mit der technischen
+Makrooption `operator=...` kombiniert werden. Das Operatorwort darf weiterhin im sichtbaren
+Aufgabenwortlaut stehen, wie das Wort „Erkläre“ im Beispiel. Für die atomare Inhaltsprüfung wird es
+jedoch nicht zusätzlich als Operatoroption gesetzt. Ein leerer Abschnitt, Inhalt vor dem ersten
+Marker, mehr als 16 Kriterien, ein leerer, mehrfacher oder falsch platzierter Lösungsmarker sowie eine
+Mischung mit Alternativen beziehungsweise `operator=...` führt vor dem Modellaufruf zu einer klaren
+Fehlermeldung.
+
+### Normalisierter Direktabgleich
+
+Vor jeder Modellauswahl vergleicht `lia-llm` die vollständige Lernendenantwort direkt mit der
+vollständigen Musterlösung beziehungsweise mit jeder hinterlegten vollständigen Alternative. Bei
+atomaren Kriterien mit Lösungsmarker ist die Vergleichsgrundlage die ausformulierte Musterlösung
+hinter `<!-- lia-llm:solution -->`. Ohne Lösungsmarker bleibt sie aus Kompatibilitätsgründen die
+Zusammenfügung aller Kriterien. Der Direktabgleich ist nur eine Abkürzung für exakt denselben Text;
+jede freie Umformulierung wird weiterhin einzeln gegen alle Kriterien geprüft. Für diesen Vergleich werden
+Unicode-Zeichen kompatibilitätsnormalisiert, Groß- und Kleinschreibung angeglichen, aufeinanderfolgende
+Leerzeichen und Zeilenumbrüche zu einem Leerzeichen zusammengefasst sowie Leerraum am Anfang und Ende
+entfernt.
+
+Sind die normalisierten Texte danach identisch, gilt die Antwort unmittelbar und deterministisch als
+richtig; dafür wird kein Modell geladen. Dies ist kein unscharfer Vergleich: Abweichende Satzzeichen,
+Wortreihenfolge, Schreibweisen sowie fehlende oder zusätzliche Inhalte werden nicht entfernt.
+Synonyme, Umformulierungen und andere inhaltlich gleichwertige Antworten gelangen deshalb weiterhin
+in die semantische Modellprüfung.
+
+### Nicht eindeutige Ergebnisse
+
+Ein Modellergebnis mit dem Status `uncertain` wird vom Makro nicht als `false` und damit nicht als
+falsche Fachantwort an LiaScript weitergegeben. Stattdessen bleibt die Antwort neutral unbewertet und
+es erscheint die Aufforderung, die Prüfung erneut zu versuchen. Nur ein eindeutiges `passed` wird als
+richtig und ein eindeutiges `failed` als falsch zurückgemeldet; bei `uncertain` wird auch keine
+Musterlösung eingeblendet.
 
 `@LLMQuiz.question(...)` muss in derselben Zeile wie die öffnenden drei Backticks stehen. In der nächsten
 Zeile wäre der Aufruf nur Teil der Musterlösung und würde nicht ausgeführt.
@@ -455,9 +585,9 @@ pauschal einem Anforderungsbereich zugeordnet. Die fachliche Grundlage steht in
 Operatoraufgaben bestehen erst nach der Prüfung durch das Qualitätsmodell. Das Kompaktmodell darf
 den Fachinhalt vorprüfen, aber die verlangte Antwortform nicht allein freigeben. Ist die
 Qualitätsprüfung etwa ohne WebGPU oder nach einem Modellfehler nicht verfügbar, wird ein sonst
-bestandener Kompaktbefund zu `uncertain` und bittet bei `feedback=1` um eine
-erneute Prüfung; er wird nicht fälschlich freigegeben. Ein bereits erkannter fachlicher Fehler oder
-unvollständiger Inhalt bleibt dagegen der vorrangige Befund.
+ausschließlich verfügbarer Kompaktbefund zu `uncertain` und bittet um eine erneute Prüfung.
+Da ohne das erforderliche Modell die Gesamtaufgabe einschließlich ihrer Antwortform nicht
+zuverlässig geprüft ist, wird der Versuch weder als richtig noch als fachlich falsch verbucht.
 
 Das ältere `@LLMQuiz(Optionen)` verwendet weiterhin den allgemeinen Kontext
 „LiaScript-Freitextaufgabe“ und ist deshalb nur ohne Operator zulässig.

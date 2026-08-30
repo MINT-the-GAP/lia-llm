@@ -14,6 +14,7 @@ import {
   normalizeAnswerText,
   normalizeRequest,
   parseCriteria,
+  parseCriteriaBlock,
   parseReferenceVariants,
   splitReference,
 } from "../src/scoring.ts"
@@ -110,6 +111,7 @@ import {
   clearLegacyQualityCache,
   completeLanguageAnalysis,
   contextualOrthographyOptions,
+  createExactReferenceMatchResult,
   finalizeQualityAssessment,
   GRAMMAR_CORRECTION_POST_DATA_INSTRUCTION,
   grammarCorrectionResponseSchema,
@@ -1844,6 +1846,250 @@ test("parseCriteria accepts weighted JSON criteria and NLI thresholds", () => {
   assert.deepEqual(criteria?.[0]?.acceptedVariants, ["geringere Dichte"])
 })
 
+test("parseCriteriaBlock extracts required atomic statements and a clean reference", () => {
+  const source = [
+    "",
+    "<!-- lia-llm:criterion -->",
+    "Leyla will die Blechdose und ihren Inhalt nicht beschädigen.",
+    "<!-- lia-llm:criterion -->",
+    "Leyla untersucht zunächst den Zettel.",
+    "<!-- lia-llm:criterion -->",
+    "Finn drängt anfangs auf ein schnelles Ergebnis.",
+    "",
+  ].join("\r\n")
+  const parsed = parseCriteriaBlock(source)
+
+  assert.deepEqual(parsed, {
+    reference: [
+      "Leyla will die Blechdose und ihren Inhalt nicht beschädigen.",
+      "Leyla untersucht zunächst den Zettel.",
+      "Finn drängt anfangs auf ein schnelles Ergebnis.",
+    ].join("\n\n"),
+    criteria: [
+      {
+        text: "Leyla will die Blechdose und ihren Inhalt nicht beschädigen.",
+        required: true,
+      },
+      {
+        text: "Leyla untersucht zunächst den Zettel.",
+        required: true,
+      },
+      {
+        text: "Finn drängt anfangs auf ein schnelles Ergebnis.",
+        required: true,
+      },
+    ],
+  })
+  const normalized = normalizeRequest({
+    question: "Warum hält Leyla Finn zurück?",
+    answer:
+      "Leyla will Schäden vermeiden, prüft den Zettel und arbeitet bedächtiger als Finn.",
+    reference: parsed!.reference,
+    criteria: parsed!.criteria,
+  })
+  assert.equal(normalized.mode, "criteria")
+  assert.equal(normalized.passThreshold, 1)
+  assert.equal(normalized.criteria.every((criterion) => criterion.required), true)
+})
+
+test("parseCriteriaBlock separates atomic criteria from an authored flowing solution", () => {
+  const flowingSolution = [
+    "Leyla hält Finn zurück, weil sie die Dose nicht beschädigen und zuerst den Zettel prüfen möchte.",
+    "",
+    "Dabei arbeitet sie **sorgfältig**; Finn will möglichst schnell fertig sein.",
+  ].join("\n")
+  const parsed = parseCriteriaBlock(
+    [
+      "<!-- lia-llm:criterion -->",
+      "Leyla möchte die Dose nicht beschädigen.",
+      "<!-- lia-llm:criterion -->",
+      "Finn möchte möglichst schnell zu einem Ergebnis kommen.",
+      "<!-- lia-llm:solution -->",
+      flowingSolution,
+    ].join("\r\n"),
+  )
+
+  assert.equal(parsed?.reference, flowingSolution)
+  assert.deepEqual(parsed?.criteria, [
+    { text: "Leyla möchte die Dose nicht beschädigen.", required: true },
+    {
+      text: "Finn möchte möglichst schnell zu einem Ergebnis kommen.",
+      required: true,
+    },
+  ])
+  assert.doesNotMatch(parsed!.reference, /lia-llm:(?:criterion|solution)/u)
+
+  const normalized = normalizeRequest({
+    question: "Was zeigen Leylas und Finns Arbeitsweisen?",
+    answer: flowingSolution,
+    reference: parsed!.reference,
+    criteria: parsed!.criteria,
+  })
+  assert.equal(normalized.mode, "criteria")
+  const direct = createExactReferenceMatchResult(normalized)
+  assert.equal(direct?.passed, true)
+  assert.equal(direct?.model.task, "deterministic-match")
+})
+
+test("parseCriteriaBlock preserves legacy text and rejects ambiguous authored blocks", () => {
+  assert.equal(
+    parseCriteriaBlock(
+      "Der Text nennt <!-- lia-llm:criterion --> nur als Beispiel.",
+    ),
+    undefined,
+  )
+  assert.equal(
+    parseCriteriaBlock(
+      "Der Text nennt <!-- lia-llm:solution --> nur als Beispiel.",
+    ),
+    undefined,
+  )
+  assert.throws(
+    () =>
+      parseCriteriaBlock(
+        "<!-- lia-llm:solution -->\nHier stünde eine Musterlösung.",
+      ),
+    /nur nach mindestens einem Kriterienmarker/u,
+  )
+  assert.throws(
+    () =>
+      parseCriteriaBlock(
+        [
+          "<!-- lia-llm:criterion -->",
+          "Erste Aussage.",
+          "<!-- lia-llm:solution -->",
+          "Fließtext.",
+          "<!-- lia-llm:solution -->",
+          "Zweiter Fließtext.",
+        ].join("\n"),
+      ),
+    /höchstens einmal/u,
+  )
+  assert.throws(
+    () =>
+      parseCriteriaBlock(
+        [
+          "<!-- lia-llm:criterion -->",
+          "Erste Aussage.",
+          "<!-- lia-llm:solution -->",
+          "",
+        ].join("\n"),
+      ),
+    /Musterlösung .* leer/u,
+  )
+  assert.throws(
+    () =>
+      parseCriteriaBlock(
+        [
+          "<!-- lia-llm:criterion -->",
+          "Erste Aussage.",
+          "<!-- lia-llm:solution -->",
+          "Fließtext.",
+          "<!-- lia-llm:criterion -->",
+          "Zu spät markierte Aussage.",
+        ].join("\n"),
+      ),
+    /Alle Kriterien müssen vor dem Musterlösungsmarker stehen/u,
+  )
+  assert.throws(
+    () =>
+      parseCriteriaBlock(
+        "Vorspann\n<!-- lia-llm:criterion -->\nErste Aussage.",
+      ),
+    /erste nichtleere Zeile/u,
+  )
+  for (const alternative of [
+    "<!-- lia-llm:alternative -->",
+    "<!-- lia-llm-variant -->",
+    "<!-- lia-llm-variante -->",
+  ]) {
+    assert.throws(
+      () =>
+        parseCriteriaBlock(
+          [
+            "<!-- lia-llm:criterion -->",
+            "Erste Aussage.",
+            alternative,
+            "Alternative Aussage.",
+          ].join("\n"),
+        ),
+      /nicht mit vollständigen Musterlösungsalternativen/u,
+    )
+  }
+  for (const invalid of [
+    "<!-- lia-llm:criterion -->",
+    [
+      "<!-- lia-llm:criterion -->",
+      "Erste Aussage.",
+      "<!-- lia-llm:criterion -->",
+    ].join("\n"),
+    [
+      "<!-- lia-llm:criterion -->",
+      "<!-- lia-llm:criterion -->",
+      "Zweite Aussage.",
+    ].join("\n"),
+  ]) {
+    assert.throws(() => parseCriteriaBlock(invalid), /Kriterium \d+ ist leer/u)
+  }
+  assert.throws(
+    () =>
+      parseCriteriaBlock(
+        [
+          "<!-- lia-llm:criterion -->",
+          "Dieselbe Aussage.",
+          "<!-- lia-llm:criterion -->",
+          "Dieselbe   Aussage.",
+        ].join("\n"),
+      ),
+    /inhaltlich unterscheiden/u,
+  )
+  assert.throws(
+    () =>
+      parseCriteriaBlock(
+        Array.from(
+          { length: 17 },
+          (_, index) =>
+            `<!-- lia-llm:criterion -->\nAussage ${index + 1}.`,
+        ).join("\n"),
+      ),
+    /höchstens 16 Kriterien/u,
+  )
+})
+
+test("exact authored references pass deterministically before model selection", async () => {
+  const reference =
+    "Leyla will die Dose nicht beschädigen und untersucht deshalb den Zettel genau."
+  const normalized = normalizeRequest({
+    question: "Warum hält Leyla Finn zurück?",
+    answer:
+      "  LEYLA will die Dose nicht beschädigen   und untersucht deshalb den Zettel genau.  ",
+    reference,
+  })
+  const direct = createExactReferenceMatchResult(normalized)
+  assert.equal(direct?.passed, true)
+  assert.equal(direct?.status, "passed")
+  assert.equal(direct?.criteria[0]?.status, "met")
+  assert.deepEqual(direct?.model, {
+    id: "deterministic-reference-match",
+    revision: "1",
+    device: "none",
+    dtype: "none",
+    task: "deterministic-match",
+  })
+
+  const automatic = new AutomaticEvaluator({} as never, {} as never)
+  const operatorResult = await automatic.evaluate({
+    question:
+      "Erkläre, warum Leyla Finn davon abhält, die Blechdose aufzubrechen.",
+    answer: reference,
+    reference,
+    assessmentEngine: "quality",
+    operator: "erklaeren",
+  })
+  assert.equal(operatorResult.passed, true)
+  assert.equal(operatorResult.model.task, "deterministic-match")
+})
+
 test("parseReferenceVariants preserves legacy text and authored LiaScript markup", () => {
   const legacy =
     "Erster Absatz mit $a^2$.\n\n- erster Punkt\n- zweiter Punkt\n\n$$b^2$$"
@@ -2251,11 +2497,34 @@ test("chunkAnswer keeps the whole short answer and useful sentences", () => {
   assert.ok(chunks.includes("Seine Kristallstruktur benötigt mehr Volumen."))
 })
 
-test("all evaluation modes preserve complete answer context without sentence picking", () => {
+test("criteria mode adds local evidence without changing holistic short-answer context", () => {
   const answer =
-    "Eis ist weniger dicht. Deshalb schwimmt es.\n\nBeide Aussagen gehören zusammen."
+    "Vorbemerkung. Eis ist weniger dicht. Deshalb schwimmt es.\n\nBeide Aussagen gehören zusammen."
   assert.deepEqual(evaluationAnswerContexts(answer, "holistic"), [answer])
-  assert.deepEqual(evaluationAnswerContexts(answer, "criteria"), [answer])
+  const contexts = evaluationAnswerContexts(answer, "criteria")
+  assert.equal(contexts[0], answer)
+  assert.ok(contexts.includes("Eis ist weniger dicht."))
+  assert.ok(
+    contexts.includes("Eis ist weniger dicht. Deshalb schwimmt es."),
+  )
+  assert.ok(
+    contexts.includes(
+      "Vorbemerkung. Eis ist weniger dicht. Deshalb schwimmt es.",
+    ),
+  )
+  assert.ok(contexts.includes("Beide Aussagen gehören zusammen."))
+  assert.equal(new Set(contexts).size, contexts.length)
+})
+
+test("criteria mode separates a harmless framing phrase before a colon", () => {
+  const answer =
+    "Meine Antwort lautet: Leyla schützt die Dose und untersucht den Zettel."
+  assert.deepEqual(evaluationAnswerContexts(answer, "holistic"), [answer])
+  assert.ok(
+    evaluationAnswerContexts(answer, "criteria").includes(
+      "Leyla schützt die Dose und untersucht den Zettel.",
+    ),
+  )
 })
 
 test("long evaluation contexts stay ordered and retain both answer ends", () => {
@@ -2276,7 +2545,17 @@ test("long evaluation contexts stay ordered and retain both answer ends", () => 
   assert.match(holistic.at(-1)!, /SCHLUSS: Die entscheidende Folgerung steht am Ende\.$/u)
   assert.ok(holistic.every((context) => context.length <= 700))
   assert.equal(holistic.join(" "), answer)
-  assert.deepEqual(evaluationAnswerContexts(answer, "criteria"), holistic)
+
+  const criteriaContexts = evaluationAnswerContexts(answer, "criteria")
+  assert.notDeepEqual(criteriaContexts, holistic)
+  assert.ok(criteriaContexts.length <= 24)
+  assert.ok(criteriaContexts.every((context) => context.length <= 700))
+  assert.deepEqual(criteriaContexts.slice(0, holistic.length), holistic)
+  assert.ok(
+    criteriaContexts.includes(
+      "Die entscheidende Folgerung steht am Ende.",
+    ),
+  )
 })
 
 test("long answer contexts still respect the global NLI pair cap", async () => {
@@ -7761,7 +8040,7 @@ test('AutomaticEvaluator retries Quality after recoverable output and request fa
     const automatic = new AutomaticEvaluator(compact as never, quality as never)
     const request: EvaluationRequest = {
       question: 'Warum schwimmt Eis?',
-      answer: 'Eis besitzt eine geringere Dichte als Wasser.',
+      answer: 'Gefrorenes Wasser ist weniger dicht und schwimmt deshalb.',
       reference: 'Eis besitzt eine geringere Dichte als Wasser.',
       assessmentEngine: 'quality',
     }
@@ -8060,7 +8339,7 @@ test("automatic evaluator defaults to compact and uses quality only for explicit
     const automatic = new AutomaticEvaluator(compact as never, quality as never)
     const request = {
       question: "Warum schwimmt Eis?",
-      answer: "Eis hat eine geringere Dichte als flüssiges Wasser.",
+      answer: "Gefrorenes Wasser ist weniger dicht und schwimmt deshalb.",
       reference: "Eis hat eine geringere Dichte als flüssiges Wasser.",
     }
 
@@ -8523,7 +8802,7 @@ test("automatic evaluator never downloads uncached quality after consent is deni
       )
       const resultValue = await automatic.evaluate({
         question: "Warum schwimmt Eis?",
-        answer: "Eis besitzt eine geringere Dichte als flüssiges Wasser.",
+        answer: "Gefrorenes Wasser ist weniger dicht und schwimmt deshalb.",
         reference: "Eis besitzt eine geringere Dichte als flüssiges Wasser.",
         assessmentEngine: "quality",
       })
@@ -8589,7 +8868,7 @@ test("automatic evaluator blocks quality before consent when storage is insuffic
       )
       const resultValue = await automatic.evaluate({
         question: "Warum schwimmt Eis?",
-        answer: "Eis besitzt eine geringere Dichte als flüssiges Wasser.",
+        answer: "Gefrorenes Wasser ist weniger dicht und schwimmt deshalb.",
         reference: "Eis besitzt eine geringere Dichte als flüssiges Wasser.",
         assessmentEngine: "quality",
       })
@@ -8645,7 +8924,7 @@ test("automatic evaluator bounds an uncached quality wait and accepts late succe
     )
     const request: EvaluationRequest = {
       question: "Warum schwimmt Eis?",
-      answer: "Eis besitzt eine geringere Dichte als flüssiges Wasser.",
+      answer: "Gefrorenes Wasser ist weniger dicht und schwimmt deshalb.",
       reference: "Eis besitzt eine geringere Dichte als flüssiges Wasser.",
     }
     const thinkingOptions = {
@@ -8719,7 +8998,7 @@ test("automatic evaluator preserves loading status after an uncached quality wai
       )
       const request: EvaluationRequest = {
         question: "Warum schwimmt Eis?",
-        answer: "Eis besitzt eine geringere Dichte als flüssiges Wasser.",
+        answer: "Gefrorenes Wasser ist weniger dicht und schwimmt deshalb.",
         reference: "Eis besitzt eine geringere Dichte als flüssiges Wasser.",
       }
 
@@ -8778,7 +9057,7 @@ test("automatic evaluator retries after a timeout and late transient quality fai
     )
     const request: EvaluationRequest = {
       question: "Warum schwimmt Eis?",
-      answer: "Eis besitzt eine geringere Dichte als flüssiges Wasser.",
+      answer: "Gefrorenes Wasser ist weniger dicht und schwimmt deshalb.",
       reference: "Eis besitzt eine geringere Dichte als flüssiges Wasser.",
     }
     const thinkingOptions = {
@@ -8823,7 +9102,7 @@ test("automatic evaluator bounds a cached warm start without duplicating its lat
     )
     const request: EvaluationRequest = {
       question: "Warum schwimmt Eis?",
-      answer: "Eis besitzt eine geringere Dichte als flüssiges Wasser.",
+      answer: "Gefrorenes Wasser ist weniger dicht und schwimmt deshalb.",
       reference: "Eis besitzt eine geringere Dichte als flüssiges Wasser.",
     }
     const thinkingOptions = {
@@ -8904,7 +9183,7 @@ test("automatic evaluator keeps omitted plain and explicit compact requests off 
   const automatic = new AutomaticEvaluator(compact as never, quality as never)
   const request: EvaluationRequest = {
     question: "Warum schwimmt Eis?",
-    answer: "Eis besitzt eine geringere Dichte als flüssiges Wasser.",
+    answer: "Gefrorenes Wasser ist weniger dicht und schwimmt deshalb.",
     reference: "Eis besitzt eine geringere Dichte als flüssiges Wasser.",
   }
 
@@ -9023,7 +9302,7 @@ test("automatic evaluator circuit-breaks a fatal quality preload for the session
     )
     const request: EvaluationRequest = {
       question: "Warum schwimmt Eis?",
-      answer: "Eis besitzt eine geringere Dichte als Wasser.",
+      answer: "Gefrorenes Wasser ist weniger dicht und schwimmt deshalb.",
       reference: "Eis besitzt eine geringere Dichte als Wasser.",
     }
 
@@ -9161,7 +9440,7 @@ test("automatic evaluator retries a transient quality preload in the same sessio
     const automatic = new AutomaticEvaluator(compact as never, quality as never)
     const request: EvaluationRequest = {
       question: "Warum schwimmt Eis?",
-      answer: "Eis besitzt eine geringere Dichte als Wasser.",
+      answer: "Gefrorenes Wasser ist weniger dicht und schwimmt deshalb.",
       reference: "Eis besitzt eine geringere Dichte als Wasser.",
       assessmentEngine: "quality",
     }
@@ -9763,7 +10042,7 @@ test("solution variant registry validates identifiers and indices", () => {
   clearSolutionVariant(" solution ", " run ")
 })
 
-test("the public version remains pinned exactly to 0.5.14", () => {
+test("the public version remains pinned exactly to 0.6.0", () => {
   const packageJson = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   ) as { version?: string }
@@ -9773,11 +10052,11 @@ test("the public version remains pinned exactly to 0.5.14", () => {
   const entry = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8")
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8")
 
-  assert.equal(packageJson.version, "0.5.14")
-  assert.equal(packageLock.version, "0.5.14")
-  assert.equal(packageLock.packages?.[""]?.version, "0.5.14")
-  assert.match(entry, /const VERSION = "0\.5\.14"/u)
-  assert.match(readme, /^version:\s+0\.5\.14$/mu)
+  assert.equal(packageJson.version, "0.6.0")
+  assert.equal(packageLock.version, "0.6.0")
+  assert.equal(packageLock.packages?.[""]?.version, "0.6.0")
+  assert.match(entry, /const VERSION = "0\.6\.0"/u)
+  assert.match(readme, /^version:\s+0\.6\.0$/mu)
   assert.match(readme, /^script:\s+\.\/dist\/index\.js$/mu)
   assert.doesNotMatch(
     readme,
@@ -9822,7 +10101,22 @@ test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper
     /\.showActivity\?\.\(activityId, runId, "selecting-model"\)/u,
   )
   assert.match(readme, /parseMacroOptions\(optionSource\)/u)
-  assert.match(readme, /finishQuiz\(result\.passed \? "true" : "false"\)/u)
+  assert.match(
+    readme,
+    /function finishUnassessed\(message\)[\s\S]*?send\.lia\(message, \[\], false\)/u,
+  )
+  assert.match(
+    readme,
+    /if \(result\.status === "uncertain"\)[\s\S]*?finishUnassessed\(/u,
+  )
+  assert.match(
+    readme,
+    /finishQuiz\(result\.status === "passed" \? "true" : "false"\)/u,
+  )
+  assert.match(
+    readme,
+    /function finishTechnicalError\(error\)[\s\S]*?finishUnassessed\(message\)/u,
+  )
   assert.match(readme, /send\.handle\("stop",/u)
   assert.match(readme, /evaluationController\.abort\(\)/u)
   assert.match(readme, /signal: evaluationController\.signal/u)
@@ -9839,6 +10133,19 @@ test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper
   assert.match(readme, /criterionThreshold: options\.passThreshold/u)
   assert.match(readme, /assessmentEngine:\s*options\.assessmentEngine/u)
   assert.match(readme, /operator: options\.operator \?\? undefined/u)
+  assert.match(
+    readme,
+    /criteriaBlock = window\.LiaLLM\.parseCriteriaBlock\(referenceSource\) \?\? null/u,
+  )
+  assert.equal(
+    (readme.match(/criteria:\s*criteriaBlock\?\.criteria/gu) ?? []).length,
+    2,
+  )
+  assert.match(readme, /if \(criteriaBlock && options\.operator\)/u)
+  assert.match(
+    readme,
+    /Der atomare Aussagenabgleich prüft Inhalte ohne technischen Operator/u,
+  )
   const initialEvaluationStart = readme.indexOf(
     "return window.LiaLLM.evaluate({",
   )
@@ -9883,7 +10190,9 @@ test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper
   assert.match(readme, /showLearnerFeedback\(feedback, languageCheck\)/u)
   assert.ok(
     readme.indexOf("showLearnerFeedback(feedback, languageCheck)") <
-      readme.indexOf('finishQuiz(result.passed ? "true" : "false")'),
+      readme.indexOf(
+        'finishQuiz(result.status === "passed" ? "true" : "false")',
+      ),
   )
   assert.match(
     readme,
@@ -9897,7 +10206,7 @@ test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper
   assert.match(readme, /const referenceSource = `@'3`/u)
   assert.match(
     readme,
-    /referenceVariants = window\.LiaLLM\.parseReferenceVariants\(referenceSource\)/u,
+    /referenceVariants = window\.LiaLLM\.parseReferenceVariants\(\s*criteriaBlock\?\.reference \?\? referenceSource\s*\)/u,
   )
   assert.match(readme, /reference:\s*referenceVariants\[0\]/u)
   assert.match(
@@ -9960,7 +10269,11 @@ test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper
   assert.match(macro, /const solutionReferenceSource = `@'3`/u)
   assert.match(
     macro,
-    /window\.LiaLLM\.parseReferenceVariants\(solutionReferenceSource\)/u,
+    /window\.LiaLLM\?\.parseCriteriaBlock\?\.\(solutionReferenceSource\)/u,
+  )
+  assert.match(
+    macro,
+    /window\.LiaLLM\.parseReferenceVariants\(\s*solutionCriteriaBlock\?\.reference \?\? solutionReferenceSource\s*\)/u,
   )
   assert.match(
     macro,
@@ -9996,6 +10309,95 @@ test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper
   )?.[1]
   assert.ok(solutionScript)
   assert.doesNotThrow(() => new Function(solutionScript))
+})
+
+test("solution=1 renders only the authored flowing criteria solution", () => {
+  const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8")
+  const macro = readme.match(/\n@LLMQuiz_\n([\s\S]*?)\n@end/u)?.[1]
+  const solutionScript = macro?.match(
+    /<script style="display:block" modify="false">\n([\s\S]*?)\n<\/script>/u,
+  )?.[1]
+  assert.ok(solutionScript)
+
+  const executableSolutionScript = solutionScript
+    .replace(
+      'const solutionResult = "@input(`lia-llm-result-@0`)"',
+      'const solutionResult = "true"',
+    )
+    .replace(
+      "const solutionReferenceSource = `@'3`",
+      "const solutionReferenceSource = solutionReferenceSourceInput",
+    )
+  assert.doesNotMatch(executableSolutionScript, /@input/u)
+
+  const flowingSolution =
+    "Leyla schützt die Dose und untersucht deshalb den Zettel. Finn drängt dagegen auf ein schnelles Ergebnis."
+  const solutionSource = [
+    "<!-- lia-llm:criterion -->",
+    "INTERNES KRITERIUM: Leyla schützt die Dose.",
+    "<!-- lia-llm:criterion -->",
+    "INTERNES KRITERIUM: Finn drängt auf ein schnelles Ergebnis.",
+    "<!-- lia-llm:solution -->",
+    flowingSolution,
+  ].join("\n")
+  const rendered: string[] = []
+  let cleared = 0
+  const run = new Function(
+    "window",
+    "send",
+    "solutionReferenceSourceInput",
+    executableSolutionScript,
+  )
+
+  run(
+    {
+      LiaLLM: {
+        parseMacroOptions: () => ({ solution: true }),
+        parseCriteriaBlock,
+        parseReferenceVariants,
+        getSolutionVariant: () => undefined,
+      },
+    },
+    {
+      liascript: (value: string) => rendered.push(value),
+      clear: () => {
+        cleared += 1
+      },
+    },
+    solutionSource,
+  )
+
+  assert.deepEqual(rendered, [
+    flowingSolution +
+      "\n\n<lia-llm-result-separator></lia-llm-result-separator>",
+  ])
+  assert.equal(cleared, 0)
+  assert.doesNotMatch(rendered[0]!, /INTERNES KRITERIUM/u)
+  assert.doesNotMatch(rendered[0]!, /lia-llm:(?:criterion|solution)/u)
+
+  rendered.length = 0
+  run(
+    {
+      LiaLLM: {
+        parseMacroOptions: () => ({ solution: false }),
+        parseCriteriaBlock,
+        parseReferenceVariants,
+        getSolutionVariant: () => undefined,
+      },
+    },
+    {
+      liascript: (value: string) => rendered.push(value),
+      clear: () => {
+        cleared += 1
+      },
+    },
+    solutionSource,
+  )
+  assert.deepEqual(rendered, [
+    "\n\n<lia-llm-result-separator></lia-llm-result-separator>",
+  ])
+  assert.doesNotMatch(rendered[0]!, /Leyla schützt die Dose/u)
+  assert.equal(cleared, 0)
 })
 
 test("operator documentation lists every active runtime profile", () => {
@@ -10106,6 +10508,40 @@ test("holistic browser calibration selects quality explicitly", () => {
     "utf8",
   )
   assert.match(html, /assessmentEngine: "quality"/u)
+})
+
+test("browser criteria calibration covers the Leyla compact pass and fail cases", () => {
+  const html = readFileSync(
+    new URL("../test/browser-criteria-calibration.html", import.meta.url),
+    "utf8",
+  )
+  const calibrationScript = html.match(
+    /<script>\n([\s\S]*?)\n<\/script>/u,
+  )?.[1]
+  assert.ok(calibrationScript)
+  assert.doesNotThrow(() => new Function(calibrationScript))
+  assert.equal(
+    (html.match(/<!-- lia-llm:criterion -->/gu) ?? []).length,
+    8,
+  )
+  assert.equal(
+    (html.match(/<!-- lia-llm:solution -->/gu) ?? []).length,
+    1,
+  )
+  assert.match(html, /parsed\.reference !== displaySolution/u)
+  assert.match(html, /Leyla will nicht aufbrechen[\s\S]*Finn anfangs ungeduldig/u)
+  assert.match(html, /window\.LiaLLM\.parseCriteriaBlock\(criteriaSource\)/u)
+  assert.match(html, /criteria:\s*parsed\.criteria/u)
+  assert.match(html, /assessmentEngine: "compact"/u)
+  assert.match(
+    html,
+    /const expected = \[true, true, true, true, false, false, false\]/u,
+  )
+  assert.match(
+    html,
+    /matches: result\.passed === expected\[index\] && usesExpectedModel/u,
+  )
+  assert.doesNotMatch(html, /\boperator\s*:/u)
 })
 
 test("browser adversarial calibration distinguishes the deterministic guard from Qwen", () => {

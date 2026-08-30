@@ -19,6 +19,7 @@ import {
 } from "./language-analysis.ts"
 import {
   createAssessmentManipulationResult,
+  createExactReferenceMatchResult,
   isFatalQualityEngineError,
   isQualityOutputError,
   isRecoverableQualityRequestError,
@@ -252,7 +253,7 @@ function operatorSafeCompactResult(
   result: EvaluationResult,
 ): EvaluationResult {
   const languageSafe = withLanguageAnalysisFallback(request, result)
-  if (!request.operator?.trim() || !languageSafe.passed) return languageSafe
+  if (!request.operator?.trim()) return languageSafe
   return {
     ...languageSafe,
     status: "uncertain",
@@ -754,6 +755,11 @@ export class AutomaticEvaluator {
     if (deterministicResult) {
       if (evaluationOptions?.signal?.aborted) throw abortError()
       return deterministicResult
+    }
+    const exactMatchResult = createExactReferenceMatchResult(normalized)
+    if (exactMatchResult) {
+      if (evaluationOptions?.signal?.aborted) throw abortError()
+      return exactMatchResult
     }
     const advancedQualityFeature =
       normalized.operator !== undefined ||

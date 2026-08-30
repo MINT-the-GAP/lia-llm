@@ -122,6 +122,13 @@ export interface Criterion extends CriterionInput {
   misconceptions: string[]
 }
 
+export interface ParsedCriteriaBlock {
+  /** Authored flowing solution, or the joined criteria as a compatible fallback. */
+  reference: string
+  /** Required atomic statements authored in their original order. */
+  criteria: CriterionInput[]
+}
+
 export interface EvaluationRequest {
   question: string
   answer: string
@@ -322,6 +329,7 @@ export interface EvaluationResult {
     task:
       | "natural-language-inference"
       | "generative-assessment"
+      | "deterministic-match"
       | "deterministic-guard"
   }
   notice: string
@@ -530,6 +538,7 @@ export interface LiaLLMApi {
   clearCache(): Promise<number>
   parseMacroOptions(source: string): import("./macro-options.ts").LLMQuizMacroOptions
   parseReferenceVariants(source: string): string[]
+  parseCriteriaBlock(source: string): ParsedCriteriaBlock | undefined
   parseCriteria(source: string | CriterionInput[] | undefined): CriterionInput[] | undefined
   formatResult(
     result: EvaluationResult,

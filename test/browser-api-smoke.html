@@ -188,6 +188,25 @@
           "Erster Weg mit $a^2$.",
           "## Zweiter Weg\n\n$$b^2$$"
         ])
+      const visibleCriteriaSolution = [
+        "Leyla schützt die Dose und prüft zuerst den Zettel.",
+        "",
+        "Finn drängt dagegen auf ein schnelles Ergebnis."
+      ].join("\n")
+      const parsedCriteriaBlock = window.LiaLLM?.parseCriteriaBlock(
+        [
+          "<!-- lia-llm:criterion -->",
+          "Leyla möchte die Dose nicht beschädigen.",
+          "<!-- lia-llm:criterion -->",
+          "Finn möchte möglichst schnell zu einem Ergebnis kommen.",
+          "<!-- lia-llm:solution -->",
+          visibleCriteriaSolution
+        ].join("\r\n")
+      )
+      const criteriaParserWorks =
+        parsedCriteriaBlock?.reference === visibleCriteriaSolution &&
+        parsedCriteriaBlock?.criteria?.length === 2 &&
+        parsedCriteriaBlock.criteria.every(criterion => criterion.required)
       const solutionVariantId = "browser-solution-variant-probe"
       window.LiaLLM?.setSolutionVariant?.(solutionVariantId, "run-one")
       window.LiaLLM?.setSolutionVariant?.(solutionVariantId, "run-one", 1)
@@ -1845,7 +1864,7 @@
         cacheInfo?.engines?.quality?.estimatedBytes === selectedQualityBytes
       const matches = Boolean(
         window.LiaLLM &&
-        window.LiaLLM.version === "0.5.14" &&
+        window.LiaLLM.version === "0.6.0" &&
         typeof window.LiaLLM.evaluate === "function" &&
         typeof window.LiaLLM.debugReport === "function" &&
         typeof window.LiaLLM.feedbackForResult === "function" &&
@@ -1853,6 +1872,7 @@
         typeof window.LiaLLM.showSolution === "function" &&
         typeof window.LiaLLM.showActivity === "function" &&
         typeof window.LiaLLM.parseReferenceVariants === "function" &&
+        typeof window.LiaLLM.parseCriteriaBlock === "function" &&
         typeof window.LiaLLM.setSolutionVariant === "function" &&
         typeof window.LiaLLM.getSolutionVariant === "function" &&
         typeof window.LiaLLM.clearSolutionVariant === "function" &&
@@ -1874,6 +1894,7 @@
         explicitQuality?.assessmentEngine === "quality" &&
         compactThinkingDisabled?.maxThinkingTimeMs === 0 &&
         referenceVariantParserWorks &&
+        criteriaParserWorks &&
         solutionVariantRegistryIsRunScoped &&
         compactAdvancedRejected &&
         area instanceof HTMLTextAreaElement &&
@@ -1986,6 +2007,8 @@
         positional,
         parsedReferenceVariants,
         referenceVariantParserWorks,
+        parsedCriteriaBlock,
+        criteriaParserWorks,
         solutionVariantRegistryIsRunScoped,
         textareaLivesOnlyInShadow,
         textareaAriaStaysInsideShadow,

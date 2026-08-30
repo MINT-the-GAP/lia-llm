@@ -1,0 +1,105 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>lia-llm criteria calibration</title>
+<script src="../dist/index.js"></script>
+<pre id="output">starting</pre>
+<script>
+const displaySolution =
+  "Leyla hält Finn davon ab, die Dose aufzubrechen, weil sie die Dose unbeschädigt lassen und den Zettel zunächst genau untersuchen möchte. Auf dessen Rückseite entdeckt sie Hinweise, die zu einem passenden Schlüssel führen. Daran zeigt sich, dass Leyla sorgfältig, geduldig und aufmerksam arbeitet; Finn ist anfangs dagegen ungeduldig und möchte so schnell wie möglich zu einem Ergebnis kommen."
+const criteriaSource = [
+  "<!-- lia-llm:criterion -->",
+  "Leyla möchte die Dose nicht beschädigen.",
+  "<!-- lia-llm:criterion -->",
+  "Leyla möchte zunächst den Zettel genau untersuchen.",
+  "<!-- lia-llm:criterion -->",
+  "Auf der Rückseite erkennt sie Hinweise, die zu einem passenden Schlüssel führen.",
+  "<!-- lia-llm:criterion -->",
+  "Leyla arbeitet sorgfältig.",
+  "<!-- lia-llm:criterion -->",
+  "Leyla arbeitet geduldig.",
+  "<!-- lia-llm:criterion -->",
+  "Leyla arbeitet aufmerksam.",
+  "<!-- lia-llm:criterion -->",
+  "Finn ist anfangs ungeduldig.",
+  "<!-- lia-llm:criterion -->",
+  "Finn möchte möglichst schnell zu einem Ergebnis kommen.",
+  "<!-- lia-llm:solution -->",
+  displaySolution
+].join("\n")
+const parsed = window.LiaLLM.parseCriteriaBlock(criteriaSource)
+if (!parsed) throw new Error("Der Kriterienblock wurde nicht erkannt.")
+if (parsed.reference !== displaySolution) {
+  throw new Error("Die sichtbare Fließtext-Musterlösung wurde nicht getrennt.")
+}
+
+const completeAnswer =
+  "Leyla will nicht aufbrechen, weil sie die Dose nicht beschädigen und zunächst den Zettel genau untersuchen möchte. Sie erkennt auf der Rückseite Hinweise, die zu einem passenden Schlüssel führen. Leyla arbeitet deshalb sorgfältig, geduldig und aufmerksam, während Finn anfangs ungeduldig ist und möglichst schnell zu einem Ergebnis kommen möchte."
+const answers = [
+  parsed.reference,
+  completeAnswer,
+  "Als vollständige Antwort formuliere ich: " + completeAnswer,
+  "Um die Dose nicht kaputtzumachen, lässt Leyla sie geschlossen und schaut sich zuerst den Zettel gründlich an. Auf der Rückseite entdeckt sie Zeichen, die zu einem passenden Schlüssel führen. Leyla arbeitet dabei genau, geduldig und aufmerksam. Finn dagegen ist zu Beginn ungeduldig und will rasch ein Ergebnis.",
+  "Leyla verhindert das Aufbrechen, um die Dose zu schützen. Danach sieht sie sich den Zettel an.",
+  "Leyla will die Dose sofort gewaltsam öffnen. Finn hält sie zurück, untersucht den Zettel geduldig und sucht nach dem Schlüssel.",
+  completeAnswer + " Tatsächlich möchte Leyla die Dose jedoch beschädigen, und Finn verhält sich geduldig."
+]
+const expected = [true, true, true, true, false, false, false]
+const compactModelId =
+  "Xenova/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
+
+window.__liaCalibrationDone = false
+window.__liaCalibration = []
+window.__liaCalibrationExpected = expected.length
+;(async () => {
+  try {
+    for (let index = 0; index < answers.length; index += 1) {
+      const result = await window.LiaLLM.evaluate({
+        question:
+          "Warum hält Leyla Finn davon ab, die Blechdose aufzubrechen? Erkläre außerdem, was die unterschiedlichen Reaktionen über ihre Arbeitsweisen zeigen.",
+        answer: answers[index],
+        reference: parsed.reference,
+        criteria: parsed.criteria,
+        assessmentEngine: "compact",
+        criterionThreshold: 0.55,
+        contradictionThreshold: 0.65
+      })
+      const feedback = window.LiaLLM.formatResult(result, "de-DE")
+      const usesExpectedModel =
+        index === 0
+          ? result.model.id === "deterministic-reference-match" &&
+            result.model.task === "deterministic-match"
+          : result.model.id === compactModelId &&
+            result.model.task === "natural-language-inference"
+      const compactFeedbackHasCriteria = parsed.criteria.some(criterion =>
+        feedback.includes(criterion.text)
+      )
+      window.__liaCalibration.push({
+        answer: index + 1,
+        status: result.status,
+        passed: result.passed,
+        expected: expected[index],
+        matches: result.passed === expected[index] && usesExpectedModel,
+        criteria: result.criteria.map(criterion => ({
+          status: criterion.status,
+          entailment: criterion.entailment,
+          neutral: criterion.neutral,
+          contradiction: criterion.contradiction
+        })),
+        compactFeedbackHasCriteria,
+        usesExpectedModel,
+        model: result.model
+      })
+      document.querySelector("#output").textContent = JSON.stringify(
+        window.__liaCalibration,
+        null,
+        2
+      )
+    }
+  } catch (error) {
+    window.__liaCalibrationError =
+      error instanceof Error ? error.stack : String(error)
+  } finally {
+    window.__liaCalibrationDone = true
+  }
+})()
+</script>
