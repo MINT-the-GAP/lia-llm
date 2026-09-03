@@ -170,6 +170,9 @@
       const explicitQuality = window.LiaLLM?.parseMacroOptions(
         "0.66;assessmentengine=QUALITY"
       )
+      const coverage = window.LiaLLM?.parseMacroOptions(
+        "0.55;CoVeRaGe=0.80;assessmentengine=compact"
+      )
       const compactThinkingDisabled = window.LiaLLM?.parseMacroOptions(
         "0.66;assessmentengine=compact;maxthinkingtime=0s"
       )
@@ -1864,7 +1867,7 @@
         cacheInfo?.engines?.quality?.estimatedBytes === selectedQualityBytes
       const matches = Boolean(
         window.LiaLLM &&
-        window.LiaLLM.version === "0.6.0" &&
+        window.LiaLLM.version === "0.6.1" &&
         typeof window.LiaLLM.evaluate === "function" &&
         typeof window.LiaLLM.debugReport === "function" &&
         typeof window.LiaLLM.feedbackForResult === "function" &&
@@ -1884,6 +1887,7 @@
         named?.operator === "erklaeren" &&
         named?.rechtschreibung === false &&
         named?.satzbau === false &&
+        Object.hasOwn(named, "coverage") === false &&
         JSON.stringify(named) === JSON.stringify(positional) &&
         language?.rechtschreibung === true &&
         language?.satzbau === true &&
@@ -1892,6 +1896,9 @@
         extremeThinking?.maxThinkingTokens === 2_048 &&
         explicitCompact?.assessmentEngine === "compact" &&
         explicitQuality?.assessmentEngine === "quality" &&
+        coverage?.passThreshold === 0.55 &&
+        coverage?.coverage === 0.8 &&
+        coverage?.assessmentEngine === "compact" &&
         compactThinkingDisabled?.maxThinkingTimeMs === 0 &&
         referenceVariantParserWorks &&
         criteriaParserWorks &&

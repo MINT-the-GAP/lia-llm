@@ -146,6 +146,7 @@ import {
 } from "../src/quality-evaluator.ts"
 import type {
   Criterion,
+  CriterionInput,
   CriterionResult,
   DebugEnvironment,
   DebugStorageSummary,
@@ -2458,7 +2459,7 @@ test("operators require the real task wording in the public API", () => {
         reference: "Eine vollständige Erklärung.",
         operator: "erklaeren",
       }),
-    /echten Aufgabenwortlaut/u,
+    /Operatoren benötigen den echten Aufgabenwortlaut\. Verwende @LLMQuiz\(\.\.\.\) oder übergib question über die API\./u,
   )
   assert.doesNotThrow(() =>
     normalizeRequest({
@@ -3727,6 +3728,55 @@ test('QualityEvaluator sends correct rebuttals through the model', async () => {
     assert.equal(result.criteria[0]?.judgeDecision, 'pass', answer)
   }
   assert.equal(calls, answers.length)
+})
+
+test("QualityEvaluator suppresses blocking diagnostics after coverage passes", async () => {
+  const outputs = [
+    ...Array(9).fill(
+      '{"decision":"pass","confidence":0.93,"feedback_code":"none","operator_criterion_id":""}',
+    ),
+    '{"decision":"uncertain","confidence":0.70,"feedback_code":"unclear","operator_criterion_id":""}',
+    '{"decision":"fail_incomplete","confidence":0.90,"feedback_code":"incomplete","operator_criterion_id":""}',
+  ]
+  let calls = 0
+  const engine = {
+    interruptGenerate: async () => undefined,
+    chat: { completions: { create: async () => ({
+      choices: [{
+        finish_reason: "stop",
+        message: { content: outputs[calls++] },
+      }],
+    }) } },
+  }
+  const evaluator = new QualityEvaluator()
+  ;(evaluator as unknown as { engine: typeof engine | null }).engine = engine
+
+  const result = await evaluator.evaluate(
+    {
+      question: "Welche Kriterien deckt die Antwort ab?",
+      answer: "Die Testantwort formuliert mehrere passende fachliche Aussagen.",
+      reference: "Zusammenfassende Referenz.",
+      criteria: Array.from({ length: 11 }, (_, index) => ({
+        id: "criterion-" + String(index + 1),
+        text: "Unabhaengiges Kriterium " + String(index + 1) + ".",
+        required: false,
+      })),
+      criterionThreshold: 0.55,
+      passThreshold: 0.8,
+    },
+    { maxThinkingTimeMs: 0 },
+  )
+
+  assert.equal(calls, 11)
+  assert.equal(result.status, "passed")
+  assert.equal(result.passed, true)
+  assert.equal(result.criteria.filter((criterion) => criterion.status === "met").length, 9)
+  assert.equal(
+    result.criteria.filter((criterion) => criterion.status === "uncertain").length,
+    1,
+  )
+  assert.equal(result.diagnostic, undefined)
+  assert.equal(feedbackForResult(result, "de-DE"), null)
 })
 
 test('QualityEvaluator forwards complete alternatives and selects the judged variant', async () => {
@@ -6109,6 +6159,17 @@ test("quality diagnostics use a stable priority and keep style advisory", () => 
     qualityDiagnosticForCriteria([style, offTopic, contentError])?.code,
     "content-error",
   )
+
+  const unclear = result("unclear", "uncertain")
+  unclear.judgeFeedbackCode = "unclear"
+  unclear.judgeConfidence = 0.6
+  assert.deepEqual(qualityDiagnosticForCriteria([unclear, style], true), {
+    code: "too-colloquial",
+    confidence: 0.9,
+    source: "quality",
+    severity: "advisory",
+  })
+  assert.equal(qualityDiagnosticForCriteria([unclear], true), undefined)
 })
 
 test("the compact WASM runtime enables the ONNX worker proxy", () => {
@@ -10042,7 +10103,43 @@ test("solution variant registry validates identifiers and indices", () => {
   clearSolutionVariant(" solution ", " run ")
 })
 
-test("the public version remains pinned exactly to 0.6.0", () => {
+type LLMQuizValidatorRunner = (
+  windowValue: unknown,
+  sendValue: unknown,
+  optionSourceInput: string,
+  questionInput: string,
+  referenceSourceInput: string,
+  answerInput: string,
+) => Promise<void>
+
+function createLLMQuizValidatorRunner(): LLMQuizValidatorRunner {
+  const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8")
+  const macro = readme.match(/\n@LLMQuiz_\n([\s\S]*?)\n@end/u)?.[1]
+  const validatorScript = macro?.match(
+    /<script output="lia-llm-result-@0">\n([\s\S]*?)\n<\/script>/u,
+  )?.[1]
+  assert.ok(validatorScript)
+
+  const executable = validatorScript
+    .replace(/^const optionSource = .*$/mu, "const optionSource = optionSourceInput")
+    .replace(/^const question = .*$/mu, "const question = questionInput")
+    .replace(/^const referenceSource = .*$/mu, "const referenceSource = referenceSourceInput")
+    .replace(/^const answer = .*$/mu, "const answer = answerInput")
+    .replace(/^Promise\.resolve\(\)$/mu, "return Promise.resolve()")
+
+  assert.doesNotMatch(executable, /@'(?:1|2|3|input)/u)
+  return new Function(
+    "window",
+    "send",
+    "optionSourceInput",
+    "questionInput",
+    "referenceSourceInput",
+    "answerInput",
+    executable,
+  ) as LLMQuizValidatorRunner
+}
+
+test("the public version remains pinned exactly to 0.6.1", () => {
   const packageJson = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   ) as { version?: string }
@@ -10052,11 +10149,11 @@ test("the public version remains pinned exactly to 0.6.0", () => {
   const entry = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8")
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8")
 
-  assert.equal(packageJson.version, "0.6.0")
-  assert.equal(packageLock.version, "0.6.0")
-  assert.equal(packageLock.packages?.[""]?.version, "0.6.0")
-  assert.match(entry, /const VERSION = "0\.6\.0"/u)
-  assert.match(readme, /^version:\s+0\.6\.0$/mu)
+  assert.equal(packageJson.version, "0.6.1")
+  assert.equal(packageLock.version, "0.6.1")
+  assert.equal(packageLock.packages?.[""]?.version, "0.6.1")
+  assert.match(entry, /const VERSION = "0\.6\.1"/u)
+  assert.match(readme, /^version:\s+0\.6\.1$/mu)
   assert.match(readme, /^script:\s+\.\/dist\/index\.js$/mu)
   assert.doesNotMatch(
     readme,
@@ -10065,32 +10162,93 @@ test("the public version remains pinned exactly to 0.6.0", () => {
   )
 })
 
-test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper", () => {
+test("LLMQuiz exposes a canonical wrapper and a compatible question alias", () => {
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8")
+  const operatorDocs = readFileSync(
+    new URL("../docs/operatoren.md", import.meta.url),
+    "utf8",
+  )
   const publicDefinitions = readme.match(/^@LLMQuiz[^_\n]*:/gmu) ?? []
   assert.deepEqual(publicDefinitions, ["@LLMQuiz:", "@LLMQuiz.question:"])
   assert.match(
     readme,
-    /^@LLMQuiz: @LLMQuiz_\(@uid,@0,```LiaScript-Freitextaufgabe```,```@1```\)$/mu,
+    /^@LLMQuiz: @LLMQuiz_\(@uid,@0,```@1```,```@2```\)$/mu,
   )
   assert.match(
     readme,
     /^@LLMQuiz\.question: @LLMQuiz_\(@uid,@0,```@1```,```@2```\)$/mu,
   )
+  const courseBodyStart = readme.indexOf("\n# lia-llm")
+  assert.ok(courseBodyStart >= 0)
+  const courseBody = readme.slice(courseBodyStart)
+  assert.doesNotMatch(courseBody, /@LLMQuiz\.question/u)
+  assert.doesNotMatch(operatorDocs, /@LLMQuiz\.question/u)
+  assert.doesNotMatch(readme, /@LLMQuiz\([^,\n)]*\)/u)
   assert.match(
     readme,
-    /@LLMQuiz\.question\(0\.66;solution=1;feedback=1,`Beschreibe den Verlauf\.`\)/u,
+    /@LLMQuiz\(0\.66;solution=1;feedback=1,`Beschreibe den Verlauf\.`\)/u,
   )
   assert.match(
     readme,
-    /@LLMQuiz\.question\(0\.66;1;1;beschreiben,`Beschreibe den Verlauf\.`\)/u,
+    /@LLMQuiz\(0\.66;1;1;beschreiben,`Beschreibe den Verlauf\.`\)/u,
   )
   assert.match(
     readme,
-    /^```text @LLMQuiz\.question\(0\.66;solution=1;feedback=1;assessmentengine=quality;operator=erklaeren;maxthinkingtime=15s;maxthinkingtokens=medium,`Erkläre, warum Eis auf flüssigem Wasser schwimmt\.`\)$/mu,
+    /^```text @LLMQuiz\(0\.66;solution=1;feedback=1;assessmentengine=quality;operator=erklaeren;maxthinkingtime=15s;maxthinkingtokens=medium,`Erkläre, warum Eis auf flüssigem Wasser schwimmt\.`\)$/mu,
   )
-  assert.doesNotMatch(readme, /^```text\r?\n@LLMQuiz(?:\.question)?\(/mu)
-  assert.doesNotMatch(readme, /@LLMQuiz\.(?:compact|withFeedback|noSolution)/u)
+  assert.doesNotMatch(
+    readme,
+    /^\s*```\s*text\s*\r?\n\s*@LLMQuiz\(/mu,
+  )
+  assert.doesNotMatch(
+    courseBody,
+    /@LLMQuiz\.(?:compact|withFeedback|noSolution)/u,
+  )
+
+  const usage = readme.match(/\n## Verwendung\n([\s\S]*?)\n## /u)?.[1]
+  assert.ok(usage)
+  assert.match(usage, /### Aufruf und Optionen/u)
+  assert.match(
+    usage,
+    /@LLMQuiz\(Schwellenwert\[;Optionen\],`Aufgabenwortlaut`\)/u,
+  )
+  const optionRows = usage
+    .split("\n")
+    .filter((line) => line.startsWith("| `"))
+    .map((line) => line.split("|").slice(1, 4).map((cell) => cell.trim()))
+  assert.deepEqual(optionRows, [
+    [
+      "`Schwellenwert`",
+      "Dezimalzahl von `0` bis `1`, mit Punkt",
+      "Pflichtangabe; empfohlen meist `0.66`, bei atomaren Kriterien `0.55`",
+    ],
+    ["`solution`", "`0`, `1`, `false`, `true`", "`true`"],
+    ["`feedback`", "`0`, `1`, `false`, `true`", "`false`"],
+    [
+      "`operator`",
+      "`erklaeren`, `erlaeutern`, `beschreiben`, `begruenden`, `vergleichen`, `beurteilen`",
+      "nicht gesetzt",
+    ],
+    [
+      "`coverage`",
+      "Dezimalzahl mit `0 < coverage <= 1`, mit Punkt",
+      "nicht gesetzt",
+    ],
+    ["`assessmentengine`", "`compact`, `quality`", "automatisch"],
+    ["`Rechtschreibung`", "`0`, `1`, `false`, `true`", "`false`"],
+    ["`Satzbau`", "`0`, `1`, `false`, `true`", "`false`"],
+    [
+      "`maxthinkingtime`",
+      "`0s`, `5s`, `10s`, `15s`, `20s`, `30s`",
+      "im adaptiven Zweitlauf `15s`",
+    ],
+    [
+      "`maxthinkingtokens`",
+      "`low`, `medium`, `high`, `ultra`, `extreme`",
+      "im adaptiven Zweitlauf `medium`",
+    ],
+  ])
+  assert.ok(usage.indexOf("### Aufruf und Optionen") < usage.indexOf("Aufgabe 1:"))
 
   assert.match(readme, /\.feedbackForResult\?\.\(result, "de-DE"\)/u)
   assert.match(readme, /\.feedbackForError\?\.\(error, "de-DE"\)/u)
@@ -10136,10 +10294,6 @@ test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper
   assert.match(
     readme,
     /criteriaBlock = window\.LiaLLM\.parseCriteriaBlock\(referenceSource\) \?\? null/u,
-  )
-  assert.equal(
-    (readme.match(/criteria:\s*criteriaBlock\?\.criteria/gu) ?? []).length,
-    2,
   )
   assert.match(readme, /if \(criteriaBlock && options\.operator\)/u)
   assert.match(
@@ -10224,10 +10378,6 @@ test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper
   )
   assert.match(readme, /return window\.LiaLLM\.evaluate\(\{\s*question,/u)
   assert.doesNotMatch(readme, /question:\s*"LiaScript-Freitextaufgabe"/u)
-  assert.match(
-    readme,
-    /Operatoren benötigen den echten Aufgabenwortlaut\. Verwende @LLMQuiz\.question/u,
-  )
   assert.doesNotMatch(readme, /feedbackEnabled && !result\.passed/u)
   assert.doesNotMatch(readme, /send\.lia\(feedback\.message, \[\], false\)/u)
 
@@ -10309,6 +10459,231 @@ test("LLMQuiz exposes a legacy wrapper and an explicit-question operator wrapper
   )?.[1]
   assert.ok(solutionScript)
   assert.doesNotThrow(() => new Function(solutionScript))
+})
+
+test("LLMQuiz forwards its explicit question and operator", async () => {
+  const run = createLLMQuizValidatorRunner()
+  const requests: EvaluationRequest[] = []
+  const sent: unknown[] = []
+  const question = "Erkläre, warum Eis auf flüssigem Wasser schwimmt."
+
+  await run(
+    {
+      LiaLLM: {
+        version: "0.6.1",
+        parseMacroOptions,
+        parseCriteriaBlock,
+        parseReferenceVariants,
+        evaluate: async (request: EvaluationRequest) => {
+          requests.push(request)
+          return evaluation("failed", [])
+        },
+        feedbackForError: () => null,
+        showFeedback: () => undefined,
+        showActivity: () => undefined,
+        clearSolutionVariant: () => undefined,
+      },
+    },
+    {
+      handle: () => undefined,
+      lia: (value: unknown) => {
+        sent.push(value)
+      },
+    },
+    "0.66;solution=0;operator=erklaeren",
+    question,
+    "Eis besitzt eine geringere Dichte als flüssiges Wasser.",
+    "Eine hinreichend lange Antwort für die Weitergabeprüfung.",
+  )
+
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0]?.question, question)
+  assert.equal(requests[0]?.operator, "erklaeren")
+  assert.deepEqual(sent, ["false"])
+})
+
+test("LLMQuiz rejects coverage without a criteria block before evaluation", async () => {
+  const run = createLLMQuizValidatorRunner()
+  const sent: Array<[unknown, unknown?, unknown?]> = []
+  let evaluationCalls = 0
+
+  await run(
+    {
+      LiaLLM: {
+        version: "0.6.1",
+        parseMacroOptions,
+        parseCriteriaBlock,
+        parseReferenceVariants,
+        evaluate: async () => {
+          evaluationCalls += 1
+          return evaluation("passed", [])
+        },
+        feedbackForError: () => null,
+        showFeedback: () => undefined,
+        showActivity: () => undefined,
+      },
+    },
+    {
+      handle: () => undefined,
+      lia: (value: unknown, detail?: unknown, correct?: unknown) => {
+        sent.push([value, detail, correct])
+      },
+    },
+    "0.55;coverage=0.80",
+    "Testfrage",
+    "Holistische Referenz.",
+    "Eine hinreichend lange Testantwort.",
+  )
+
+  assert.equal(evaluationCalls, 0)
+  assert.equal(sent.length, 1)
+  assert.match(String(sent[0]?.[0]), /coverage.*Kriterienblock/iu)
+  assert.deepEqual(sent[0]?.slice(1), [[], false])
+})
+
+test("LLMQuiz preserves required criteria when coverage is omitted", async () => {
+  const run = createLLMQuizValidatorRunner()
+  const criteriaSource = [
+    "<!-- lia-llm:criterion -->",
+    "Erstes Kriterium.",
+    "<!-- lia-llm:criterion -->",
+    "Zweites Kriterium.",
+  ].join("\n")
+  const criteriaBlock = parseCriteriaBlock(criteriaSource)
+  assert.ok(criteriaBlock)
+  const requests: EvaluationRequest[] = []
+
+  await run(
+    {
+      LiaLLM: {
+        version: "0.6.1",
+        parseMacroOptions,
+        parseCriteriaBlock: () => criteriaBlock,
+        parseReferenceVariants,
+        evaluate: async (request: EvaluationRequest) => {
+          requests.push(request)
+          return evaluation("passed", [])
+        },
+        feedbackForResult: () => null,
+        feedbackForError: () => null,
+        showFeedback: () => undefined,
+        showActivity: () => undefined,
+        setSolutionVariant: () => undefined,
+      },
+    },
+    {
+      handle: () => undefined,
+      lia: () => undefined,
+    },
+    "0.55;solution=0",
+    "Testfrage",
+    criteriaSource,
+    "Eine hinreichend lange Testantwort.",
+  )
+
+  assert.equal(requests.length, 1)
+  assert.strictEqual(requests[0]?.criteria, criteriaBlock.criteria)
+  assert.equal(criteriaBlock.criteria.every((criterion) => criterion.required), true)
+  assert.equal(requests[0]?.criterionThreshold, 0.55)
+  assert.equal(Object.hasOwn(requests[0]!, "passThreshold"), false)
+})
+
+test("LLMQuiz shares cloned coverage criteria and thresholds with language analysis", async () => {
+  const run = createLLMQuizValidatorRunner()
+  const criteriaSource = Array.from({ length: 11 }, (_, index) =>
+    [
+      "<!-- lia-llm:criterion -->",
+      "Kriterium " + String(index + 1) + ".",
+    ].join("\n"),
+  ).join("\n")
+  const criteriaBlock = parseCriteriaBlock(criteriaSource)
+  assert.ok(criteriaBlock)
+
+  const contentRequests: EvaluationRequest[] = []
+  const languageRequests: EvaluationRequest[] = []
+  const sent: unknown[] = []
+  let languageCheck:
+    | { run(signal: AbortSignal): Promise<unknown> }
+    | undefined
+
+  await run(
+    {
+      LiaLLM: {
+        version: "0.6.1",
+        parseMacroOptions,
+        parseCriteriaBlock: () => criteriaBlock,
+        parseReferenceVariants,
+        evaluate: async (request: EvaluationRequest) => {
+          contentRequests.push(request)
+          return evaluation("passed", [])
+        },
+        evaluateLanguage: async (request: EvaluationRequest) => {
+          languageRequests.push(request)
+          return {
+            status: "completed",
+            wordCount: 61,
+            spelling: true,
+            syntax: true,
+            syntaxErrors: 1,
+          }
+        },
+        feedbackForResult: () => null,
+        feedbackForError: () => null,
+        showFeedback: (
+          _id: string,
+          _message: string,
+          options?: {
+            languageCheck?: { run(signal: AbortSignal): Promise<unknown> }
+          },
+        ) => {
+          if (options?.languageCheck) languageCheck = options.languageCheck
+        },
+        showActivity: () => undefined,
+        setSolutionVariant: () => undefined,
+      },
+    },
+    {
+      handle: () => undefined,
+      lia: (value: unknown) => {
+        sent.push(value)
+      },
+    },
+    "0.55;coverage=0.80;solution=1;feedback=1;assessmentengine=quality;Rechtschreibung=1;Satzbau=1",
+    "Testfrage",
+    criteriaSource,
+    "Eine hinreichend lange Testantwort.",
+  )
+
+  assert.equal(contentRequests.length, 1)
+  const contentRequest = contentRequests[0]!
+  assert.equal(contentRequest.criterionThreshold, 0.55)
+  assert.equal(contentRequest.passThreshold, 0.8)
+  assert.equal(Object.hasOwn(contentRequest, "passThreshold"), true)
+  assert.equal(contentRequest.languageAnalysis, undefined)
+  assert.ok(Array.isArray(contentRequest.criteria))
+  const preparedCriteria = contentRequest.criteria as CriterionInput[]
+  assert.notStrictEqual(preparedCriteria, criteriaBlock.criteria)
+  assert.equal(preparedCriteria.length, 11)
+  assert.equal(preparedCriteria.every((criterion) => criterion.required === false), true)
+  assert.equal(criteriaBlock.criteria.every((criterion) => criterion.required), true)
+  for (let index = 0; index < preparedCriteria.length; index += 1) {
+    assert.notStrictEqual(preparedCriteria[index], criteriaBlock.criteria[index])
+  }
+  assert.deepEqual(sent, ["true"])
+
+  assert.ok(languageCheck)
+  await languageCheck.run(new AbortController().signal)
+
+  assert.equal(languageRequests.length, 1)
+  const languageRequest = languageRequests[0]!
+  assert.strictEqual(languageRequest.criteria, preparedCriteria)
+  assert.equal(languageRequest.criterionThreshold, 0.55)
+  assert.equal(languageRequest.passThreshold, 0.8)
+  assert.deepEqual(languageRequest.languageAnalysis, {
+    spelling: true,
+    syntax: true,
+  })
+  assert.deepEqual(sent, ["true"])
 })
 
 test("solution=1 renders only the authored flowing criteria solution", () => {
@@ -10612,6 +10987,53 @@ test("aggregateCriteria enforces required criteria", () => {
   assert.equal(assessment.status, "failed")
 })
 
+test("aggregateCriteria applies 0.80 coverage to eleven optional criteria", () => {
+  const assess = (
+    statuses: CriterionResult["status"][],
+  ) => aggregateCriteria(
+    statuses.map((status, index) => result(`criterion-${index + 1}`, status)),
+    0.8,
+  )
+
+  const passed = assess([
+    ...Array<CriterionResult["status"]>(9).fill("met"),
+    ...Array<CriterionResult["status"]>(2).fill("missed"),
+  ])
+  assert.equal(passed.status, "passed")
+  assert.equal(passed.passed, true)
+
+  const passedWithUncertain = assess([
+    ...Array<CriterionResult["status"]>(9).fill("met"),
+    "uncertain",
+    "missed",
+  ])
+  assert.equal(passedWithUncertain.status, "passed")
+  assert.equal(passedWithUncertain.passed, true)
+
+  const failed = assess([
+    ...Array<CriterionResult["status"]>(8).fill("met"),
+    ...Array<CriterionResult["status"]>(3).fill("missed"),
+  ])
+  assert.equal(failed.status, "failed")
+  assert.equal(failed.passed, false)
+
+  const uncertain = assess([
+    ...Array<CriterionResult["status"]>(8).fill("met"),
+    "uncertain",
+    ...Array<CriterionResult["status"]>(2).fill("missed"),
+  ])
+  assert.equal(uncertain.status, "uncertain")
+  assert.equal(uncertain.passed, false)
+
+  const contradicted = assess([
+    ...Array<CriterionResult["status"]>(9).fill("met"),
+    "missed",
+    "contradicted",
+  ])
+  assert.equal(contradicted.status, "failed")
+  assert.equal(contradicted.passed, false)
+})
+
 test("quiz input encoding preserves textarea paragraphs losslessly", () => {
   const encoded = toQuizInputValue("Erster Absatz.\r\n\r\nZweiter Absatz.")
   assert.equal(encoded, "Erster Absatz.\u2028\u2028Zweiter Absatz.")
@@ -10671,6 +11093,32 @@ test("parseMacroOptions supports named and positional quiz options", () => {
     rechtschreibung: false,
     satzbau: false,
   })
+})
+
+test("parseMacroOptions supports explicit case-insensitive coverage", () => {
+  assert.deepEqual(
+    parseMacroOptions(
+      "0.55;CoVeRaGe=0.80;solution=1;feedback=1;assessmentengine=quality",
+    ),
+    {
+      passThreshold: 0.55,
+      coverage: 0.8,
+      solution: true,
+      feedback: true,
+      operator: null,
+      rechtschreibung: false,
+      satzbau: false,
+      assessmentEngine: "quality",
+    },
+  )
+
+  const legacy = parseMacroOptions("0.55;solution=1")
+  assert.equal(legacy.coverage, undefined)
+  assert.equal(Object.hasOwn(legacy, "coverage"), false)
+
+  const explicitFullCoverage = parseMacroOptions("0.55;coverage=1")
+  assert.equal(explicitFullCoverage.coverage, 1)
+  assert.equal(Object.hasOwn(explicitFullCoverage, "coverage"), true)
 })
 
 test('parseMacroOptions supports explicit thinking limits and presets', () => {
@@ -10861,6 +11309,23 @@ test("parseMacroOptions rejects ambiguous or invalid input", () => {
   assert.throws(() => parseMacroOptions("0.66;solution=on"), /0, 1, true oder false/u)
   assert.throws(() => parseMacroOptions("1.01"), /zwischen 0 und 1/u)
   assert.throws(() => parseMacroOptions("0.66;"), /Leere Makrooptionen/u)
+})
+
+test("parseMacroOptions rejects invalid, empty, duplicate, and positional coverage", () => {
+  for (const value of ["", "0", "-0.1", "1.01", "NaN", "0,80"]) {
+    assert.throws(
+      () => parseMacroOptions(`0.55;coverage=${value}`),
+      /coverage.*gr\u00f6\u00dfer als 0.*h\u00f6chstens 1/iu,
+    )
+  }
+  assert.throws(
+    () => parseMacroOptions("0.55;coverage=0.80;COVERAGE=0.90"),
+    /coverage.*mehrfach/iu,
+  )
+  assert.throws(
+    () => parseMacroOptions("0.55;1;1;erklaeren;0.80"),
+    /Kurzform/u,
+  )
 })
 
 test("download policy asks before mobile or uncertain large downloads", () => {

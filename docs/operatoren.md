@@ -99,29 +99,28 @@ bildet dieselbe Reihenfolge direkt ab, ohne diese Zahlen als konfigurierbare Sco
 - Der echte Aufgabenwortlaut wird zusammen mit dem expliziten Operator ausgewertet. Aus dem
   Operatorverb allein werden weder Gegenstand und Umfang der Aufgabe noch Zahlen, Kriterien oder
   eine Perspektive erfunden.
-- Im dokumentierten Operator-Makropfad prüft das Kompaktmodell den Fachinhalt vor, entscheidet aber
-  nicht endgültig über die Operatorerfüllung. Ein inhaltlicher Kompakt-Pass wird dort durch das
-  Qualitätsmodell überprüft. Nur ein direkter API-Aufruf mit ausdrücklich gesetztem
-  `assessmentEngine: "compact"` bleibt vollständig bei Compact und stuft einen solchen Befund
-  konservativ zu `uncertain` herab.
+- Im dokumentierten Operator-Makropfad prüft das Qualitätsmodell direkt, sobald es bereit ist.
+  Während es noch lädt oder wenn ein Rückfall nötig ist, kann das Kompaktmodell den Fachinhalt
+  vorprüfen, aber nicht endgültig über die Operatorerfüllung entscheiden. Auch ein direkter
+  API-Aufruf mit ausdrücklich gesetztem `assessmentEngine: "compact"` stuft den Gesamtbefund deshalb konservativ zu
+  `uncertain` herab.
 - Meldet das Qualitätsmodell `operator-not-met`, ist der Befund unabhängig von einer
   anteiligen Bestehensgrenze blockierend.
 - Zu `operator-not-met` muss das Modell eine Kriteriums-ID aus dem aktiven Profil
   zurückgeben. Die Laufzeit validiert diese ID und zeigt bei mehreren Befunden den
   kriterienspezifischen Hinweis mit der höchsten Priorität.
-- Ist die Qualitätsprüfung nicht verfügbar, wird ein sonst bestandener Kompaktbefund nicht
-  freigegeben. Der technische Befund `operator-check-unavailable` unterscheidet diesen
-  Fall ausdrücklich von einem nachweislich nicht erfüllten Operator. Ein bereits vom
-  Kompaktmodell erkannter Inhaltsfehler oder unzureichender Inhalt bleibt der vorrangige Befund.
+- Ist die Qualitätsprüfung nicht verfügbar, wird ein Kompaktbefund unabhängig von dessen
+  Inhaltsstatus nicht als endgültiges Fach- und Operatorurteil freigegeben. Das Ergebnis bleibt
+  `uncertain`; der technische Befund `operator-check-unavailable` unterscheidet diesen Fall
+  ausdrücklich von einem nachweislich nicht erfüllten Operator.
 - Operatoren werden nicht pauschal einem Anforderungsbereich zugeordnet. Eine solche Zuordnung
   hängt von Aufgabe, Fach, Jahrgang und erwarteter Bearbeitungstiefe ab.
 
 ## Laufzeit und Grenzen
 
 Autoren setzen genau ein Profil explizit über `operator=...` und übergeben den
-Aufgabenwortlaut mit `@LLMQuiz.question(...)`. Eine automatische Erkennung aus dem
-Aufgabentext findet nicht statt. Die Legacy-Form `@LLMQuiz(...)` bleibt für Aufgaben ohne
-Operator verfügbar.
+Aufgabenwortlaut als zweiten Parameter mit `@LLMQuiz(Optionen,Aufgabenwortlaut)`. Eine
+automatische Erkennung aus dem Aufgabentext findet nicht statt.
 
 Die sechs aktiven Profile prüfen textuelle Antwortprodukte. Rein grafische Leistungen wie
 `zeichnen`, `skizzieren` oder `grafisch_darstellen` werden ohne

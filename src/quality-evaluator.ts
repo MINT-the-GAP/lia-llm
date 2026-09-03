@@ -1881,8 +1881,10 @@ const QUALITY_DIAGNOSTIC_PRIORITY: readonly Exclude<
 
 export function qualityDiagnosticForCriteria(
   criteria: readonly CriterionResult[],
+  assessmentPassed = false,
 ): EvaluationDiagnostic | undefined {
   for (const code of QUALITY_DIAGNOSTIC_PRIORITY) {
+    if (assessmentPassed && code !== "too-colloquial") continue
     const matching = criteria.filter(
       (criterion) =>
         (criterion.judgeFeedbackCode === "operator-not-met" &&
@@ -4311,7 +4313,10 @@ export class QualityEvaluator {
         criteria,
         normalized.operator !== undefined,
       )
-      const diagnostic = qualityDiagnosticForCriteria(criteria)
+      const diagnostic = qualityDiagnosticForCriteria(
+        criteria,
+        assessment.passed,
+      )
       let languageAnalysis: LanguageAnalysisResult | undefined
       if (normalized.languageAnalysis) {
         try {

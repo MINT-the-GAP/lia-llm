@@ -398,7 +398,7 @@ export function normalizeRequest(request: EvaluationRequest): NormalizedEvaluati
       LEGACY_MACRO_QUESTION.toLocaleLowerCase("de-DE")
   ) {
     throw new Error(
-      "Operatoren benötigen den echten Aufgabenwortlaut. Verwende @LLMQuiz.question(...) oder übergib question über die API.",
+      "Operatoren benötigen den echten Aufgabenwortlaut. Verwende @LLMQuiz(...) oder übergib question über die API.",
     )
   }
   if (!reference) throw new Error("Die Musterlösung fehlt.")

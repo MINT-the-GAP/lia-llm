@@ -9,6 +9,7 @@ import {
 
 export interface LLMQuizMacroOptions {
   passThreshold: number
+  coverage?: number
   solution: boolean
   feedback: boolean
   operator: string | null
@@ -40,6 +41,22 @@ function parsePassThreshold(value: string): number {
     throw new Error("Die Bestehensgrenze muss zwischen 0 und 1 liegen.")
   }
   return threshold
+}
+
+function parseCoverageOption(value: string): number {
+  if (!DECIMAL_PATTERN.test(value)) {
+    throw new Error(
+      `Die Option coverage erwartet eine Dezimalzahl mit Punkt größer als 0 und höchstens 1; erhalten wurde "${value || "(leer)"}".`,
+    )
+  }
+
+  const coverage = Number(value)
+  if (!Number.isFinite(coverage) || coverage <= 0 || coverage > 1) {
+    throw new Error(
+      `Die Option coverage muss größer als 0 und höchstens 1 sein; erhalten wurde "${value}".`,
+    )
+  }
+  return coverage
 }
 
 function parseBooleanOption(
@@ -173,7 +190,7 @@ export function parseMacroOptions(source: string): LLMQuizMacroOptions {
   const seen = new Set<string>()
   for (const part of parts) {
     const match =
-      /^(solution|feedback|operator|rechtschreibung|satzbau|maxthinkingtime|maxthinkingtokens|assessmentengine)\s*=\s*(\S+)$/iu.exec(
+      /^(solution|feedback|operator|rechtschreibung|satzbau|maxthinkingtime|maxthinkingtokens|assessmentengine|coverage)\s*=\s*(\S*)$/iu.exec(
         part,
       )
     if (!match) {
@@ -189,6 +206,7 @@ export function parseMacroOptions(source: string): LLMQuizMacroOptions {
       | "maxthinkingtime"
       | "maxthinkingtokens"
       | "assessmentengine"
+      | "coverage"
     if (seen.has(name)) {
       throw new Error(`Die Makrooption ${name} wurde mehrfach angegeben.`)
     }
@@ -201,6 +219,8 @@ export function parseMacroOptions(source: string): LLMQuizMacroOptions {
       options.maxThinkingTokens = parseThinkingTokensOption(match[2]!)
     } else if (name === "assessmentengine") {
       options.assessmentEngine = parseAssessmentEngineOption(match[2]!)
+    } else if (name === "coverage") {
+      options.coverage = parseCoverageOption(match[2]!)
     } else {
       options[name] = parseBooleanOption(name, match[2]!)
     }

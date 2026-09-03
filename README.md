@@ -1,6 +1,6 @@
 <!--
 author:      MINT-the-GAP, Martin Lommatzsch
-version:     0.6.0
+version:     0.6.1
 language:    de
 narrator:    Deutsch Female
 comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
@@ -22,7 +22,7 @@ attribute:   [WebLLM](https://webllm.mlc.ai/docs/) by MLC is licensed under
              by Street Side Software are licensed under
              [MIT](https://github.com/streetsidesoftware/cspell/blob/main/LICENSE).
 
-@LLMQuiz: @LLMQuiz_(@uid,@0,```LiaScript-Freitextaufgabe```,```@1```)
+@LLMQuiz: @LLMQuiz_(@uid,@0,```@1```,```@2```)
 @LLMQuiz.question: @LLMQuiz_(@uid,@0,```@1```,```@2```)
 
 @LLMQuiz_
@@ -42,6 +42,8 @@ let finished = false
 let feedbackEnabled = false
 let referenceVariants = []
 let criteriaBlock = null
+let evaluationCriteria
+let evaluationThresholds = null
 let quizOptions = null
 
 window.LiaLLM?.showFeedback?.(feedbackId, "")
@@ -116,13 +118,31 @@ Promise.resolve()
     if (!window.LiaLLM) {
       throw new Error("lia-llm konnte nicht geladen werden.")
     }
-    if (window.LiaLLM.version !== "0.6.0") {
-      throw new Error(`lia-llm 0.6.0 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
+    if (window.LiaLLM.version !== "0.6.1") {
+      throw new Error(`lia-llm 0.6.1 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
     }
 
     const options = window.LiaLLM.parseMacroOptions(optionSource)
     quizOptions = options
     criteriaBlock = window.LiaLLM.parseCriteriaBlock(referenceSource) ?? null
+    if (options.coverage !== undefined && !criteriaBlock) {
+      throw new Error(
+        "Die Option coverage ist nur mit einem Kriterienblock zulässig."
+      )
+    }
+    evaluationCriteria =
+      options.coverage === undefined
+        ? criteriaBlock?.criteria
+        : criteriaBlock.criteria.map(criterion => ({
+            ...criterion,
+            required: false
+          }))
+    evaluationThresholds = {
+      criterionThreshold: options.passThreshold,
+      ...(options.coverage !== undefined
+        ? { passThreshold: options.coverage }
+        : {})
+    }
     referenceVariants = window.LiaLLM.parseReferenceVariants(
       criteriaBlock?.reference ?? referenceSource
     )
@@ -132,12 +152,6 @@ Promise.resolve()
         "Der atomare Aussagenabgleich prüft Inhalte ohne technischen Operator. Entferne operator=...; das Operatorwort darf im Aufgabenwortlaut stehen bleiben."
       )
     }
-    if (options.operator && question === "LiaScript-Freitextaufgabe") {
-      throw new Error(
-        "Operatoren benötigen den echten Aufgabenwortlaut. Verwende @LLMQuiz.question(...)."
-      )
-    }
-
     return window.LiaLLM.evaluate({
       question,
       answer,
@@ -145,8 +159,8 @@ Promise.resolve()
       referenceVariants: referenceVariants.slice(1),
       assessmentEngine: options.assessmentEngine,
       operator: options.operator ?? undefined,
-      criteria: criteriaBlock?.criteria,
-      criterionThreshold: options.passThreshold
+      criteria: evaluationCriteria,
+      ...evaluationThresholds
     }, {
       signal: evaluationController.signal,
       maxThinkingTimeMs: options.maxThinkingTimeMs,
@@ -211,8 +225,8 @@ Promise.resolve()
                 referenceVariants: referenceVariants.slice(1),
                 assessmentEngine: "quality",
                 operator: quizOptions.operator ?? undefined,
-                criteria: criteriaBlock?.criteria,
-                criterionThreshold: quizOptions.passThreshold,
+                criteria: evaluationCriteria,
+                ...evaluationThresholds,
                 languageAnalysis: {
                   spelling: quizOptions.rechtschreibung,
                   syntax: quizOptions.satzbau
@@ -297,9 +311,8 @@ if (solutionResult === "true" && solutionOptions?.solution) {
 
     --{{0}}--
 `lia-llm` ergänzt ein normales LiaScript-Freitextquiz um eine lokale, semantische
-Auswertung anhand einer Musterlösung. Für neue Aufgaben ist
-`@LLMQuiz.question(Optionen,Aufgabenwortlaut)` das empfohlene öffentliche Makro.
-`@LLMQuiz(...)` bleibt für ältere Aufgaben ohne Operator erhalten.
+Auswertung anhand einer Musterlösung. Dafür steht das öffentliche Makro
+`@LLMQuiz(Optionen,Aufgabenwortlaut)` zur Verfügung.
 
 Die vollständige Antwort wird im Zusammenhang mit der vollständigen Musterlösung betrachtet.
 Synonyme, Umschreibungen und andere Satzstrukturen dürfen dieselbe Aussage ausdrücken. Das stärkere
@@ -333,14 +346,57 @@ Die Musterlösung wird in der gerenderten Aufgabe zunächst nicht angezeigt. Mit
 erscheint sie erst, nachdem die Antwort als richtig bewertet wurde.
 Bei der Anzeige wird ihr Inhalt vollständig als LiaScript neu geparst. Dadurch werden insbesondere
 Markdown-Strukturen sowie Inline- und Blockformeln in TeX gerendert und nicht als Quelltext gezeigt.
-Bei `@LLMQuiz.question` wird der echte Aufgabenwortlaut zusätzlich an die Auswertung übergeben.
+Der echte Aufgabenwortlaut wird als zweiter Makroparameter an die Auswertung übergeben.
+
+### Aufruf und Optionen
+
+Der Makroaufruf steht in derselben Zeile wie die öffnenden drei Backticks des `text`-Blocks. Die
+Grundform lautet ``@LLMQuiz(Schwellenwert[;Optionen],`Aufgabenwortlaut`)``.
+
+Der erste Makroparameter beginnt immer mit dem verpflichtenden Schwellenwert. Weitere Optionen
+folgen darin, jeweils durch ein Semikolon getrennt. Der zweite Makroparameter ist der vollständige
+Aufgabenwortlaut. Backticks schützen ihn vor einer versehentlichen Trennung an Kommas und sind
+deshalb auch bei kurzen Aufgaben empfehlenswert. Der Inhalt des anschließenden `text`-Blocks ist
+die Musterlösung oder der Kriterienblock.
+
+| Eintrag | Zulässige Werte | Standard | Bedeutung |
+| --- | --- | --- | --- |
+| `Schwellenwert` | Dezimalzahl von `0` bis `1`, mit Punkt | Pflichtangabe; empfohlen meist `0.66`, bei atomaren Kriterien `0.55` | Mindestkonfidenz für die gesamte Musterlösung beziehungsweise für jedes einzelne Kriterium; keine Gesamtquote |
+| `solution` | `0`, `1`, `false`, `true` | `true` | Zeigt die Musterlösung nach einer richtigen Antwort an; bei `false` bleibt sie immer verborgen |
+| `feedback` | `0`, `1`, `false`, `true` | `false` | Schaltet eine kurze, priorisierte Rückmeldung ein; für die Sprachoptionen muss `feedback` aktiv sein |
+| `operator` | `erklaeren`, `erlaeutern`, `beschreiben`, `begruenden`, `vergleichen`, `beurteilen` | nicht gesetzt | Prüft zusätzlich die verlangte Antwortform; nicht mit einem Kriterienblock oder ausdrücklich gewähltem `compact` kombinierbar |
+| `coverage` | Dezimalzahl mit `0 < coverage <= 1`, mit Punkt | nicht gesetzt | Aktiviert nur bei einem Kriterienblock eine gewichtete Gesamtquote; ohne die Option bleiben alle Kriterien einzeln erforderlich, ein Widerspruch bleibt immer ein Veto |
+| `assessmentengine` | `compact`, `quality` | automatisch | Wählt die Engine der Inhaltsprüfung; normale Prüfungen verwenden `compact`, Operator- oder positive Thinking-Vorgaben `quality` |
+| `Rechtschreibung` | `0`, `1`, `false`, `true` | `false` | Bietet nach der Inhaltsprüfung eine getrennte Prüfung von Rechtschreibung und Zeichensetzung an; benötigt `feedback=1` |
+| `Satzbau` | `0`, `1`, `false`, `true` | `false` | Bietet nach der Inhaltsprüfung eine getrennte Prüfung von Grammatik und Satzbau an; benötigt `feedback=1` |
+| `maxthinkingtime` | `0s`, `5s`, `10s`, `15s`, `20s`, `30s` | im adaptiven Zweitlauf `15s` | Begrenzt die zusätzliche Denkzeit; `0s` deaktiviert den Thinking-Lauf |
+| `maxthinkingtokens` | `low`, `medium`, `high`, `ultra`, `extreme` | im adaptiven Zweitlauf `medium` | Begrenzt das Thinking-Ausgabebudget auf 256, 512, 768, 1024 beziehungsweise 2048 Tokens |
+
+Mit den Standardwerten für alle optionalen Einträge genügt die Minimalform
+``@LLMQuiz(0.66,`Beschreibe den Verlauf.`)``. Die empfohlene benannte Form lautet beispielsweise
+``@LLMQuiz(0.66;solution=1;feedback=1,`Beschreibe den Verlauf.`)``.
+
+Für `solution`, `feedback` und `operator` existiert zusätzlich die Kurzform in genau dieser
+Reihenfolge: ``@LLMQuiz(0.66;1;1;beschreiben,`Beschreibe den Verlauf.`)``.
+
+Alle übrigen Optionen sind nur benannt verfügbar. Optionsnamen sind nicht von Groß- und
+Kleinschreibung abhängig und dürfen in beliebiger Reihenfolge stehen. Benannte und positionale
+Optionen dürfen innerhalb eines Aufrufs nicht gemischt werden. Leere, unbekannte oder doppelte
+Optionen werden mit einer Fehlermeldung abgewiesen. `assessmentengine=compact` ist nicht mit einem
+Operator oder aktivem Thinking kombinierbar; `maxthinkingtime=0s` bleibt zulässig.
+`Rechtschreibung` und `Satzbau` starten erst nach dem abgeschlossenen Inhaltsurteil einen eigenen
+Quality-Lauf und verändern das Inhaltsurteil nicht.
+Aufrufe aus älteren Ständen, die `@LLMQuiz` nur einen Optionsparameter übergeben, müssen um den
+Aufgabenwortlaut als zweiten Parameter ergänzt werden.
+
+Ein vollständiger Aufruf sieht so aus:
 
 ```` markdown
 Aufgabe 1: Erkläre, warum Eis auf flüssigem Wasser schwimmt.
 
 <!-- data-solution-button="off" data-llm-textarea="5" -->
 [[Antwort]]
-```text @LLMQuiz.question(0.66;solution=1;feedback=1;assessmentengine=quality;operator=erklaeren;maxthinkingtime=15s;maxthinkingtokens=medium,`Erkläre, warum Eis auf flüssigem Wasser schwimmt.`)
+```text @LLMQuiz(0.66;solution=1;feedback=1;assessmentengine=quality;operator=erklaeren;maxthinkingtime=15s;maxthinkingtokens=medium,`Erkläre, warum Eis auf flüssigem Wasser schwimmt.`)
 Eis besitzt eine geringere Dichte als flüssiges Wasser. Beim Gefrieren bildet das
 Wasserstoffbrückennetzwerk eine offene Kristallstruktur, die mehr Volumen einnimmt.
 Deshalb schwimmt Eis an der Oberfläche.
@@ -358,7 +414,7 @@ Aufgabe: Erkläre, warum Eis auf flüssigem Wasser schwimmt.
 
 <!-- data-solution-button="off" data-llm-textarea="5" -->
 [[Antwort]]
-```text @LLMQuiz.question(0.66;solution=1;feedback=1,`Erkläre, warum Eis auf flüssigem Wasser schwimmt.`)
+```text @LLMQuiz(0.66;solution=1;feedback=1,`Erkläre, warum Eis auf flüssigem Wasser schwimmt.`)
 Eis besitzt eine geringere Dichte als flüssiges Wasser. Deshalb trägt der Auftrieb das Eis
 bereits, bevor es vollständig eintaucht.
 <!-- lia-llm:alternative -->
@@ -382,8 +438,8 @@ Kursquelltext und im Browser technisch auffindbar.
 
 ### Atomare Kriterien
 
-Soll eine freie Antwort nicht nur als Ganzes, sondern gegen mehrere einzeln erforderliche
-Kerninformationen geprüft werden, beginnt jede Aussage mit der allein stehenden Kommentarzeile
+Soll eine freie Antwort nicht nur als Ganzes, sondern gegen mehrere atomare Kerninformationen
+geprüft werden, beginnt jede Aussage mit der allein stehenden Kommentarzeile
 `<!-- lia-llm:criterion -->`. Der erste Marker muss zugleich die erste nichtleere Zeile des
 Erwartungshorizonts sein. Ohne einen solchen Marker bleibt der bisherige ganzheitliche Vergleich
 unverändert aktiv.
@@ -394,7 +450,7 @@ unterschiedlichen Reaktionen über ihre Arbeitsweisen zeigen.
 
 <!-- data-solution-button="off" data-llm-textarea="6" -->
 [[Antwort]]
-```text @LLMQuiz.question(0.55;solution=1;feedback=1,`Warum hält Leyla Finn davon ab, die Blechdose aufzubrechen? Erkläre außerdem, was die unterschiedlichen Reaktionen über ihre Arbeitsweisen zeigen.`)
+```text @LLMQuiz(0.55;solution=1;feedback=1,`Warum hält Leyla Finn davon ab, die Blechdose aufzubrechen? Erkläre außerdem, was die unterschiedlichen Reaktionen über ihre Arbeitsweisen zeigen.`)
 <!-- lia-llm:criterion -->
 Leyla will die Dose nicht beschädigen.
 <!-- lia-llm:criterion -->
@@ -421,10 +477,12 @@ und möglichst schnell zu einem Ergebnis kommen möchte.
 
 Jeder mit `<!-- lia-llm:criterion -->` beginnende Abschnitt vor dem Lösungsmarker wird als eigenes
 Kriterium in der angegebenen Reihenfolge übernommen.
-Alle Kriterien sind erforderlich und gleich gewichtet; die Antwort besteht daher nur, wenn jede
-Kerninformation erfüllt ist. Ein Kriterium soll genau eine selbstständig prüfbare fachliche Aussage
-enthalten. Unabhängige Behauptungen werden getrennt; deshalb bilden im Beispiel „sorgfältig“,
-„geduldig“ und „aufmerksam“ drei Kriterien und keine Aufzählung in einem Sammelkriterium.
+Die vom Makro gelesenen Kriterien sind gleich gewichtet. Ohne die Option `coverage` sind sie wie
+bisher alle einzeln erforderlich: Die Antwort besteht nur, wenn jede Kerninformation erfüllt ist.
+Dieses Legacy-Verhalten gilt unverändert für alle vorhandenen Aufrufe. Ein Kriterium soll genau eine
+selbstständig prüfbare fachliche Aussage enthalten. Unabhängige Behauptungen werden getrennt;
+deshalb bilden im Beispiel „sorgfältig“, „geduldig“ und „aufmerksam“ drei Kriterien und keine
+Aufzählung in einem Sammelkriterium.
 
 Der allein stehende Marker `<!-- lia-llm:solution -->` folgt genau einmal auf das letzte Kriterium.
 Alles danach ist eine zusammenhängende, frei formulierte Musterlösung und wird nicht als zusätzliches
@@ -437,6 +495,75 @@ verschiedene Kriterien zulässig. Nach einer bestandenen Prüfung zeigt `solutio
 den ausformulierten Text hinter dem Lösungsmarker; Kriterien und technische Marker bleiben unsichtbar.
 `solution=0` unterdrückt die Anzeige. Fehlt der neue Lösungsmarker in einem älteren Kriterienblock,
 werden aus Kompatibilitätsgründen weiterhin die zusammengefügten Kriterien als Musterlösung verwendet.
+
+#### Gesamtquote mit `coverage`
+
+Die benannte Option `coverage` aktiviert ausdrücklich einen zweiten, davon unabhängigen
+Schwellenwert. Der erste Zahlenwert entscheidet weiterhin, ab welcher Konfidenz **jedes einzelne**
+Kriterium als erfüllt gilt. `coverage=0.80` verlangt anschließend eine gewichtete Gesamtquote von
+mindestens 80 Prozent erfüllter Kriterien. Der erste Zahlenwert ist also keine Gesamtquote.
+
+Ein vollständiger Aufruf mit elf Kriterien sieht beispielsweise so aus:
+
+```` markdown
+Aufgabe: Beschreibe die Eigenschaften eines Quadrats.
+
+<!-- data-solution-button="off" data-llm-textarea="6" -->
+[[Antwort]]
+```text @LLMQuiz(0.55;coverage=0.80;solution=1;feedback=1;assessmentengine=quality;Rechtschreibung=1;Satzbau=1,`Beschreibe die Eigenschaften eines Quadrats.`)
+<!-- lia-llm:criterion -->
+Ein Quadrat hat vier Seiten.
+<!-- lia-llm:criterion -->
+Alle vier Seiten sind gleich lang.
+<!-- lia-llm:criterion -->
+Ein Quadrat hat vier Eckpunkte.
+<!-- lia-llm:criterion -->
+Alle vier Innenwinkel sind rechte Winkel.
+<!-- lia-llm:criterion -->
+Je zwei gegenüberliegende Seiten sind parallel.
+<!-- lia-llm:criterion -->
+Die beiden Diagonalen sind gleich lang.
+<!-- lia-llm:criterion -->
+Die Diagonalen halbieren einander.
+<!-- lia-llm:criterion -->
+Die Diagonalen stehen senkrecht aufeinander.
+<!-- lia-llm:criterion -->
+Jede Diagonale halbiert zwei Innenwinkel.
+<!-- lia-llm:criterion -->
+Jedes Quadrat ist ein Rechteck.
+<!-- lia-llm:criterion -->
+Jedes Quadrat ist eine Raute.
+<!-- lia-llm:solution -->
+Ein Quadrat besitzt vier gleich lange Seiten und vier Eckpunkte. Alle vier Innenwinkel sind rechte
+Winkel, und je zwei gegenüberliegende Seiten verlaufen parallel. Seine gleich langen Diagonalen
+halbieren einander, stehen senkrecht aufeinander und halbieren die Innenwinkel. Daher ist jedes
+Quadrat sowohl ein Rechteck als auch eine Raute.
+```
+````
+
+Bei gleich gewichteten Kriterien wird die benötigte Anzahl stets aufgerundet:
+`ceil(Anzahl × coverage)`. Im Beispiel müssen daher mindestens neun der elf Kriterien erfüllt
+sein, weil `ceil(11 × 0.80) = 9` und `9 / 11 >= 0.80`.
+
+| Kriterienstatus bei elf gleich gewichteten Kriterien | Gesamtergebnis bei `coverage=0.80` |
+| --- | --- |
+| 9 `met`, 2 `missed` | `passed` |
+| 8 `met`, 3 `missed` | `failed` |
+| 8 `met`, 1 `uncertain`, 2 `missed` | `uncertain` |
+| ausreichende `met`-Quote, aber mindestens 1 `contradicted` | `failed` |
+
+Im Quotenmodus blockiert ein einzelnes `missed`-Kriterium nicht; für das Bestehen zählt nur die
+gewichtete Quote der `met`-Kriterien. `uncertain` zählt weder als erfüllt noch als widerlegt. Reicht
+die `met`-Quote bereits aus, ist das Ergebnis `passed`. Reicht sie nicht aus, könnte aber zusammen
+mit allen `uncertain`-Kriterien die Grenze erreichen, bleibt das Ergebnis `uncertain` und wird nicht
+als richtig gewertet. Reicht auch diese potenzielle Quote nicht aus, ist es `failed`. Jedes
+`contradicted`-Kriterium bleibt unabhängig von der Quote ein Veto und führt zu `failed`.
+
+`coverage` ist case-insensitiv, ausschließlich als benannte Option verfügbar und akzeptiert
+Dezimalwerte mit Punkt im Bereich `0 < coverage <= 1`. Auch `coverage=1` aktiviert den Quotenmodus
+ausdrücklich; ohne die Option bleibt dagegen das Legacy-Verhalten mit einzeln erforderlichen
+Kriterien aktiv. Die Option ist nur zusammen mit einem Kriterienblock zulässig. Bei einer
+ganzheitlichen Musterlösung wird der Aufruf vor der Modellprüfung mit einer Fehlermeldung beendet.
 
 Im Kriterienmodus sucht das Kompaktmodell die stärkste inhaltliche Unterstützung im vollständigen
 Antworttext, in Absätzen, in einzelnen Sätzen sowie in benachbarten Zwei- und Drei-Satz-Fenstern.
@@ -479,58 +606,6 @@ falsche Fachantwort an LiaScript weitergegeben. Stattdessen bleibt die Antwort n
 es erscheint die Aufforderung, die Prüfung erneut zu versuchen. Nur ein eindeutiges `passed` wird als
 richtig und ein eindeutiges `failed` als falsch zurückgemeldet; bei `uncertain` wird auch keine
 Musterlösung eingeblendet.
-
-`@LLMQuiz.question(...)` muss in derselben Zeile wie die öffnenden drei Backticks stehen. In der nächsten
-Zeile wäre der Aufruf nur Teil der Musterlösung und würde nicht ausgeführt.
-
-Die Optionen benötigen keine Backticks. Der Aufgabenwortlaut wird als zweiter Parameter übergeben;
-enthält er wie üblich Kommas, muss er mit Backticks geschützt werden. Benannte und kurze
-Optionsschreibweise sind gleichwertig:
-
-``` text
-@LLMQuiz.question(0.66;solution=1;feedback=1,`Beschreibe den Verlauf.`)
-@LLMQuiz.question(0.66;1;1,`Beschreibe den Verlauf.`)
-@LLMQuiz.question(0.66;solution=1;feedback=1;assessmentengine=quality;operator=beschreiben,`Beschreibe den Verlauf.`)
-@LLMQuiz.question(0.66;1;1;beschreiben,`Beschreibe den Verlauf.`)
-@LLMQuiz.question(0.66;solution=1;feedback=1;assessmentengine=quality;operator=erklaeren;Rechtschreibung=1;Satzbau=1,`Erkläre, warum Eis auf flüssigem Wasser schwimmt.`)
-```
-
-| Teil | Bedeutung |
-| --- | --- |
-| `0.66` | Mindestkonfidenz zwischen `0` und `1`; Dezimaltrennzeichen ist der Punkt |
-| `solution=1` / zweiter Wert `1` | Musterlösung ausschließlich nach einer richtigen Antwort anzeigen |
-| `solution=0` / zweiter Wert `0` | Musterlösung unabhängig vom Ergebnis nie anzeigen |
-| `feedback=1` / dritter Wert `1` | kurze priorisierte Rückmeldung einschalten; ein reiner Stilhinweis kann auch bei richtiger Antwort erscheinen |
-| `feedback=0` / dritter Wert `0` | zusätzliches Kurzfeedback ausschalten |
-| `assessmentengine=compact|quality` | Engine ausschließlich für die Inhaltsprüfung festlegen; ohne Angabe nutzt normaler Inhalt `compact`, die spätere optionale Sprachprüfung unabhängig davon `quality` |
-| `operator=...` / vierter Wert | zusätzlich die verlangte Antwortform des gesetzten Operators prüfen |
-| `Rechtschreibung=1` | nach der fertigen Inhaltsprüfung einen Button für Rechtschreibung, Zeichensetzung und die sichere Korrekturansicht anbieten |
-| `Satzbau=1` | nach der fertigen Inhaltsprüfung eindeutige Grammatikfehler (einschließlich Kasus, Kongruenz und Flexion) sowie Satzbaufehler prüfen; sichere Einwort-Grammatikkorrekturen werden markiert |
-| `maxthinkingtime=...` | maximale zusätzliche Denkzeit: `0s`, `5s`, `10s`, `15s`, `20s` oder `30s`; Standard ist `15s` |
-| `maxthinkingtokens=...` | maximales Thinking-Ausgabebudget: `low`, `medium`, `high`, `ultra` oder experimentell `extreme`; Standard ist `medium` |
-
-Ohne Optionen gelten `solution=1` und `feedback=0`:
-
-``` text
-@LLMQuiz(0.66)
-```
-
-Benannte Optionen dürfen in beliebiger Reihenfolge stehen. Benannte und positionale Angaben werden
-innerhalb eines Aufrufs nicht gemischt; Tippfehler und unbekannte Optionen führen zu einer klaren
-Fehlermeldung. `Rechtschreibung` und `Satzbau` sind ausschließlich benannte Optionen. Ihre
-Namen sind nicht von Groß- und Kleinschreibung abhängig; als Werte sind `0`, `1`, `false`
-und `true` zulässig. Sobald mindestens eine dieser Optionen eingeschaltet ist, muss auch
-`feedback=1` gesetzt sein, damit die Sprachstatistik sichtbar ausgegeben werden kann.
-
-`assessmentengine` ist ausschließlich als benannte Option zulässig und steuert nur die
-Inhaltsprüfung. Eine ausdrückliche Wahl von `assessmentengine=compact` wird dafür niemals
-automatisch auf das WebGPU-Qualitätsmodell hochgestuft. Sie kann deshalb nicht mit einem Operator
-oder einem positiven Thinking-Limit kombiniert werden; der Parser meldet diesen Konflikt direkt.
-Ein allein gesetztes `maxthinkingtime=0s` bleibt mit `compact` zulässig.
-`Rechtschreibung=1` und `Satzbau=1` dürfen dagegen mit beiden Inhaltsengines kombiniert werden:
-Ihr eigener Quality-Lauf beginnt erst nach dem Inhaltsurteil und ausschließlich durch den
-zusätzlichen Button. Ohne Engine-Angabe wählen Operator oder ausdrücklich aktiviertes Thinking für
-den Inhalt `quality`; normale Inhaltsprüfungen verwenden `compact`.
 
 ### Adaptiver Denkmodus
 
@@ -577,8 +652,8 @@ Imperativformen werden normalisiert. Das Qualitätsmodell erhält für jedes Pro
 Antwortvertrag mit erforderlichen Teilleistungen, Beleg- und Verfahrensregeln sowie Grenzen.
 Es meldet bei einer fehlenden Teilleistung eine validierte Kriteriums-ID; dadurch kann das
 priorisierte, konkrete Operatorfeedback angezeigt werden.
-Ein Operator kann nur mit `@LLMQuiz.question` verwendet werden, weil sein konkreter Umfang aus dem
-echten Aufgabenwortlaut folgt. Der Operator wird nicht heimlich aus einem Verb erkannt und nicht
+Für `operator=...` muss der echte Aufgabenwortlaut als zweiter Parameter von `@LLMQuiz` übergeben
+werden, weil daraus sein konkreter Umfang folgt. Der Operator wird nicht heimlich aus einem Verb erkannt und nicht
 pauschal einem Anforderungsbereich zugeordnet. Die fachliche Grundlage steht in
 [Operatoren.md](Operatoren.md), die technische Matrix in [docs/operatoren.md](docs/operatoren.md).
 
@@ -589,16 +664,13 @@ ausschließlich verfügbarer Kompaktbefund zu `uncertain` und bittet um eine ern
 Da ohne das erforderliche Modell die Gesamtaufgabe einschließlich ihrer Antwortform nicht
 zuverlässig geprüft ist, wird der Versuch weder als richtig noch als fachlich falsch verbucht.
 
-Das ältere `@LLMQuiz(Optionen)` verwendet weiterhin den allgemeinen Kontext
-„LiaScript-Freitextaufgabe“ und ist deshalb nur ohne Operator zulässig.
-
 Der native LiaScript-Lösungsbutton bleibt bei dieser Quizform ausgeschaltet; die sichtbare Ausgabe
 wird ausschließlich über `solution` gesteuert. Soll die Musterlösung nie erscheinen:
 
 ```` markdown
 <!-- data-solution-button="off" data-llm-textarea="5" -->
 [[Antwort]]
-```text @LLMQuiz(0.66;solution=0;feedback=1)
+```text @LLMQuiz(0.66;solution=0;feedback=1,`Beschreibe den Verlauf.`)
 Hier steht weiterhin die vollständige Musterlösung für den lokalen Vergleich.
 ```
 ````
@@ -644,13 +716,13 @@ Aufgabe: Erkläre, warum Eis auf flüssigem Wasser schwimmt.
 
 <!-- data-solution-button="off" data-llm-textarea="5" -->
 [[Antwort]]
-```text @LLMQuiz.question(0.66;solution=1;feedback=1;operator=erklaeren;Rechtschreibung=1;Satzbau=1,`Erkläre, warum Eis auf flüssigem Wasser schwimmt.`)
+```text @LLMQuiz(0.66;solution=1;feedback=1;operator=erklaeren;Rechtschreibung=1;Satzbau=1,`Erkläre, warum Eis auf flüssigem Wasser schwimmt.`)
 Eis besitzt eine geringere Dichte als flüssiges Wasser. Beim Gefrieren entsteht eine
 offene Kristallstruktur, die mehr Volumen einnimmt.
 ```
 ````
 
-Der echte Aufgabenwortlaut steht bei `@LLMQuiz.question` nach dem Komma als zweiter
+Der echte Aufgabenwortlaut steht bei `@LLMQuiz` nach dem Komma als zweiter
 Makroparameter. Enthält er ein Komma, schützen die Backticks den vollständigen Text vor der
 Parametertrennung.
 
@@ -957,7 +1029,7 @@ Aufgabe 1: Erkläre, warum Eis auf flüssigem Wasser schwimmt.
 <!-- data-solution-button="off" data-llm-textarea="5" -->
 [[Antwort]]
 [[?]] Hinweis
-```text @LLMQuiz.question(0.66;solution=1;feedback=1;assessmentengine=compact;Rechtschreibung=1;Satzbau=1,`Erkläre, warum Eis auf flüssigem Wasser schwimmt.`)
+```text @LLMQuiz(0.66;solution=1;feedback=1;assessmentengine=compact;Rechtschreibung=1;Satzbau=1,`Erkläre, warum Eis auf flüssigem Wasser schwimmt.`)
 Beim Gefrieren entsteht eine besondere Molekülstruktur, durch die Eis eine geringere
 Dichte als flüssiges Wasser hat. Deshalb schwimmt Eis auf Wasser.
 <!-- lia-llm:alternative -->
