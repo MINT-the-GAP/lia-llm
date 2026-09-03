@@ -74,6 +74,24 @@ function contentFeedbackForResult(
     }
   }
 
+  if (diagnostic?.code === "quality-check-unavailable") {
+    return {
+      code: "quality-check-unavailable",
+      message: german
+        ? "Die ausdrücklich angeforderte Qualitätsprüfung war gerade nicht verfügbar. Das Kompaktmodell konnte die Einzelkriterien nicht zuverlässig abschließend bewerten. Versuche die Prüfung erneut, sobald die Qualitätsprüfung verfügbar ist."
+        : "The explicitly requested quality assessment was unavailable. The compact model could not reliably reach a final judgement on the individual criteria. Try again when quality assessment is available.",
+    }
+  }
+
+  if (diagnostic?.code === "operator-check-unavailable") {
+    return {
+      code: "operator-check-unavailable",
+      message: german
+        ? "Die verlangte Antwortform konnte gerade nicht zuverlässig geprüft werden. Versuche die Prüfung erneut, sobald die Qualitätsprüfung verfügbar ist."
+        : "The required response form could not be checked reliably. Try again when quality assessment is available.",
+    }
+  }
+
   if (
     diagnostic?.code === "content-error" ||
     result.criteria.some((criterion) => criterion.status === "contradicted")
@@ -97,15 +115,6 @@ function contentFeedbackForResult(
       message: german
         ? "Die Antwort geht noch nicht auf die gestellte Frage ein."
         : "The answer does not address the question yet.",
-    }
-  }
-
-  if (diagnostic?.code === "operator-check-unavailable") {
-    return {
-      code: "operator-check-unavailable",
-      message: german
-        ? "Die verlangte Antwortform konnte gerade nicht zuverlässig geprüft werden. Versuche die Prüfung erneut, sobald die Qualitätsprüfung verfügbar ist."
-        : "The required response form could not be checked reliably. Try again when quality assessment is available.",
     }
   }
 

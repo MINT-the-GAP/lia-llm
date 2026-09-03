@@ -266,6 +266,31 @@ function operatorSafeCompactResult(
   }
 }
 
+function qualityUnavailableSafeCompactResult(
+  request: EvaluationRequest,
+  result: EvaluationResult,
+): EvaluationResult {
+  const operatorSafe = operatorSafeCompactResult(request, result)
+  if (
+    request.assessmentEngine !== "quality" ||
+    result.mode !== "criteria" ||
+    (result.status !== "failed" && result.status !== "uncertain") ||
+    operatorSafe.diagnostic?.code === "operator-check-unavailable"
+  ) {
+    return operatorSafe
+  }
+  return {
+    ...operatorSafe,
+    status: "uncertain",
+    passed: false,
+    diagnostic: {
+      code: "quality-check-unavailable",
+      source: "compact",
+      severity: "blocking",
+    },
+  }
+}
+
 export class AutomaticEvaluator {
   private readonly compactEvaluator: SemanticEvaluator
   private readonly qualityEvaluator: QualityEvaluator
@@ -650,9 +675,9 @@ export class AutomaticEvaluator {
         message: "Prüfung wird mit dem Kompaktmodell abgeschlossen …",
       })
       if (compactFallback) {
-        return operatorSafeCompactResult(request, compactFallback)
+        return qualityUnavailableSafeCompactResult(request, compactFallback)
       }
-      return operatorSafeCompactResult(
+      return qualityUnavailableSafeCompactResult(
         request,
         await this.evaluateCompact(request, options, run),
       )
@@ -881,7 +906,7 @@ export class AutomaticEvaluator {
     )
     assertRunActive(run)
     if (!qualityAvailable || run.generation !== this.generation) {
-      return compactResult
+      return qualityUnavailableSafeCompactResult(request, compactResult)
     }
     return this.evaluateQualityWithFallback(
       request,

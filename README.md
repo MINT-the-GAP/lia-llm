@@ -1,6 +1,6 @@
 <!--
 author:      MINT-the-GAP, Martin Lommatzsch
-version:     0.6.1
+version:     0.6.2
 language:    de
 narrator:    Deutsch Female
 comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
@@ -118,8 +118,8 @@ Promise.resolve()
     if (!window.LiaLLM) {
       throw new Error("lia-llm konnte nicht geladen werden.")
     }
-    if (window.LiaLLM.version !== "0.6.1") {
-      throw new Error(`lia-llm 0.6.1 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
+    if (window.LiaLLM.version !== "0.6.2") {
+      throw new Error(`lia-llm 0.6.2 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
     }
 
     const options = window.LiaLLM.parseMacroOptions(optionSource)
@@ -483,6 +483,22 @@ Dieses Legacy-Verhalten gilt unverändert für alle vorhandenen Aufrufe. Ein Kri
 selbstständig prüfbare fachliche Aussage enthalten. Unabhängige Behauptungen werden getrennt;
 deshalb bilden im Beispiel „sorgfältig“, „geduldig“ und „aufmerksam“ drei Kriterien und keine
 Aufzählung in einem Sammelkriterium.
+
+Mit `assessmentengine=quality` wird jedes atomare Kriterium ausdrücklich als `einzelkriterium`
+geprüft. Die vollständige Lernendenantwort dient dabei als Belegtext; die vollständige Aufgabenfrage
+liefert nur den Kontext. Andere Anforderungen aus der Frage – etwa eine bestimmte Reihenfolge oder
+ein weiterer, nicht im aktuellen Kriterium genannter Bildbereich – dürfen den Einzelentscheid nicht
+beeinflussen. Das unterscheidet den Kriterienmodus von einer ganzheitlichen Musterlösung: Dort wird
+weiterhin die `gesamtantwort` geprüft, und die wesentlichen Anforderungen müssen insgesamt
+vollständig genug erfüllt sein.
+
+Eine fehlende oder nicht eindeutig belegte Information führt beim Quality-Judge zu
+`fail_incomplete`, nicht zu `fail_contradiction`. Ein Widerspruch liegt nur vor, wenn die Antwort eine
+ausdrückliche, logisch unvereinbare Gegenbehauptung zum aktuellen Kriterium enthält. Eine plausible
+oder unscharfe Zuordnung wie „Bildmitte“ gegenüber „Hintergrund“ ist daher kein Widerspruch. Formale
+Kriterien wie Präsens werden direkt am Antworttext geprüft. Abwesenheitskriterien wie „keine
+erfundene Geschichte“ sind erfüllt, wenn der verbotene Inhalt fehlt; die Regel muss in der Antwort
+nicht eigens erwähnt werden.
 
 Der allein stehende Marker `<!-- lia-llm:solution -->` folgt genau einmal auf das letzte Kriterium.
 Alles danach ist eine zusammenhängende, frei formulierte Musterlösung und wird nicht als zusätzliches
@@ -857,6 +873,13 @@ Schwelle liegen. Das stärkere Quality-Modell ist eine optionale Erweiterung:
 5. Reicht ein bekanntes Speicherbudget nicht einmal für die kleinere Quality-Stufe, startet kein
    Quality-Download. Bei Ablehnung, ungültigem Qwen-Ergebnis, fehlendem WebGPU oder Geräteverlust
    bleibt der vorgesehene Kompakt- beziehungsweise `uncertain`-Fallback erhalten.
+
+Wurde `assessmentengine=quality` ausdrücklich für atomare Kriterien angefordert, ist ein
+`failed`- oder `uncertain`-Befund des Kompaktmodells bei nicht verfügbarer Quality-Prüfung kein
+abschließendes fachliches Urteil. Das Gesamtergebnis bleibt in diesem Fall `uncertain`, `passed`
+bleibt `false`, und die Diagnose `quality-check-unavailable` fordert zu einer erneuten Prüfung mit
+verfügbarem Quality-Modell auf. Ein tatsächlich erzeugter Quality-Befund wird nicht abgeschwächt:
+Insbesondere bleibt ein dort festgestelltes `contradicted` unabhängig von `coverage` ein hartes Veto.
 
 | Stufe | Modell und Laufzeit | Erster Download | Einordnung |
 | --- | --- | ---: | --- |

@@ -45,6 +45,7 @@ export type LearnerFeedbackCode =
   | "too-colloquial"
   | "operator-not-met"
   | "operator-check-unavailable"
+  | "quality-check-unavailable"
   | "language-analysis"
   | "language-analysis-unavailable"
 
@@ -298,6 +299,7 @@ export interface CriterionResult extends NliScores {
 export type EvaluationDiagnosticCode =
   | Exclude<QualityFeedbackCode, "none">
   | "operator-check-unavailable"
+  | "quality-check-unavailable"
 
 export interface EvaluationDiagnostic {
   code: EvaluationDiagnosticCode

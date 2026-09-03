@@ -72,11 +72,27 @@ export function formatResult(
   options: ResultFormatOptions = {},
 ): string {
   const german = locale.toLowerCase().startsWith("de")
+  const unavailableCheck = result.diagnostic?.code === "quality-check-unavailable"
+    ? "quality"
+    : result.diagnostic?.code === "operator-check-unavailable"
+      ? "operator"
+      : null
   const hasContradiction = result.criteria.some(
     (criterion) => criterion.status === "contradicted",
   )
+  const unavailableHeading =
+    unavailableCheck === "quality"
+      ? german
+        ? "Die ausdrücklich angeforderte Qualitätsprüfung ist gerade nicht verfügbar; die Antwort bleibt unentschieden."
+        : "The explicitly requested quality assessment is unavailable; the answer remains undecided."
+      : unavailableCheck === "operator"
+        ? german
+          ? "Die verlangte Antwortform konnte gerade nicht zuverlässig geprüft werden."
+          : "The required response form could not be checked reliably."
+        : null
   const heading =
-    result.mode === "holistic"
+    unavailableHeading ??
+    (result.mode === "holistic"
       ? german
         ? hasContradiction
           ? "Die Antwort widerspricht der Musterlösung im Gesamtzusammenhang."
@@ -106,7 +122,7 @@ export function formatResult(
             ? "The answer covers the required aspects."
             : result.status === "uncertain"
               ? "The answer is in the uncertainty zone."
-              : "Some required aspects are not supported yet."
+              : "Some required aspects are not supported yet.")
   const color =
     result.status === "passed"
       ? "#16794a"
@@ -115,7 +131,7 @@ export function formatResult(
         : "#a12b2b"
   const label = german ? "Sicher bestätigte Abdeckung" : "Clearly supported coverage"
   const details =
-    options.showCriteria === true
+    options.showCriteria === true && unavailableCheck === null
       ? `<div>${label}: ${percentage(result.coverage, locale)}</div><ul style="padding-left:1.3rem">${result.criteria.map((criterion) => criterionHtml(criterion, locale, german)).join("")}</ul>`
       : ""
 

@@ -446,6 +446,17 @@ Der reproduzierbare Inhalts-Stresstest wird nach einem aktuellen Build mit
 dort geprüften Fälle. Für die getestete 1.7B-Stufe liegt wegen des reproduzierten
 Geräteverlusts auf dem lokalen Testhost noch kein erfolgreicher Browser-Stresstest vor.
 
+Die gezielte Kalibrierung für atomare Kriterien mit `coverage` wird separat mit
+`npm run test:browser-quality-criteria` ausgeführt. Sie prüft den dokumentierten
+Bildbeschreibungsfall mit acht Kriterien sowie die ausdrückliche Gegenbehauptung „Der Himmel ist
+nicht blau, sondern rot.“ und akzeptiert nur Ergebnisse mit
+`model.task === "generative-assessment"`. Bei einem Cold-Cache-Fallback wartet die Fixture
+höchstens 20 Minuten auf die bereits im Hintergrund laufende Quality-Vorbereitung und wiederholt
+danach die Auswertung. Der Befehl gehört bewusst nicht zu `npm test` oder `npm run check`, weil er
+WebGPU und gegebenenfalls einen Download von etwa 984 MB beziehungsweise 2,28 GB benötigt. Auch ein
+bestandener semantischer Kalibrierungsfall ersetzt nicht den folgenden
+Cold→Neustart→Offline-Inferenz→Clear-Freigabeablauf.
+
 Eine Quality-Freigabe braucht pro Browser/OS-Paar weiterhin denselben
 Cold→Neustart→Offline-Inferenz→Clear-Ablauf und muss nachweisen, dass wirklich Qwen statt des
 Kompakt-Fallbacks inferiert hat. Der lokale Stresstest lief nicht auf den Schulrechnern und ersetzt

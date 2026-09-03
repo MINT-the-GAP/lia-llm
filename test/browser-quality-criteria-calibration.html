@@ -1,0 +1,139 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>lia-llm quality criteria calibration</title>
+<script src="../dist/index.js"></script>
+<pre id="output">starting</pre>
+<script>
+const question =
+  "Beschreibe das Bild so, dass jemand ohne das Bild es sich gut vorstellen kann. Gib zuerst einen Überblick. Beschreibe dann passende Details im Vordergrund, in der Mitte und im Hintergrund. Nenne wichtige Farben und erkläre, wie das Bild auf dich wirkt. Nutze die Gegenwart und erfinde keine Geschichte."
+const reference =
+  "Das Bild zeigt eine grüne Hügellandschaft unter einem blauen Himmel mit weißen Wolken. Im Vordergrund liegen eine große grüne Wiese und rechts ein großer Laubbaum. In der Bildmitte stehen kleinere Bäume auf weiteren Hügeln; im Hintergrund sind entfernte Berge, Himmel und Wolken zu sehen. Grün, Blau und Weiß prägen das Bild. Die ruhige Landschaft wirkt zuversichtlich und hoffnungsvoll."
+const criteria = [
+  "Die Beschreibung vermittelt einen zutreffenden Gesamtüberblick über eine grüne Landschaft mit Wiesen und Hügeln.",
+  "Im Vordergrund wird mindestens ein passendes sichtbares Detail beschrieben, etwa die große grüne Wiese oder der große Baum auf der rechten Seite.",
+  "In der Bildmitte wird mindestens ein passendes sichtbares Detail beschrieben, etwa weitere Hügel oder kleinere Bäume.",
+  "Im Hintergrund wird mindestens ein passendes sichtbares Detail beschrieben, etwa entfernte Berge, der blaue Himmel oder weiße Wolken.",
+  "Die Antwort nennt passende wichtige Farben des Bildes, etwa Grün, Blau oder Weiß.",
+  "Die Antwort beschreibt die persönliche Wirkung des Bildes.",
+  "Die Bildbeschreibung ist in der Gegenwart verfasst.",
+  "Die Antwort enthält keine erfundene Handlung oder Geschichte."
+].map((text, index) => ({
+  id: "criterion-" + String(index + 1),
+  text,
+  required: false
+}))
+const cases = [
+  {
+    id: "reproduction",
+    answer:
+      "In dem Bild sieht man einen blauen Himmel mit einigen leichten Wolken. im Vordergrund ist eine Wiese im satten Grün zu sehen und ein Laubbaum der einen Schatten wirft. Im Hintergrund sind auf der Wiese immer wieder vereinzelt Bäume zu sehen. Insgesamt ist es eine Hügellandschaft, welche eine Zuversicht und Hoffnung verströmt.",
+    expectedPassed: true,
+    minimumMet: 6,
+    expectedContradiction: false
+  },
+  {
+    id: "explicit-counterclaim",
+    answer: "Der Himmel ist nicht blau, sondern rot.",
+    expectedPassed: false,
+    minimumMet: 0,
+    expectedContradiction: true
+  }
+]
+const delay = milliseconds =>
+  new Promise(resolve => setTimeout(resolve, milliseconds))
+
+async function evaluateWithQuality(request) {
+  let result = await window.LiaLLM.evaluate(request)
+  if (result.model.task === "generative-assessment") return result
+
+  const deadline = Date.now() + 20 * 60 * 1000
+  while (Date.now() < deadline) {
+    await delay(2_000)
+    const status = window.LiaLLM.getStatus()
+    if (
+      status.assessmentEngine === "quality" &&
+      status.phase === "ready"
+    ) {
+      result = await window.LiaLLM.evaluate(request)
+      if (result.model.task === "generative-assessment") return result
+    }
+  }
+  throw new Error(
+    "Das Quality-Modell wurde innerhalb von 20 Minuten nicht bereit."
+  )
+}
+
+window.addEventListener("lia-llm:download-consent", event => {
+  const detail = event.detail
+  if (!detail) return
+  detail.handled = true
+  detail.respond(true)
+})
+window.__liaCalibrationDone = false
+window.__liaCalibration = []
+window.__liaCalibrationExpected = cases.length
+
+;(async () => {
+  try {
+    for (const item of cases) {
+      const result = await evaluateWithQuality({
+        question,
+        answer: item.answer,
+        reference,
+        criteria,
+        assessmentEngine: "quality",
+        criterionThreshold: 0.55,
+        contradictionThreshold: 0.65,
+        passThreshold: 0.66
+      })
+      const met = result.criteria.filter(criterion => criterion.status === "met")
+        .length
+      const contradicted = result.criteria.some(
+        criterion => criterion.status === "contradicted"
+      )
+      const skyContradicted = result.criteria.some(
+        criterion =>
+          (criterion.id === "criterion-4" || criterion.id === "criterion-5") &&
+          criterion.status === "contradicted"
+      )
+      const qualityUsed = result.model.task === "generative-assessment"
+      const feedback = window.LiaLLM.formatResult(result, "de-DE")
+      window.__liaCalibration.push({
+        id: item.id,
+        status: result.status,
+        passed: result.passed,
+        expectedPassed: item.expectedPassed,
+        met,
+        minimumMet: item.minimumMet,
+        contradicted,
+        expectedContradiction: item.expectedContradiction,
+        criteria: result.criteria.map(criterion => ({
+          id: criterion.id,
+          status: criterion.status,
+          decision: criterion.judgeDecision,
+          confidence: criterion.judgeConfidence
+        })),
+        model: result.model,
+        matches:
+          result.passed === item.expectedPassed &&
+          met >= item.minimumMet &&
+          contradicted === item.expectedContradiction &&
+          (!item.expectedContradiction || skyContradicted) &&
+          qualityUsed,
+        compactFeedbackHasCriteria:
+          /Gesamtantwort|Bestätigung:|Sicher bestätigte Abdeckung/.test(feedback)
+      })
+      document.querySelector("#output").textContent = JSON.stringify(
+        window.__liaCalibration,
+        null,
+        2
+      )
+    }
+  } catch (error) {
+    window.__liaCalibrationError =
+      error instanceof Error ? error.stack : String(error)
+  } finally {
+    window.__liaCalibrationDone = true
+  }
+})()
+</script>

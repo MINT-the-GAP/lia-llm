@@ -3730,6 +3730,303 @@ test('QualityEvaluator sends correct rebuttals through the model', async () => {
   assert.equal(calls, answers.length)
 })
 
+function assessmentPayloadFromRequest(
+  request: Record<string, unknown>,
+): Record<string, unknown> {
+  const messages = request.messages as
+    | Array<{ role?: string; content?: string }>
+    | undefined
+  const userContent = messages?.find((message) => message.role === "user")?.content
+  assert.equal(typeof userContent, "string")
+  const payload = userContent.match(
+    /^BEGIN_UNTRUSTED_ASSESSMENT_DATA_JSON\n([\s\S]*?)\nEND_UNTRUSTED_ASSESSMENT_DATA_JSON\n/u,
+  )?.[1]
+  assert.ok(payload)
+  return JSON.parse(payload) as Record<string, unknown>
+}
+
+test("QualityEvaluator distinguishes atomic criteria from holistic completeness", async () => {
+  const requests: Array<Record<string, unknown>> = []
+  const engine = {
+    interruptGenerate: async () => undefined,
+    chat: {
+      completions: {
+        create: async (request: Record<string, unknown>) => {
+          requests.push(request)
+          const payload = assessmentPayloadFromRequest(request)
+          const decision =
+            payload.bewertungsmodus === "einzelkriterium"
+              ? {
+                  decision: "pass",
+                  confidence: 0.93,
+                  feedback_code: "none",
+                  operator_criterion_id: "",
+                }
+              : {
+                  decision: "fail_incomplete",
+                  confidence: 0.93,
+                  feedback_code: "incomplete",
+                  operator_criterion_id: "",
+                }
+          return {
+            choices: [{
+              finish_reason: "stop",
+              message: { content: JSON.stringify(decision) },
+            }],
+          }
+        },
+      },
+    },
+  }
+  const evaluator = new QualityEvaluator()
+  ;(evaluator as unknown as { engine: typeof engine | null }).engine = engine
+  const question =
+    "Nenne zuerst den Himmel und beschreibe danach den Boden und einen Baum."
+  const answer = "Der Himmel ist blau."
+  const reference =
+    "Der Himmel ist blau. Der Boden ist grün und rechts steht ein Baum."
+
+  const criteriaResult = await evaluator.evaluate(
+    {
+      question,
+      answer,
+      reference,
+      criteria: [{
+        id: "sky",
+        text: "Der Himmel ist blau.",
+        required: false,
+      }],
+      passThreshold: 1,
+    },
+    { maxThinkingTimeMs: 0 },
+  )
+  const holisticResult = await evaluator.evaluate(
+    { question, answer, reference },
+    { maxThinkingTimeMs: 0 },
+  )
+
+  assert.equal(criteriaResult.mode, "criteria")
+  assert.equal(criteriaResult.passed, true)
+  assert.equal(criteriaResult.criteria[0]?.status, "met")
+  assert.equal(holisticResult.mode, "holistic")
+  assert.equal(holisticResult.passed, false)
+  assert.equal(
+    holisticResult.criteria[0]?.judgeDecision,
+    "fail_incomplete",
+  )
+  assert.equal(requests.length, 2)
+  const criteriaPayload = assessmentPayloadFromRequest(requests[0]!)
+  const holisticPayload = assessmentPayloadFromRequest(requests[1]!)
+  assert.equal(criteriaPayload.bewertungsmodus, "einzelkriterium")
+  assert.equal(criteriaPayload.frage, question)
+  assert.equal(criteriaPayload.musterloesung, "Der Himmel ist blau.")
+  assert.equal(criteriaPayload.lernendenantwort, answer)
+  assert.deepEqual(criteriaPayload.erwartungshorizonte, [
+    "Der Himmel ist blau.",
+  ])
+  assert.equal(holisticPayload.bewertungsmodus, "gesamtantwort")
+  assert.equal(holisticPayload.musterloesung, reference)
+  assert.deepEqual(holisticPayload.erwartungshorizonte, [reference])
+})
+
+test("QualityEvaluator keeps omission, formal, absence, and contradiction semantics separate", async () => {
+  const payloads: Array<Record<string, unknown>> = []
+  const decisions = new Map<string, Record<string, unknown>>([
+    [
+      "In der Bildmitte wird mindestens ein passendes sichtbares Detail beschrieben.",
+      {
+        decision: "fail_incomplete",
+        confidence: 0.93,
+        feedback_code: "incomplete",
+        operator_criterion_id: "",
+      },
+    ],
+    [
+      "Die Bildbeschreibung ist in der Gegenwart verfasst.",
+      {
+        decision: "pass",
+        confidence: 0.93,
+        feedback_code: "none",
+        operator_criterion_id: "",
+      },
+    ],
+    [
+      "Die Antwort enthält keine erfundene Handlung oder Geschichte.",
+      {
+        decision: "pass",
+        confidence: 0.93,
+        feedback_code: "none",
+        operator_criterion_id: "",
+      },
+    ],
+    [
+      "Die Beschreibung vermittelt einen Gesamtüberblick über die Landschaft.",
+      {
+        decision: "pass",
+        confidence: 0.93,
+        feedback_code: "none",
+        operator_criterion_id: "",
+      },
+    ],
+    [
+      "Der Himmel ist blau.",
+      {
+        decision: "fail_contradiction",
+        confidence: 0.93,
+        feedback_code: "content-error",
+        operator_criterion_id: "",
+      },
+    ],
+  ])
+  const engine = {
+    interruptGenerate: async () => undefined,
+    chat: {
+      completions: {
+        create: async (request: Record<string, unknown>) => {
+          const payload = assessmentPayloadFromRequest(request)
+          payloads.push(payload)
+          const output = decisions.get(String(payload.musterloesung))
+          assert.ok(output)
+          return {
+            choices: [{
+              finish_reason: "stop",
+              message: { content: JSON.stringify(output) },
+            }],
+          }
+        },
+      },
+    },
+  }
+  const evaluator = new QualityEvaluator()
+  ;(evaluator as unknown as { engine: typeof engine | null }).engine = engine
+  const answer =
+    "Der Himmel ist nicht blau, sondern rot. Im Vordergrund ist eine grüne Wiese. Im Hintergrund stehen einzelne Bäume. Die Landschaft wirkt ruhig."
+  const criteria = [...decisions.keys()].map((text, index) => ({
+    id: "criterion-" + String(index + 1),
+    text,
+    required: false,
+  }))
+  const assessed = await evaluator.evaluate(
+    {
+      question:
+        "Gib zuerst einen Überblick und beschreibe danach Vordergrund, Bildmitte, Hintergrund, Farben und Wirkung.",
+      answer,
+      reference: "Eine vollständige Beschreibung der Landschaft.",
+      criteria,
+      criterionThreshold: 0.55,
+      passThreshold: 0.6,
+    },
+    { maxThinkingTimeMs: 0 },
+  )
+
+  assert.deepEqual(
+    assessed.criteria.map((criterion) => criterion.status),
+    ["missed", "met", "met", "met", "contradicted"],
+  )
+  assert.equal(
+    assessed.criteria[0]?.judgeDecision,
+    "fail_incomplete",
+  )
+  assert.notEqual(assessed.criteria[0]?.status, "contradicted")
+  assert.equal(assessed.criteria[1]?.status, "met")
+  assert.equal(assessed.criteria[2]?.status, "met")
+  assert.equal(assessed.coverage, 0.6)
+  assert.equal(assessed.passed, false)
+  assert.equal(assessed.status, "failed")
+  assert.equal(assessed.diagnostic?.code, "content-error")
+  assert.equal(
+    assessed.criteria.filter((criterion) => criterion.status === "contradicted")
+      .length,
+    1,
+  )
+  assert.equal(
+    payloads.every(
+      (payload) =>
+        payload.bewertungsmodus === "einzelkriterium" &&
+        payload.lernendenantwort === answer,
+    ),
+    true,
+  )
+})
+
+test("QualityEvaluator preserves criteria mode in thinking refinement", async () => {
+  const requests: Array<Record<string, unknown>> = []
+  const outputs = [
+    {
+      decision: "pass",
+      confidence: 0.71,
+      feedback_code: "none",
+      operator_criterion_id: "",
+    },
+    {
+      decision: "pass",
+      confidence: 0.95,
+      feedback_code: "none",
+      operator_criterion_id: "",
+    },
+  ]
+  const engine = {
+    interruptGenerate: async () => undefined,
+    chat: {
+      completions: {
+        create: async (request: Record<string, unknown>) => {
+          requests.push(request)
+          const output = outputs.shift()
+          assert.ok(output)
+          return {
+            choices: [{
+              finish_reason: "stop",
+              message: { content: JSON.stringify(output) },
+            }],
+            usage: { completion_tokens: 32 },
+          }
+        },
+      },
+    },
+  }
+  const evaluator = new QualityEvaluator()
+  ;(evaluator as unknown as { engine: typeof engine | null }).engine = engine
+  const answer = Array.from(
+    { length: 45 },
+    (_, index) => "Aussage" + String(index),
+  ).join(" ")
+  const assessed = await evaluator.evaluate(
+    {
+      question: "Beschreibe mehrere Aspekte.",
+      answer,
+      reference: "Eine vollständige Beschreibung.",
+      criteria: [{
+        id: "single",
+        text: "Das aktuelle Einzelkriterium ist erfüllt.",
+        required: false,
+      }],
+      passThreshold: 1,
+    },
+    { maxThinkingTimeMs: 5_000, maxThinkingTokens: 256 },
+  )
+
+  assert.equal(requests.length, 2)
+  assert.deepEqual(
+    requests.map(
+      (request) => assessmentPayloadFromRequest(request).bewertungsmodus,
+    ),
+    ["einzelkriterium", "einzelkriterium"],
+  )
+  const baselineMessages = requests[0]?.messages as
+    | Array<{ role: string; content: string }>
+    | undefined
+  const thinkingMessages = requests[1]?.messages as
+    | Array<{ role: string; content: string }>
+    | undefined
+  assert.equal(baselineMessages?.[0]?.content, QUALITY_SYSTEM_PROMPT)
+  assert.equal(thinkingMessages?.[0]?.content, QUALITY_SYSTEM_PROMPT)
+  assert.equal(thinkingMessages?.[1]?.content, baselineMessages?.[1]?.content)
+  assert.deepEqual(requests[0]?.extra_body, { enable_thinking: false })
+  assert.deepEqual(requests[1]?.extra_body, { enable_thinking: true })
+  assert.equal(assessed.passed, true)
+  assert.equal(assessed.criteria[0]?.judgeConfidence, 0.95)
+})
+
 test("QualityEvaluator suppresses blocking diagnostics after coverage passes", async () => {
   const outputs = [
     ...Array(9).fill(
@@ -5839,6 +6136,23 @@ test("quality judge keeps uncertainty and contradictions out of passing", () => 
 
 test("quality prompt requires contextual synonym and negation handling", () => {
   assert.match(QUALITY_SYSTEM_PROMPT, /Gesamtzusammenhang/u)
+  assert.match(QUALITY_SYSTEM_PROMPT, /bewertungsmodus als einzelkriterium oder gesamtantwort/u)
+  assert.match(QUALITY_SYSTEM_PROMPT, /ausschließlich die aktuelle musterloesung/u)
+  assert.match(QUALITY_SYSTEM_PROMPT, /frage ist nur Kontext/u)
+  assert.match(QUALITY_SYSTEM_PROMPT, /fail_incomplete, niemals fail_contradiction/u)
+  assert.match(QUALITY_SYSTEM_PROMPT, /explizite, logisch unvereinbare Gegenbehauptung/u)
+  assert.match(QUALITY_SYSTEM_PROMPT, /räumliche Zuordnungen/u)
+  assert.match(QUALITY_SYSTEM_PROMPT, /Formale Kriterien wie Präsens/u)
+  assert.match(QUALITY_SYSTEM_PROMPT, /Abwesenheitskriterien/u)
+  assert.match(QUALITY_SYSTEM_PROMPT, /globale Regel[\s\S]*gilt nur bei[\s\S]*gesamtantwort/u)
+  assert.match(
+    QUALITY_SYSTEM_PROMPT,
+    /Bei gesamtantwort prüfst du bei einem Operatorprofil[\s\S]*Bei einzelkriterium ist ein Operatorprofil nur Kontext/u,
+  )
+  assert.match(
+    QUALITY_SYSTEM_PROMPT,
+    /Bei gesamtantwort bestimmt der konkrete Aufgabenwortlaut[\s\S]*Bei einzelkriterium gilt der Aufgabenwortlaut nur/u,
+  )
   assert.match(QUALITY_SYSTEM_PROMPT, /nicht vertrauenswürdig/u)
   assert.match(QUALITY_SYSTEM_PROMPT, /Rollen-, System-/u)
   assert.match(QUALITY_SYSTEM_PROMPT, /Synonyme/u)
@@ -8013,7 +8327,7 @@ test("automatic evaluator does not wait for persistent storage and records later
   }
 })
 
-test('AutomaticEvaluator retries Quality after recoverable output and request fallbacks', async () => {
+test('AutomaticEvaluator retries recoverable Quality failures and safely degrades fatal criteria failures', async () => {
   class RecoverableMockEvaluator {
     readonly status: RuntimeStatus
     preloadCalls = 0
@@ -8021,6 +8335,8 @@ test('AutomaticEvaluator retries Quality after recoverable output and request fa
     private readonly id: string
     private readonly engine: 'compact' | 'quality'
     private readonly firstQualityError: Error
+    private readonly compactStatus: EvaluationResult['status']
+    private readonly compactMode: EvaluationResult['mode']
 
     constructor(
       id: string,
@@ -8028,10 +8344,14 @@ test('AutomaticEvaluator retries Quality after recoverable output and request fa
       firstQualityError = new QualityOutputError(
         'recoverable invalid quality JSON',
       ),
+      compactStatus: EvaluationResult['status'] = 'passed',
+      compactMode: EvaluationResult['mode'] = 'holistic',
     ) {
       this.id = id
       this.engine = engine
       this.firstQualityError = firstQualityError
+      this.compactStatus = compactStatus
+      this.compactMode = compactMode
       this.status = {
         phase: 'idle',
         assessmentEngine: engine,
@@ -8068,7 +8388,24 @@ test('AutomaticEvaluator retries Quality after recoverable output and request fa
       if (this.engine === 'quality' && this.evaluateCalls === 1) {
         throw this.firstQualityError
       }
-      const value = evaluation('passed', [result('overall', 'met', true)])
+      const evaluationStatus = this.engine === 'compact'
+        ? this.compactStatus
+        : 'passed'
+      const criterionStatus: CriterionResult['status'] =
+        evaluationStatus === 'failed'
+          ? 'contradicted'
+          : evaluationStatus === 'uncertain'
+            ? 'uncertain'
+            : 'met'
+      const value = evaluation(
+        evaluationStatus,
+        [result('overall', criterionStatus, true)],
+      )
+      value.mode = this.engine === 'compact'
+        ? this.compactMode
+        : request.criteria?.length
+          ? 'criteria'
+          : 'holistic'
       value.answer = request.answer
       value.model.id = this.id
       value.model.device = this.status.device
@@ -8149,6 +8486,42 @@ test('AutomaticEvaluator retries Quality after recoverable output and request fa
     assert.equal(contextQuality.evaluateCalls, 2)
     assert.equal(contextQuality.preloadCalls, 1)
     assert.equal(contextAutomatic.getStatus().assessmentEngine, 'quality')
+
+    const criteriaCompact = new RecoverableMockEvaluator(
+      'compact-fatal-fallback',
+      'compact',
+      undefined,
+      'failed',
+      'criteria',
+    )
+    const criteriaQuality = new RecoverableMockEvaluator(
+      'quality-fatal-fallback',
+      'quality',
+      new Error('fatal quality runtime failure'),
+    )
+    const criteriaAutomatic = new AutomaticEvaluator(
+      criteriaCompact as never,
+      criteriaQuality as never,
+    )
+    await criteriaAutomatic.preload()
+
+    const criteriaFallback = await criteriaAutomatic.evaluate({
+      ...request,
+      criteria: [{
+        id: 'density',
+        text: 'Die geringere Dichte von Eis wird genannt.',
+        required: false,
+      }],
+    })
+    assert.equal(criteriaQuality.evaluateCalls, 1)
+    assert.equal(criteriaCompact.evaluateCalls, 1)
+    assert.equal(criteriaFallback.mode, 'criteria')
+    assert.equal(criteriaFallback.status, 'uncertain')
+    assert.equal(criteriaFallback.passed, false)
+    assert.equal(
+      criteriaFallback.diagnostic?.code,
+      'quality-check-unavailable',
+    )
   } finally {
     if (gpuDescriptor) {
       Object.defineProperty(navigatorObject, 'gpu', gpuDescriptor)
@@ -8156,6 +8529,237 @@ test('AutomaticEvaluator retries Quality after recoverable output and request fa
       delete (navigatorObject as Navigator & { gpu?: unknown }).gpu
     }
   }
+})
+
+test("explicit Quality criteria fallbacks stay uncertain when Compact cannot decide", async () => {
+  const compactStatuses: EvaluationResult["status"][] = [
+    "failed",
+    "uncertain",
+    "failed",
+    "failed",
+  ]
+  let compactCalls = 0
+  let qualityCalls = 0
+  const compactStatus: RuntimeStatus = {
+    phase: "ready",
+    assessmentEngine: "compact",
+    modelId: "compact-fallback",
+    revision: "test",
+    device: "wasm",
+    dtype: "q8",
+  }
+  const compact = {
+    getStatus: () => compactStatus,
+    getCacheInfo: async (): Promise<ModelCacheInfo> => ({
+      supported: true,
+      cached: true,
+      downloadCached: true,
+      filesCached: 1,
+      filesTotal: 1,
+      estimatedBytes: 1,
+    }),
+    preload: async () => compactStatus,
+    evaluate: async (request: EvaluationRequest): Promise<EvaluationResult> => {
+      const status = compactStatuses[compactCalls++]!
+      const criterion = result(
+        "spatial-detail",
+        status === "failed" ? "contradicted" : "uncertain",
+        false,
+      )
+      const value = evaluation(status, [criterion])
+      value.mode = request.criteria?.length ? "criteria" : "holistic"
+      value.answer = request.answer
+      value.diagnostic = {
+        code: status === "failed" ? "content-error" : "unclear",
+        source: "compact",
+        severity: "blocking",
+      }
+      return value
+    },
+    unloadRuntime: async () => undefined,
+    clearCache: async () => 0,
+  }
+  const qualityStatus: RuntimeStatus = {
+    phase: "idle",
+    assessmentEngine: "quality",
+    modelId: "quality-unavailable",
+    revision: "test",
+    device: "webgpu",
+    dtype: "q4f16",
+  }
+  const quality = {
+    getStatus: () => qualityStatus,
+    getCacheInfo: async (): Promise<ModelCacheInfo> => ({
+      supported: false,
+      cached: false,
+      downloadCached: false,
+      filesCached: 0,
+      filesTotal: 1,
+      estimatedBytes: 1,
+    }),
+    preload: async () => {
+      throw new Error("Quality must not preload without WebGPU.")
+    },
+    evaluate: async () => {
+      qualityCalls += 1
+      throw new Error("Quality must not evaluate when unavailable.")
+    },
+    evaluateLanguage: async () => undefined,
+    unloadRuntime: async () => undefined,
+    clearCache: async () => 0,
+  }
+  const navigatorObject = globalThis.navigator
+  const gpuDescriptor = Object.getOwnPropertyDescriptor(navigatorObject, "gpu")
+  delete (navigatorObject as Navigator & { gpu?: unknown }).gpu
+
+  try {
+    const automatic = new AutomaticEvaluator(compact as never, quality as never)
+    const request: EvaluationRequest = {
+      question:
+        "Beschreibe Vordergrund, Bildmitte und Hintergrund des Bildes.",
+      answer: "Im Hintergrund stehen einzelne Bäume.",
+      reference: "Eine vollständige räumliche Bildbeschreibung.",
+      criteria: [{
+        id: "spatial-detail",
+        text: "In der Bildmitte wird ein sichtbares Detail beschrieben.",
+        required: false,
+      }],
+      passThreshold: 1,
+      assessmentEngine: "quality",
+    }
+
+    const failedFallback = await automatic.evaluate(request)
+    assert.equal(failedFallback.status, "uncertain")
+    assert.equal(failedFallback.passed, false)
+    assert.equal(
+      failedFallback.diagnostic?.code,
+      "quality-check-unavailable",
+    )
+    assert.equal(
+      feedbackForResult(failedFallback, "de-DE")?.code,
+      "quality-check-unavailable",
+    )
+    const formattedFallback = formatResult(
+      failedFallback,
+      "de-DE",
+      { showCriteria: true },
+    )
+    assert.match(formattedFallback, /Qualitätsprüfung ist gerade nicht verfügbar/u)
+    assert.doesNotMatch(
+      formattedFallback,
+      /fachlichen Widerspruch|widersprüchlich|Widerspruchspassage|Sicher bestätigte Abdeckung/u,
+    )
+
+    const uncertainFallback = await automatic.evaluate(request)
+    assert.equal(uncertainFallback.status, "uncertain")
+    assert.equal(
+      uncertainFallback.diagnostic?.code,
+      "quality-check-unavailable",
+    )
+
+    const explicitCompact = await automatic.evaluate({
+      ...request,
+      assessmentEngine: "compact",
+    })
+    assert.equal(explicitCompact.status, "failed")
+    assert.equal(explicitCompact.diagnostic?.code, "content-error")
+
+    const holisticFallback = await automatic.evaluate({
+      ...request,
+      criteria: undefined,
+      assessmentEngine: "quality",
+    })
+    assert.equal(holisticFallback.mode, "holistic")
+    assert.equal(holisticFallback.status, "failed")
+    assert.equal(holisticFallback.diagnostic?.code, "content-error")
+    assert.equal(compactCalls, 4)
+    assert.equal(qualityCalls, 0)
+  } finally {
+    if (gpuDescriptor) {
+      Object.defineProperty(navigatorObject, "gpu", gpuDescriptor)
+    } else {
+      delete (navigatorObject as Navigator & { gpu?: unknown }).gpu
+    }
+  }
+})
+
+test("a real Quality contradiction remains authoritative and vetoes coverage", async () => {
+  let compactCalls = 0
+  let qualityCalls = 0
+  const compact = {
+    getStatus: () => ({
+      phase: "ready",
+      assessmentEngine: "compact",
+      modelId: "compact-unused",
+      revision: "test",
+      device: "wasm",
+      dtype: "q8",
+    }),
+    evaluate: async () => {
+      compactCalls += 1
+      return evaluation("passed", [result("unused", "met", false)])
+    },
+    unloadRuntime: async () => undefined,
+    clearCache: async () => 0,
+  }
+  const qualityResult = evaluation("failed", [
+    result("overview", "met", false),
+    result("sky-colour", "contradicted", false),
+  ])
+  qualityResult.mode = "criteria"
+  qualityResult.coverage = 0.5
+  qualityResult.diagnostic = {
+    code: "content-error",
+    source: "quality",
+    severity: "blocking",
+  }
+  qualityResult.model = {
+    id: "quality-authoritative",
+    revision: "test",
+    device: "webgpu",
+    dtype: "q4f16",
+    task: "generative-assessment",
+  }
+  const qualityStatus: RuntimeStatus = {
+    phase: "ready",
+    assessmentEngine: "quality",
+    modelId: "quality-authoritative",
+    revision: "test",
+    device: "webgpu",
+    dtype: "q4f16",
+  }
+  const quality = {
+    getStatus: () => qualityStatus,
+    evaluate: async () => {
+      qualityCalls += 1
+      return qualityResult
+    },
+    evaluateLanguage: async () => undefined,
+    unloadRuntime: async () => undefined,
+    clearCache: async () => 0,
+  }
+  const automatic = new AutomaticEvaluator(compact as never, quality as never)
+  ;(automatic as unknown as { qualityReady: boolean }).qualityReady = true
+
+  const assessed = await automatic.evaluate({
+    question: "Beschreibe das Bild.",
+    answer: "Der Himmel ist nicht blau, sondern rot.",
+    reference: "Der Himmel ist blau.",
+    criteria: [
+      { id: "overview", text: "Die Landschaft wird beschrieben.", required: false },
+      { id: "sky-colour", text: "Der Himmel ist blau.", required: false },
+    ],
+    passThreshold: 0.5,
+    assessmentEngine: "quality",
+  })
+
+  assert.equal(assessed.status, "failed")
+  assert.equal(assessed.passed, false)
+  assert.equal(assessed.criteria[1]?.status, "contradicted")
+  assert.equal(assessed.diagnostic?.code, "content-error")
+  assert.equal(assessed.model.task, "generative-assessment")
+  assert.equal(qualityCalls, 1)
+  assert.equal(compactCalls, 0)
 })
 
 test('AutomaticEvaluator rejects manipulation before model work', async () => {
@@ -9866,7 +10470,7 @@ test("learner feedback stays short and never exposes criteria or scores", () => 
     "Stelle Ursache, Prinzip oder Bedingung und die daraus folgende Wirkung nachvollziehbar in Beziehung.",
   )
 
-  const unavailable = evaluation("uncertain", [result("secret", "met")])
+  const unavailable = evaluation("uncertain", [result("secret", "contradicted")])
   unavailable.diagnostic = {
     code: "operator-check-unavailable",
     source: "compact",
@@ -9875,6 +10479,16 @@ test("learner feedback stays short and never exposes criteria or scores", () => 
   assert.equal(
     feedbackForResult(unavailable)?.message,
     "Die verlangte Antwortform konnte gerade nicht zuverlässig geprüft werden. Versuche die Prüfung erneut, sobald die Qualitätsprüfung verfügbar ist.",
+  )
+  const unavailableHtml = formatResult(
+    unavailable,
+    "de-DE",
+    { showCriteria: true },
+  )
+  assert.match(unavailableHtml, /Antwortform konnte gerade nicht/u)
+  assert.doesNotMatch(
+    unavailableHtml,
+    /fachlichen Widerspruch|widersprüchlich|Widerspruchspassage|Sicher bestätigte Abdeckung/u,
   )
 })
 
@@ -10139,7 +10753,7 @@ function createLLMQuizValidatorRunner(): LLMQuizValidatorRunner {
   ) as LLMQuizValidatorRunner
 }
 
-test("the public version remains pinned exactly to 0.6.1", () => {
+test("the public version remains pinned exactly to 0.6.2", () => {
   const packageJson = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   ) as { version?: string }
@@ -10148,12 +10762,20 @@ test("the public version remains pinned exactly to 0.6.1", () => {
   ) as { version?: string; packages?: { ""?: { version?: string } } }
   const entry = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8")
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8")
+  const bundle = readFileSync(new URL("../dist/index.js", import.meta.url), "utf8")
+  const browserSmoke = readFileSync(
+    new URL("browser-api-smoke.html", import.meta.url),
+    "utf8",
+  )
 
-  assert.equal(packageJson.version, "0.6.1")
-  assert.equal(packageLock.version, "0.6.1")
-  assert.equal(packageLock.packages?.[""]?.version, "0.6.1")
-  assert.match(entry, /const VERSION = "0\.6\.1"/u)
-  assert.match(readme, /^version:\s+0\.6\.1$/mu)
+  assert.equal(packageJson.version, "0.6.2")
+  assert.equal(packageLock.version, "0.6.2")
+  assert.equal(packageLock.packages?.[""]?.version, "0.6.2")
+  assert.match(entry, /const VERSION = "0\.6\.2"/u)
+  assert.match(bundle, /let [\w$]+="0\.6\.2",[\w$]+=globalThis/u)
+  assert.doesNotMatch(bundle, /let [\w$]+="0\.6\.1",[\w$]+=globalThis/u)
+  assert.match(browserSmoke, /window\.LiaLLM\.version === "0\.6\.2"/u)
+  assert.match(readme, /^version:\s+0\.6\.2$/mu)
   assert.match(readme, /^script:\s+\.\/dist\/index\.js$/mu)
   assert.doesNotMatch(
     readme,
@@ -10470,7 +11092,7 @@ test("LLMQuiz forwards its explicit question and operator", async () => {
   await run(
     {
       LiaLLM: {
-        version: "0.6.1",
+        version: "0.6.2",
         parseMacroOptions,
         parseCriteriaBlock,
         parseReferenceVariants,
@@ -10510,7 +11132,7 @@ test("LLMQuiz rejects coverage without a criteria block before evaluation", asyn
   await run(
     {
       LiaLLM: {
-        version: "0.6.1",
+        version: "0.6.2",
         parseMacroOptions,
         parseCriteriaBlock,
         parseReferenceVariants,
@@ -10556,7 +11178,7 @@ test("LLMQuiz preserves required criteria when coverage is omitted", async () =>
   await run(
     {
       LiaLLM: {
-        version: "0.6.1",
+        version: "0.6.2",
         parseMacroOptions,
         parseCriteriaBlock: () => criteriaBlock,
         parseReferenceVariants,
@@ -10609,7 +11231,7 @@ test("LLMQuiz shares cloned coverage criteria and thresholds with language analy
   await run(
     {
       LiaLLM: {
-        version: "0.6.1",
+        version: "0.6.2",
         parseMacroOptions,
         parseCriteriaBlock: () => criteriaBlock,
         parseReferenceVariants,
@@ -10917,6 +11539,44 @@ test("browser criteria calibration covers the Leyla compact pass and fail cases"
     /matches: result\.passed === expected\[index\] && usesExpectedModel/u,
   )
   assert.doesNotMatch(html, /\boperator\s*:/u)
+})
+
+test("manual Quality criteria calibration covers coverage and an explicit counterclaim", () => {
+  const html = readFileSync(
+    new URL(
+      "../test/browser-quality-criteria-calibration.html",
+      import.meta.url,
+    ),
+    "utf8",
+  )
+  const calibrationScript = html.match(
+    /<script>\n([\s\S]*?)\n<\/script>/u,
+  )?.[1]
+  assert.ok(calibrationScript)
+  assert.doesNotThrow(() => new Function(calibrationScript))
+  assert.match(html, /assessmentEngine: "quality"/u)
+  assert.match(html, /criterionThreshold: 0\.55/u)
+  assert.match(html, /passThreshold: 0\.66/u)
+  assert.match(html, /result\.model\.task === "generative-assessment"/u)
+  assert.match(html, /window\.LiaLLM\.getStatus\(\)/u)
+  assert.match(html, /20 \* 60 \* 1000/u)
+  assert.match(html, /met >= item\.minimumMet/u)
+  assert.match(html, /expectedPassed: true,[\s\S]*minimumMet: 6/u)
+  assert.match(html, /expectedContradiction: false/u)
+  assert.match(html, /Der Himmel ist nicht blau, sondern rot\./u)
+  assert.match(html, /expectedContradiction: true/u)
+  assert.match(
+    html,
+    /criterion\.id === "criterion-4"[\s\S]*criterion\.id === "criterion-5"/u,
+  )
+  assert.equal(
+    (
+      html.match(
+        /^  "(?:Die |Im |In )/gmu,
+      ) ?? []
+    ).length,
+    8,
+  )
 })
 
 test("browser adversarial calibration distinguishes the deterministic guard from Qwen", () => {
