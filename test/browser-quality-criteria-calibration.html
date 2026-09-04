@@ -51,9 +51,9 @@ const criteria = [
 }))
 const cases = [
   {
-    id: "reproduction",
+    id: "reported-answer",
     answer:
-      "In dem Bild sieht man einen blauen Himmel mit einigen leichten Wolken. im Vordergrund ist eine Wiese im satten Grün zu sehen und ein Laubbaum der einen Schatten wirft. Im Hintergrund sind auf der Wiese immer wieder vereinzelt Bäume zu sehen. Insgesamt ist es eine Hügellandschaft, welche eine Zuversicht und Hoffnung verströmt.",
+      "Auf dem Bild sind H\u00fcgel zu erkennen. Im Vordergrund steht ein Baum und im Hintergrund sind H\u00fcgel zu sehen, auf denen immer mal ein Baum steht. Bei den H\u00fcgeln handelt es sich um eine Wiesenlandschaft. Die Wiese ist im satten Gr\u00fcn. Der Himmel ist blau und hat ein paar wei\u00dfe Wolken. Das Bild wirkt freundlich und strahlt Zuversicht aus.",
     expectedPassed: true,
     minimumMet: 6,
     expectedContradiction: false
@@ -103,6 +103,7 @@ window.__liaCalibrationExpected = cases.length
 ;(async () => {
   try {
     for (const item of cases) {
+      const startedAt = performance.now()
       const result = await evaluateWithQuality({
         question,
         answer: item.answer,
@@ -137,6 +138,7 @@ window.__liaCalibrationExpected = cases.length
         minimumMet: item.minimumMet,
         contradicted,
         expectedContradiction: item.expectedContradiction,
+        durationMs: Math.round(performance.now() - startedAt),
         criteria: result.criteria.map(criterion => ({
           id: criterion.id,
           status: criterion.status,

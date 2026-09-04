@@ -402,13 +402,15 @@ Konfiguriert sind zwei optionale Quality-Stufen mit unveränderlichen Revisionen
 `a5c9fab855e3ccbdfed2e7e69683d75f30332161` und 2.280.000.000 B. Beide verwenden die gepinnte
 Modellbibliotheksrevision `025bcaf3780fa8254f5e5efd3bfea0a5397248f4`.
 
-Vor einem ungecacheten Quality-Download wählt das Template anhand von
-`navigator.storage.estimate()` und einer Reserve von `max(512 MiB, 10 % der quota)` die größte
-passende Stufe. Bei unbekannter Quote wird 1.7B gewählt; reicht eine bekannte Quote für keine
-Stufe, startet kein Quality-Download. Eine gemeldete Origin-Quote von 4.000.000.000 B reicht
-rechnerisch auch bei bereits vorhandenem Kompaktmodell für die 4B-Stufe einschließlich Reserve.
-Ein vorhandener 1.7B-Cache wird bei Bedarf als nach Zustimmung freigebbarer Platz berücksichtigt
-und erst nach dieser Zustimmung gezielt entfernt; anschließend wird die Quote erneut geprüft.
+Vor einem ungecacheten Quality-Download prüft das Template
+`navigator.storage.estimate()` mit einer Reserve von `max(512 MiB, 10 % der quota)`.
+Version 0.6.4 wählt 1.7B als erprobten Produktionsstandard, sobald diese Stufe sicher passt oder
+ihre Gewichte bereits vorhanden sind; eine große Origin-Quote löst kein automatisches
+4B-Upgrade mehr aus. Bei unbekannter Quote bleibt 1.7B die konservative Auswahl; reicht eine
+bekannte Quote dafür nicht, startet kein neuer Quality-Download. Ein vollständig gecachtes
+4B-Modell kann als Fallback dienen, wenn 1.7B nicht zusätzlich sicher passt. Ein Large-Pfad ist nur
+intern für Tests und mögliche Integrationen reserviert; die öffentliche Makro-API exponiert ihn
+nicht.
 Eine als vollständig gecacht freigegebene Aktivierung bleibt netzwerkgesperrt: Verschwundene oder
 beschädigte Artefakte dürfen erst nach einer neuen Bestätigung nachgeladen werden.
 Das belegt jedoch weder ausreichenden GPU-Speicher noch ein stabiles WebGPU-Gerät. Compact bleibt
@@ -433,6 +435,7 @@ Die Ergebnisse vor und nach der 0.6.3-Kompatibilitätskorrektur sind getrennt zu
 | 0.6.3, Command-Buffer-Cap ohne Ausgabeschema | Diagnoselauf über mehr als acht Minuten | GPU blieb stabil; die Ausgaben waren jedoch kein gültiges JSON und deshalb kein fachlicher PASS |
 | 0.6.3, Cap und JSON-Schema vor dem Einzelkriterienzusatz | 16/16 Einzelentscheidungen in rund 139 Sekunden | technisch vollständig; die Reproduktion erreichte aber nur 4/8, und die Gegenbehauptung wurde wegen falsch interpretierter `confidence=0` nicht bestätigt |
 | finaler 0.6.3-Stand | exakter `5_09`-Kriterienlauf | 2/2 Fälle in rund 139 Sekunden; Reproduktion 8/8, Gegenbehauptung mit vier Widersprüchen abgewiesen; 16/16 ohne GPU-, Grammar- oder Parserfehler |
+| 0.6.4, Kriterien-Batching und gezielter Recheck | exakter `5_09`-Kriterienlauf mit 1.7B | 2/2 Fälle in 25.655 ms + 27.741 ms; gemeldete Antwort 8/8, Gegenbehauptung am Himmelskriterium bestätigt; zwei Batchaufrufe plus ein Recheck ohne GPU-, Grammar- oder Parserfehler |
 
 Version 0.6.3 hält unveränderliche Shape-Tuples bis zum Engine-Abbau gültig, synchronisiert
 ausstehende GPU-Readbacks auch über spätere Queue-Arbeit hinweg und begrenzt jeden Command-Buffer
@@ -466,7 +469,7 @@ abweisen, ersetzt aber keine ausreichende semantische Modellleistung.
 
 Der reproduzierbare Inhalts-Stresstest wird nach einem aktuellen Build mit
 `npm run test:browser-adversarial` ausgeführt. Ein technisch erfolgreicher Lauf beweist nur die
-dort geprüften Fälle. Er wurde mit dem finalen 0.6.3-Stand noch nicht erneut vollständig belegt.
+dort geprüften Fälle. Er wurde mit dem finalen 0.6.4-Stand noch nicht erneut vollständig belegt.
 Der erfolgreiche Kriterienlauf unten ersetzt diesen 12-Fälle-Test nicht; umgekehrt widerlegt der
 frühere Geräteverlust nicht mehr die technische Lauffähigkeit des final gepatchten 1.7B-Stands.
 
@@ -481,14 +484,19 @@ WebGPU und gegebenenfalls einen Download von etwa 984 MB beziehungsweise 2,28 GB
 bestandener semantischer Kalibrierungsfall ersetzt nicht den folgenden
 Cold→Neustart→Offline-Inferenz→Clear-Freigabeablauf.
 
-Der finale 0.6.3-Lauf des exakten `5_09`-Falls bestand beide Fälle in rund 139 Sekunden. Die
-Reproduktion erreichte 8 von 8 erfüllten Kriterien bei geforderten mindestens 6. Die ausdrückliche
-Gegenbehauptung wurde abgewiesen und erzeugte vier bestätigte Widersprüche. Alle 16 Quality-Aufrufe
-endeten ohne GPU-, Grammar- oder Parserfehler.
+Der 0.6.4-Lauf des exakten `5_09`-Falls bestand beide Fälle in 25.655 ms beziehungsweise
+27.741 ms. Die vom Nutzer gemeldete Antwort erreichte 8 von 8 erfüllten Kriterien bei geforderten
+mindestens 6. Die ausdrückliche
+Gegenbehauptung wurde nach einem gezielten Einzelrecheck am Himmelskriterium als Widerspruch
+abgewiesen. Statt 16 serieller Quality-Aufrufe benötigte der Lauf zwei Batchaufrufe und einen
+Recheck; alle endeten ohne GPU-, Grammar- oder Parserfehler. Die 59 Wörter lange
+Reproduktionsantwort löste insbesondere kein automatisches Thinking mehr aus, weil die
+dokumentierte Längenschwelle nun tatsächlich 160 Wörter beträgt.
 
-Der normale npm-Kurzbefehl verwendet die produktive automatische Stufenwahl und kann bei großer
-Origin-Quote Qwen3-4B auswählen. Für eine gezielte Qwen3-1.7B-Wiederholung besitzt nur die
-Test-Fixture den Queryparameter `qualityTier=small`. Da WebLLM-Caches an die vollständige Origin
+Der normale npm-Kurzbefehl verwendet die produktive automatische Stufenwahl und bleibt nun auch
+bei großer Origin-Quote auf Qwen3-1.7B. Für eine zusätzlich erzwungene
+Qwen3-1.7B-Wiederholung besitzt die Test-Fixture den Queryparameter `qualityTier=small`. Da
+WebLLM-Caches an die vollständige Origin
 einschließlich Port gebunden sind, muss für vergleichbare Cold-/Warm-Läufe derselbe freie Port
 verwendet werden:
 

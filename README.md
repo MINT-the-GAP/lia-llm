@@ -1,6 +1,6 @@
 <!--
 author:      MINT-the-GAP, Martin Lommatzsch
-version:     0.6.3
+version:     0.6.4
 language:    de
 narrator:    Deutsch Female
 comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
@@ -118,8 +118,8 @@ Promise.resolve()
     if (!window.LiaLLM) {
       throw new Error("lia-llm konnte nicht geladen werden.")
     }
-    if (window.LiaLLM.version !== "0.6.3") {
-      throw new Error(`lia-llm 0.6.3 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
+    if (window.LiaLLM.version !== "0.6.4") {
+      throw new Error(`lia-llm 0.6.4 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
     }
 
     const options = window.LiaLLM.parseMacroOptions(optionSource)
@@ -638,19 +638,27 @@ Musterlösung eingeblendet.
 
 ### Adaptiver Denkmodus
 
-Das Qualitätsmodell bewertet zunächst kurz und strukturiert. Ist das Ergebnis grenznah oder
-`uncertain`, umfasst die Antwort mindestens 160 Wörter oder ist eine Operatorantwort ab 24 Wörtern
-zu prüfen, darf für das betroffene Kriterium höchstens ein zusätzlicher Thinking-Lauf folgen.
-Für einen solchen Zweitlauf gelten grundsätzlich `maxthinkingtime=15s` und
-`maxthinkingtokens=medium`. Ab 160 Wörtern wird jede nicht ausdrücklich gesetzte Dimension adaptiv
-auf `maxthinkingtime=30s` beziehungsweise `maxthinkingtokens=ultra` angehoben. Eine explizit
-gesetzte Zeit oder Tokenstufe bleibt jeweils erhalten; nur die jeweils fehlende Angabe wird
-automatisch ergänzt.
+Das Qualitätsmodell bewertet zunächst kurz und strukturiert. Bei atomaren Kriterien werden bis zu
+acht Kriterien in einem gemeinsamen Erstdurchlauf geprüft, aber weiterhin einzeln und fail-closed
+zugeordnet. Eine Antwort wie im Fall `5_09` benötigt deshalb nicht mehr acht serielle
+Qwen-Aufrufe. Liefert der Batch unsichere Einzelentscheidungen, wird zunächst höchstens das anhand
+der Antwort relevanteste unsichere Kriterium noch einmal ohne Thinking einzeln geprüft. Ein dabei
+bestätigter Widerspruch beendet die fachliche Prüfung sofort. Nur wenn danach noch eine vertiefte
+Prüfung sinnvoll ist, dürfen höchstens zwei relevante Kriterien das gemeinsame Thinking-Budget
+verwenden.
+
+Ist ein Ergebnis grenznah oder `uncertain`, umfasst die Antwort mindestens 160 Wörter oder ist
+eine Operatorantwort ab 24 Wörtern zu prüfen, kann ein zusätzlicher Thinking-Lauf folgen. Dafür
+gelten grundsätzlich `maxthinkingtime=15s` und `maxthinkingtokens=medium`. Ab 160 Wörtern wird
+jede nicht ausdrücklich gesetzte Dimension adaptiv auf `maxthinkingtime=30s` beziehungsweise
+`maxthinkingtokens=ultra` angehoben. Eine explizit gesetzte Zeit oder Tokenstufe bleibt jeweils
+erhalten; nur die jeweils fehlende Angabe wird automatisch ergänzt.
 
 Die Zeitangabe begrenzt nur den zusätzlichen Thinking-Lauf nach dem schnellen Erstdurchlauf; Laden
 und Initialisieren des Modells zählen nicht dazu. Sie ist unter WebGPU eine weiche Obergrenze, weil
-ein bereits laufender GPU-Schritt erst anschließend unterbrochen werden kann. `0s` deaktiviert den
-Thinking-Lauf. Die Tokenpresets entsprechen `low=256`, `medium=512`, `high=768`,
+ein bereits laufender GPU-Schritt erst anschließend unterbrochen werden kann. `0s` deaktiviert
+sowohl den optionalen Einzelrecheck als auch den Thinking-Lauf. Die Tokenpresets entsprechen
+`low=256`, `medium=512`, `high=768`,
 `ultra=1024` und `extreme=2048`. Dieses Gesamt-Completion-Budget umfasst sowohl den internen
 `<think>`-Block als auch das abschließende JSON und gilt als gemeinsames Budget für die gesamte
 Antwort, nicht erneut pro Kriterium. `ultra` ist nur für leistungsfähige Geräte gedacht;
@@ -896,8 +904,8 @@ Insbesondere bleibt ein dort festgestelltes `contradicted` unabhängig von `cove
 
 | Stufe | Modell und Laufzeit | Erster Download | Einordnung |
 | --- | --- | ---: | --- |
-| Qualität (bevorzugt, Opt-in) | Qwen3-4B über WebLLM | ca. 2,28 GB (2,12 GiB) | wird bei ausreichendem Origin-Speicher gewählt; benötigt WebGPU und einen Realgerätetest |
-| Qualität (kleiner, Opt-in) | Qwen3-1.7B über WebLLM | ca. 984 MB | konservative Auswahl bei kleinerem oder unbekanntem Speicherbudget; benötigt WebGPU |
+| Qualität (Standard, Opt-in) | Qwen3-1.7B über WebLLM | ca. 984 MB | erprobte, ressourcenschonende Quality-Stufe; benötigt WebGPU |
+| Qualität (experimentell) | Qwen3-4B über WebLLM | ca. 2,28 GB (2,12 GiB) | wird nicht automatisch neu heruntergeladen; kann nur als vollständig vorhandener Cache-Fallback dienen, die öffentliche Makro-API bietet keine Large-Auswahl |
 | sicherer Standard/Fallback | mDeBERTa-v3 NLI über Transformers.js | ca. 379 MB inklusive ONNX-Laufzeit | normale Engine ohne Quality-Opt-in; läuft bei Bedarf mit WASM |
 
 Beim standardmäßigen WASM-Start laufen ONNX-Sitzung und Inferenz des
@@ -908,20 +916,19 @@ LiaScript-UI-Thread. Einbettende Seiten müssen dafür die unter
 Vor jedem noch nicht vollständig gecachten Quality-Download wertet das Template, soweit verfügbar,
 `navigator.storage.estimate()` aus. Bei gültiger `quota` und `usage` gilt als frei
 `quota - usage`; zusätzlich bleibt eine Reserve von `max(512 MiB, 10 % der quota)` unangetastet.
-Qwen3-4B wird gewählt, wenn 2.280.000.000 B plus Reserve frei sind, andernfalls Qwen3-1.7B, wenn
-984.000.000 B plus Reserve frei sind. Reicht ein bekanntes Budget auch dafür nicht, startet kein
-Quality-Download. Fehlt die Storage-API, schlägt sie fehl oder liefert sie keine belastbaren Werte,
-wird konservativ Qwen3-1.7B gewählt. Ein vollständig gecachtes 4B-Modell kann unabhängig von der
-aktuellen Restquote wiederverwendet werden. Ist bereits 1.7B gecacht und passt 4B nur nach dessen
-Entfernung, rechnet die Auswahl diesen Platz als freigebbar ein; der Dialog weist auf den Austausch
-hin und löscht 1.7B erst nach der ausdrücklichen Bestätigung. Danach wird die Quote erneut geprüft;
-meldet der Browser weiterhin zu wenig Platz, beginnt der 4B-Download nicht.
+Qwen3-1.7B wird als verlässlicher Standard gewählt, sobald seine 984.000.000 B plus Reserve frei
+sind oder seine Gewichte bereits im Cache liegen. Reicht ein bekanntes Budget nicht einmal dafür,
+startet kein neuer Quality-Download. Fehlt die Storage-API, schlägt sie fehl oder liefert sie keine
+belastbaren Werte, bleibt 1.7B die konservative Auswahl. Qwen3-4B wird standardmäßig nicht neu
+heruntergeladen. Ein bereits vollständig vorhandenes 4B-Modell kann als Fallback wiederverwendet
+werden, wenn 1.7B nicht sicher zusätzlich Platz findet. Der interne Selektor hält einen
+Large-Pfad für Tests und mögliche Integrationen vor; die öffentliche Makro-API stellt diese
+Auswahl derzeit nicht bereit.
 
-Bei einer tatsächlich für diese Herkunft gemeldeten Quote von 4.000.000.000 B und einem bereits
-belegten Kompakt-Cache von etwa 378.614.439 B besteht die 4B-Stufe diese Prüfung einschließlich
-Reserve. Erhöht eine Schulrichtlinie dagegen nur den allgemeinen HTTP-Diskcache, ohne die von
-`navigator.storage.estimate()` gemeldete Origin-Quote zu erhöhen, bleibt für die Auswahl der
-niedrigere Browserwert maßgeblich. Alle Werte sind Schätzungen; ein späteres
+Auch bei einer für diese Herkunft gemeldeten Quote von 4.000.000.000 B bleibt 1.7B der
+Produktionsstandard. Erhöht eine Schulrichtlinie nur den allgemeinen HTTP-Diskcache, ohne die von
+`navigator.storage.estimate()` gemeldete Origin-Quote zu erhöhen, bleibt für die Zulässigkeit
+eines Downloads der niedrigere Browserwert maßgeblich. Alle Werte sind Schätzungen; ein späteres
 `QuotaExceededError` kann der Browser trotzdem melden.
 
 Die Prüfung betrifft ausschließlich den Browsercache der aktuellen Herkunft. Sie misst weder
@@ -937,25 +944,29 @@ Download erneut eine Bestätigung an.
 
 Auf dem lokal getesteten Edge-151-System mit einer RTX 2070 SUPER verlor die unveränderte
 WebLLM-0.2.84-Laufzeit mit Qwen3-1.7B in vier von vier warmen Minimalläufen das GPU-Gerät
-(`DXGI_ERROR_DEVICE_HUNG`). Version 0.6.3 enthält deshalb eng an diese gepinnte Laufzeit gebundene
+(`DXGI_ERROR_DEVICE_HUNG`). Seit Version 0.6.3 enthält das Template deshalb eng an diese gepinnte Laufzeit gebundene
 Kompatibilitätskorrekturen: Unveränderliche Shape-Tuples bleiben bis zum Abbau der Engine gültig,
 ausstehende GPU-zu-CPU-Readbacks werden auch bei nachfolgender Queue-Arbeit vollständig abgewartet
 und ein WebGPU-Command-Buffer wird auf höchstens 32 Compute-Pässe begrenzt.
 
 Mit diesem Stand bestanden auf demselben Host ein Cold- und zwei Warm-Direktläufe mit
-Qwen3-1.7B. Der exakte Kriterienfall `5_09` bestand anschließend beide Prüffälle in rund
-139 Sekunden: Die Reproduktion erfüllte im finalen Bundle 8 von 8 Kriterien, die ausdrückliche Gegenbehauptung wurde
-mit vier bestätigten Widersprüchen abgewiesen, und alle 16 Einzelentscheidungen wurden ohne GPU-,
-Grammar- oder Parserfehler abgeschlossen. Das ist ein gezielter Nachweis für diesen 1.7B-Lauf auf
-diesem Host, aber noch keine allgemeine Freigabe: Qwen3-4B, der vollständige
+Qwen3-1.7B. Der exakte Kriterienfall `5_09` bestand mit Version 0.6.4 beide Prüffälle in rund
+53 Sekunden reiner Auswertungszeit statt zuvor rund 139 Sekunden: Die gemeldete Antwort benötigte
+25.655 ms und erfüllte 8 von 8 Kriterien; die
+ausdrückliche Gegenbehauptung wurde nach einem gezielten Einzelrecheck am Himmelskriterium als
+Widerspruch abgewiesen. Die beiden Batchdurchläufe und der eine Recheck endeten ohne GPU-,
+Grammar- oder Parserfehler. Das ist ein gezielter Nachweis für diesen 1.7B-Lauf auf diesem Host,
+aber noch keine allgemeine Freigabe: Qwen3-4B, der vollständige
 Cold→Neustart→Offline→Clear-Ablauf und die tatsächlichen Schulgeräte bleiben separat zu prüfen.
 Die zwischenzeitlich geprüfte 0.6B-Variante bestand den semantischen Stresstest nur in 6 von 12
 Fällen und wird nicht als Bewertungsmodell ausgeliefert.
 
 Seit Version 0.5.14 entfernt das Template vor einem neuen Quality-Download die exakt gepinnten
-ausgehenden Qwen3-0.6B-Artefakte. Ein vorhandenes Qwen3-1.7B wird zusätzlich nur dann entfernt,
-wenn nach Zustimmung auf Qwen3-4B umgestellt und sein Platz dafür benötigt wird. Ansonsten bleiben
-die aktiven Quality-Artefakte und fremde WebLLM-Cacheeinträge erhalten.
+ausgehenden Qwen3-0.6B-Artefakte. Der normale 1.7B-Standard entfernt kein vorhandenes
+Qwen3-1.7B zugunsten eines automatischen 4B-Upgrades. Der entsprechende Large-Pfad ist nur
+intern für Tests und mögliche Integrationen reserviert; die öffentliche Makro-API exponiert ihn
+nicht. Ansonsten bleiben die aktiven
+Quality-Artefakte und fremde WebLLM-Cacheeinträge erhalten.
 
 Es gibt zwei bewusst getrennte Anzeigen:
 

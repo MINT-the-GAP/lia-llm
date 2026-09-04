@@ -553,7 +553,7 @@ export function registerLoadOverlay(api: LiaLLMApi): void {
         formatBytes(selection.storage.safetyReserveBytes) +
         " bleiben als Sicherheitsreserve frei." +
         (selection.reason === "small-fits"
-          ? " Deshalb wird die kleinere Quality-Variante verwendet."
+          ? " F\u00fcr eine zuverl\u00e4ssige und ressourcenschonende Pr\u00fcfung wird die erprobte kleinere Quality-Variante verwendet."
           : selection.reason === "large-fits-after-small-removal"
             ? " Das vorhandene kleinere Quality-Modell wird erst nach deiner Bestätigung durch die große Variante ersetzt."
             : "")

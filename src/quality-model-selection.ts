@@ -73,6 +73,8 @@ export interface QualityModelCaches {
 export interface QualityModelSelectionInput {
   readonly storage: StorageAvailability
   readonly cache?: QualityModelCaches
+  /** Large is opt-in; the verified small tier is the production default. */
+  readonly preferredTier?: SelectableQualityModel["tier"]
 }
 
 export type QualityModelSelectionReason =
@@ -99,6 +101,7 @@ export interface QualityModelSelectionDecision {
 export interface EstimateAndSelectQualityModelOptions
   extends StorageEstimateOptions {
   readonly cache?: QualityModelCaches
+  readonly preferredTier?: SelectableQualityModel["tier"]
 }
 
 function browserStorageEstimateSource(): StorageEstimateSource | undefined {
@@ -257,8 +260,8 @@ function decision(
 }
 
 /**
- * Selects the best viable model. Cached payloads take priority over estimates;
- * without a usable estimate the smaller model is the conservative fallback.
+ * Selects the verified small tier by default. The large tier is used only
+ * when explicitly preferred or when its cache is the sole viable fallback.
  */
 export function selectQualityModel(
   input: QualityModelSelectionInput,
@@ -267,6 +270,61 @@ export function selectQualityModel(
   const smallFullyCached = modelIsFullyCached(input.cache?.small)
   const largePayloadCached = payloadIsCached(input.cache?.large)
   const smallPayloadCached = payloadIsCached(input.cache?.small)
+  if (input.preferredTier !== "large") {
+    if (smallFullyCached) {
+      return decision(
+        SMALL_QUALITY_MODEL,
+        true,
+        "small-cached",
+        true,
+        input.storage,
+      )
+    }
+    if (smallPayloadCached) {
+      return decision(
+        SMALL_QUALITY_MODEL,
+        true,
+        "small-payload-cached",
+        true,
+        input.storage,
+      )
+    }
+    if (modelFits(SMALL_QUALITY_MODEL, input.storage)) {
+      return decision(
+        SMALL_QUALITY_MODEL,
+        true,
+        "small-fits",
+        false,
+        input.storage,
+      )
+    }
+    if (largeFullyCached) {
+      return decision(
+        LARGE_QUALITY_MODEL,
+        true,
+        "large-cached",
+        true,
+        input.storage,
+      )
+    }
+    if (input.storage.kind === "unknown") {
+      return decision(
+        SMALL_QUALITY_MODEL,
+        true,
+        "estimate-unavailable",
+        false,
+        input.storage,
+      )
+    }
+    return decision(
+      SMALL_QUALITY_MODEL,
+      false,
+      "insufficient-storage",
+      false,
+      input.storage,
+    )
+  }
+
   if (largeFullyCached) {
     return decision(
       LARGE_QUALITY_MODEL,
@@ -368,5 +426,9 @@ export async function estimateAndSelectQualityModel(
     source: options.source,
     timeoutMs: options.timeoutMs,
   })
-  return selectQualityModel({ storage, cache: options.cache })
+  return selectQualityModel({
+    storage,
+    cache: options.cache,
+    preferredTier: options.preferredTier,
+  })
 }

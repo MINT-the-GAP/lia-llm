@@ -139,6 +139,7 @@ import {
   QualityEvaluator,
   referenceAnchoredSpelling,
   qualityDiagnosticForCriteria,
+  QUALITY_CRITERIA_BATCH_INSTRUCTION,
   QUALITY_CRITERIA_DECISION_INSTRUCTION,
   QUALITY_POST_DATA_INSTRUCTION,
   QUALITY_RESPONSE_SCHEMA,
@@ -3886,6 +3887,236 @@ test("QualityEvaluator distinguishes atomic criteria from holistic completeness"
   assert.deepEqual(holisticPayload.erwartungshorizonte, [reference])
 })
 
+test("QualityEvaluator batches all eight 5_09 criteria without unnecessary thinking", async () => {
+  const requests: Array<Record<string, unknown>> = []
+  const engine = {
+    interruptGenerate: async () => undefined,
+    chat: {
+      completions: {
+        create: async (request: Record<string, unknown>) => {
+          requests.push(request)
+          const payload = assessmentPayloadFromRequest(request)
+          const batch = payload.kriterien as Array<Record<string, unknown>>
+          assert.ok(Array.isArray(batch))
+          return {
+            choices: [{
+              finish_reason: "stop",
+              message: {
+                content: JSON.stringify({
+                  criteria: batch.map((criterion) => ({
+                    criterion_id: criterion.kriterium_id,
+                      decision: "pass",
+                      confidence: 0.96,
+                      feedback_code: "none",
+                      operator_criterion_id: "",
+                  })),
+                }),
+              },
+            }],
+          }
+        },
+      },
+    },
+  }
+  const evaluator = new QualityEvaluator()
+  ;(evaluator as unknown as { engine: typeof engine | null }).engine = engine
+  const answer =
+    "Auf dem Bild sind Huegel zu erkennen. Im Vordergrund steht ein Baum und im Hintergrund sind Huegel zu sehen, auf denen immer mal ein Baum steht. Bei den Huegeln handelt es sich um eine Wiesenlandschaft. Die Wiese ist im satten Gruen. Der Himmel ist blau und hat ein paar weisse Wolken. Das Bild wirkt freundlich und strahlt Zuversicht aus."
+  const criteria = Array.from({ length: 8 }, (_, index) => ({
+    id: `criterion-${index + 1}`,
+    text: `Das Kriterium ${index + 1} ist inhaltlich erfuellt.`,
+    required: true,
+  }))
+
+  const assessed = await evaluator.evaluate(
+    {
+      question: "Beschreibe das Landschaftsbild.",
+      answer,
+      reference: "Eine vollstaendige Beschreibung der Landschaft.",
+      criteria,
+      passThreshold: 1,
+    },
+    { maxThinkingTimeMs: 15_000, maxThinkingTokens: 512 },
+  )
+
+  assert.equal(requests.length, 1)
+  assert.equal(assessed.passed, true)
+  assert.equal(assessed.criteria.length, 8)
+  assert.equal(
+    assessed.criteria.every((criterion) => criterion.status === "met"),
+    true,
+  )
+  const payload = assessmentPayloadFromRequest(requests[0]!)
+  assert.equal(payload.bewertungsmodus, "kriterienliste")
+  assert.equal((payload.kriterien as unknown[]).length, 8)
+  assert.equal(requests[0]?.max_tokens, 608)
+  assert.deepEqual(requests[0]?.extra_body, { enable_thinking: false })
+  const responseFormat = requests[0]?.response_format as {
+    type?: unknown
+    schema?: unknown
+  }
+  assert.equal(responseFormat.type, "json_object")
+  assert.equal(typeof responseFormat.schema, "string")
+  const schema = JSON.parse(String(responseFormat.schema)) as {
+    properties?: { criteria?: { minItems?: number; maxItems?: number } }
+  }
+  assert.equal(schema.properties?.criteria?.minItems, 8)
+  assert.equal(schema.properties?.criteria?.maxItems, 8)
+  const messages = requests[0]?.messages as
+    | Array<{ role?: string; content?: string }>
+    | undefined
+  assert.equal(
+    messages?.find((message) => message.role === "user")?.content
+      ?.endsWith(QUALITY_CRITERIA_BATCH_INSTRUCTION),
+    true,
+  )
+})
+
+test("QualityEvaluator rechecks the most relevant uncertain batch criterion", async () => {
+  const payloads: Array<Record<string, unknown>> = []
+  const engine = {
+    interruptGenerate: async () => undefined,
+    chat: {
+      completions: {
+        create: async (request: Record<string, unknown>) => {
+          const payload = assessmentPayloadFromRequest(request)
+          payloads.push(payload)
+          if (payload.bewertungsmodus === "einzelkriterium") {
+            assert.equal(
+              payload.musterloesung,
+              "Im Hintergrund ist der Himmel blau.",
+            )
+            return {
+              choices: [{
+                finish_reason: "stop",
+                message: {
+                  content: JSON.stringify({
+                    decision: "fail_contradiction",
+                    confidence: 0.95,
+                    feedback_code: "content-error",
+                    operator_criterion_id: "",
+                    selected_reference_index: 0,
+                  }),
+                },
+              }],
+            }
+          }
+          const batch = payload.kriterien as Array<Record<string, unknown>>
+          return {
+            choices: [{
+              finish_reason: "stop",
+              message: {
+                content: JSON.stringify({
+                  criteria: batch.map((criterion) => ({
+                    criterion_id: criterion.kriterium_id,
+                    decision: "fail_incomplete",
+                    confidence: 0,
+                    feedback_code: "incomplete",
+                    operator_criterion_id: "",
+                  })),
+                }),
+              },
+            }],
+          }
+        },
+      },
+    },
+  }
+  const evaluator = new QualityEvaluator()
+  ;(evaluator as unknown as { engine: typeof engine | null }).engine = engine
+
+  const result = await evaluator.evaluate(
+    {
+      question: "Beschreibe das Bild.",
+      answer: "Der Himmel ist nicht blau, sondern rot.",
+      reference: "Eine vollstaendige Bildbeschreibung.",
+      criteria: [
+        {
+          id: "meadow",
+          text: "Im Vordergrund liegt eine gruene Wiese.",
+          required: false,
+        },
+        {
+          id: "sky",
+          text: "Im Hintergrund ist der Himmel blau.",
+          required: false,
+        },
+        {
+          id: "colors",
+          text: "Die Antwort nennt passende Farben wie Blau.",
+          required: false,
+        },
+      ],
+      passThreshold: 0.66,
+    },
+    { maxThinkingTimeMs: 15_000, maxThinkingTokens: 512 },
+  )
+
+  assert.equal(payloads.length, 2)
+  assert.deepEqual(
+    payloads.map((payload) => payload.bewertungsmodus),
+    ["kriterienliste", "einzelkriterium"],
+  )
+  assert.equal(result.criteria[1]?.status, "contradicted")
+  assert.equal(result.status, "failed")
+})
+
+test("QualityEvaluator rejects a reordered criteria batch atomically", async () => {
+  let calls = 0
+  const engine = {
+    interruptGenerate: async () => undefined,
+    chat: {
+      completions: {
+        create: async (request: Record<string, unknown>) => {
+          calls += 1
+          const payload = assessmentPayloadFromRequest(request)
+          const batch = payload.kriterien as Array<Record<string, unknown>>
+          assert.equal(batch.length, 2)
+          const complete = batch.map((criterion) => ({
+            criterion_id: criterion.kriterium_id,
+              decision: "pass",
+              confidence: 0.96,
+              feedback_code: "none",
+              operator_criterion_id: "",
+          }))
+          return {
+            choices: [{
+              finish_reason: "stop",
+              message: {
+                content: JSON.stringify({
+                  criteria: complete.reverse(),
+                }),
+              },
+            }],
+          }
+        },
+      },
+    },
+  }
+  const evaluator = new QualityEvaluator()
+  ;(evaluator as unknown as { engine: typeof engine | null }).engine = engine
+
+  await assert.rejects(
+    evaluator.evaluate(
+      {
+        question: "Beschreibe das Bild.",
+        answer: "Der Himmel ist blau und auf der Wiese steht ein Baum.",
+        reference: "Eine vollstaendige Bildbeschreibung.",
+        criteria: [
+          { id: "sky", text: "Der Himmel ist blau.", required: true },
+          { id: "tree", text: "Ein Baum ist sichtbar.", required: true },
+        ],
+      },
+      { maxThinkingTimeMs: 0 },
+    ),
+    (error: unknown) =>
+      isQualityOutputError(error) &&
+      /kein vollstaendiges Kriterienergebnis/u.test(error.message),
+  )
+  assert.equal(calls, 1)
+  assert.equal(evaluator.getStatus().phase, "ready")
+})
+
 test("QualityEvaluator keeps omission, formal, absence, and contradiction semantics separate", async () => {
   const payloads: Array<Record<string, unknown>> = []
   const decisions = new Map<string, Record<string, unknown>>([
@@ -3942,8 +4173,18 @@ test("QualityEvaluator keeps omission, formal, absence, and contradiction semant
         create: async (request: Record<string, unknown>) => {
           const payload = assessmentPayloadFromRequest(request)
           payloads.push(payload)
-          const output = decisions.get(String(payload.musterloesung))
-          assert.ok(output)
+          const batch = payload.kriterien as Array<Record<string, unknown>>
+          assert.ok(Array.isArray(batch))
+          const output = {
+            criteria: batch.map((criterion) => {
+              const decision = decisions.get(String(criterion.musterloesung))
+              assert.ok(decision)
+              return {
+                criterion_id: criterion.kriterium_id,
+                ...decision,
+              }
+            }),
+          }
           return {
             choices: [{
               finish_reason: "stop",
@@ -3999,11 +4240,12 @@ test("QualityEvaluator keeps omission, formal, absence, and contradiction semant
   assert.equal(
     payloads.every(
       (payload) =>
-        payload.bewertungsmodus === "einzelkriterium" &&
+        payload.bewertungsmodus === "kriterienliste" &&
         payload.lernendenantwort === answer,
     ),
     true,
   )
+  assert.equal(payloads.length, 1)
 })
 
 test("QualityEvaluator keeps low-confidence contradiction metadata consistent", async () => {
@@ -4018,17 +4260,26 @@ test("QualityEvaluator keeps low-confidence contradiction metadata consistent", 
       completions: {
         create: async (request: Record<string, unknown>) => {
           const payload = assessmentPayloadFromRequest(request)
-          const confidence = confidences.get(String(payload.musterloesung))
-          assert.notEqual(confidence, undefined)
+          const batch = payload.kriterien as Array<Record<string, unknown>>
+          assert.ok(Array.isArray(batch))
           return {
             choices: [{
               finish_reason: "stop",
               message: {
                 content: JSON.stringify({
-                  decision: "fail_contradiction",
-                  confidence,
-                  feedback_code: "content-error",
-                  operator_criterion_id: "",
+                  criteria: batch.map((criterion) => {
+                    const confidence = confidences.get(
+                      String(criterion.musterloesung),
+                    )
+                    assert.notEqual(confidence, undefined)
+                    return {
+                      criterion_id: criterion.kriterium_id,
+                      decision: "fail_contradiction",
+                      confidence,
+                      feedback_code: "content-error",
+                      operator_criterion_id: "",
+                    }
+                  }),
                 }),
               },
             }],
@@ -4123,7 +4374,7 @@ test("QualityEvaluator preserves criteria mode in thinking refinement", async ()
   const evaluator = new QualityEvaluator()
   ;(evaluator as unknown as { engine: typeof engine | null }).engine = engine
   const answer = Array.from(
-    { length: 45 },
+    { length: 160 },
     (_, index) => "Aussage" + String(index),
   ).join(" ")
   const assessed = await evaluator.evaluate(
@@ -4176,14 +4427,28 @@ test("QualityEvaluator suppresses blocking diagnostics after coverage passes", a
     '{"decision":"fail_incomplete","confidence":0.90,"feedback_code":"incomplete","operator_criterion_id":""}',
   ]
   let calls = 0
+  let outputIndex = 0
   const engine = {
     interruptGenerate: async () => undefined,
-    chat: { completions: { create: async () => ({
-      choices: [{
-        finish_reason: "stop",
-        message: { content: outputs[calls++] },
-      }],
-    }) } },
+    chat: { completions: { create: async (request: Record<string, unknown>) => {
+      calls += 1
+      const payload = assessmentPayloadFromRequest(request)
+      const batch = payload.kriterien as Array<Record<string, unknown>>
+      assert.ok(Array.isArray(batch))
+      return {
+        choices: [{
+          finish_reason: "stop",
+          message: {
+            content: JSON.stringify({
+              criteria: batch.map((criterion) => ({
+                criterion_id: criterion.kriterium_id,
+                ...JSON.parse(outputs[outputIndex++]!) as Record<string, unknown>,
+              })),
+            }),
+          },
+        }],
+      }
+    } } },
   }
   const evaluator = new QualityEvaluator()
   ;(evaluator as unknown as { engine: typeof engine | null }).engine = engine
@@ -4204,7 +4469,8 @@ test("QualityEvaluator suppresses blocking diagnostics after coverage passes", a
     { maxThinkingTimeMs: 0 },
   )
 
-  assert.equal(calls, 11)
+  assert.equal(calls, 2)
+  assert.equal(outputIndex, 11)
   assert.equal(result.status, "passed")
   assert.equal(result.passed, true)
   assert.equal(result.criteria.filter((criterion) => criterion.status === "met").length, 9)
@@ -4410,7 +4676,7 @@ test('QualityEvaluator treats an unmapped buffer during thinking as fatal', asyn
       {
         question: 'Erkläre den Zusammenhang.',
         answer: Array.from(
-          { length: 45 },
+          { length: 160 },
           (_, index) => `Aussage${index}`,
         ).join(' '),
         reference: 'Die vollständige fachliche Erklärung steht hier.',
@@ -4545,7 +4811,7 @@ test('QualityEvaluator adaptively refines long answers with bounded thinking', a
   ;(evaluator as unknown as { engine: typeof engine | null }).engine = engine
 
   const longAnswer = Array.from(
-    { length: 45 },
+    { length: 160 },
     (_, index) => `Aussage${index}`,
   ).join(' ')
   const result = await evaluator.evaluate(
@@ -4628,11 +4894,11 @@ test('QualityEvaluator adaptively refines long answers with bounded thinking', a
   )
   const defaultResult = await evaluator.evaluate({
     question: 'Explain the relationship.',
-    answer: Array.from({ length: 45 }, (_, index) => `Statement${index}`).join(' '),
+    answer: Array.from({ length: 160 }, (_, index) => `Statement${index}`).join(' '),
     reference: 'The complete explanation is provided here.',
   })
   assert.equal(requests.length, 4)
-  assert.equal(requests[3]?.max_tokens, 512)
+  assert.equal(requests[3]?.max_tokens, 1_024)
   assert.equal(defaultResult.criteria[0]?.judgeConfidence, 0.96)
 })
 
@@ -4674,7 +4940,7 @@ test('QualityEvaluator keeps the first result when thinking times out', async ()
   const result = await evaluator.evaluate(
     {
       question: 'Erkläre den Zusammenhang.',
-      answer: Array.from({ length: 45 }, (_, index) => `Aussage${index}`).join(' '),
+      answer: Array.from({ length: 160 }, (_, index) => `Aussage${index}`).join(' '),
       reference: 'Die vollständige fachliche Erklärung steht hier.',
     },
     { maxThinkingTimeMs: 1, maxThinkingTokens: 256 },
@@ -4723,7 +4989,7 @@ test('QualityEvaluator interrupts thinking on abort and releases its queue', asy
   const pending = evaluator.evaluate(
     {
       question: 'Explain the relationship.',
-      answer: Array.from({ length: 45 }, (_, index) => `Statement${index}`).join(' '),
+      answer: Array.from({ length: 160 }, (_, index) => `Statement${index}`).join(' '),
       reference: 'The complete explanation is provided here.',
     },
     {
@@ -4771,7 +5037,7 @@ test('maxThinkingTimeMs zero disables thinking even for long answers', async () 
   await evaluator.evaluate(
     {
       question: 'Erkläre den Zusammenhang.',
-      answer: Array.from({ length: 45 }, (_, index) => `Aussage${index}`).join(' '),
+      answer: Array.from({ length: 160 }, (_, index) => `Aussage${index}`).join(' '),
       reference: 'Die vollständige fachliche Erklärung steht hier.',
     },
     {
@@ -4911,8 +5177,7 @@ test('QualityEvaluator keeps invalid validated JSON recoverable', async () => {
 
 test("QualityEvaluator analyzes language exactly once after all content criteria", async () => {
   const outputs = [
-    '{"decision":"pass","confidence":0.99,"feedback_code":"none","operator_criterion_id":""}',
-    '{"decision":"pass","confidence":0.98,"feedback_code":"none","operator_criterion_id":""}',
+    '{"criteria":[{"criterion_id":"density","decision":"pass","confidence":0.99,"feedback_code":"none","operator_criterion_id":""},{"criterion_id":"effect","decision":"pass","confidence":0.98,"feedback_code":"none","operator_criterion_id":""}]}',
     '{"spelling_errors":2,"punctuation_errors":1,"syntax_errors":1}',
     '{"edits":[{"kind":"spelling","line":0,"column":4,"source":"schwimt","replacement":"schwimmt"}]}',
     completeGrammarChoices([0, 1]),
@@ -6282,7 +6547,10 @@ test("quality judge keeps uncertainty and contradictions out of passing", () => 
 
 test("quality prompt requires contextual synonym and negation handling", () => {
   assert.match(QUALITY_SYSTEM_PROMPT, /Gesamtzusammenhang/u)
-  assert.match(QUALITY_SYSTEM_PROMPT, /bewertungsmodus als einzelkriterium oder gesamtantwort/u)
+  assert.match(
+    QUALITY_SYSTEM_PROMPT,
+    /bewertungsmodus als einzelkriterium, kriterienliste oder gesamtantwort/u,
+  )
   assert.match(QUALITY_SYSTEM_PROMPT, /ausschließlich die aktuelle musterloesung/u)
   assert.match(QUALITY_SYSTEM_PROMPT, /frage ist nur Kontext/u)
   assert.match(QUALITY_SYSTEM_PROMPT, /fail_incomplete, niemals fail_contradiction/u)
@@ -7501,6 +7769,7 @@ test("QualityEvaluator removes a reclaimable small tier only when large preload 
   }
 
   const selection = selectQualityModel({
+    preferredTier: "large",
     storage: storageAvailabilityFromEstimate({
       quota: 4_000_000_000,
       usage: 378_614_439 + SMALL_QUALITY_MODEL.estimatedBytes,
@@ -7678,6 +7947,7 @@ test("QualityEvaluator requires fresh consent when a cached artifact is corrupt"
 
 test("QualityEvaluator rejects a stale cache selection without changing tiers", async () => {
   const largeSelection = selectQualityModel({
+    preferredTier: "large",
     storage: storageAvailabilityFromEstimate({
       quota: 4_000_000_000,
       usage: 378_614_439,
@@ -7743,6 +8013,7 @@ test("QualityEvaluator clearCache cancels a preload before its download starts",
   modelCache.seed(smallUrl + "tensor-cache.json", new Response("cached-small"))
 
   const selection = selectQualityModel({
+    preferredTier: "large",
     storage: storageAvailabilityFromEstimate({
       quota: 4_000_000_000,
       usage: 378_614_439 + SMALL_QUALITY_MODEL.estimatedBytes,
@@ -9628,6 +9899,7 @@ async function withForegroundQualityRuntime<T>(
 
 test("automatic evaluator never downloads uncached quality after consent is denied", async () => {
   const replacementSelection = selectQualityModel({
+    preferredTier: "large",
     storage: storageAvailabilityFromEstimate({
       quota: 4_000_000_000,
       usage: 378_614_439 + SMALL_QUALITY_MODEL.estimatedBytes,
@@ -10965,7 +11237,7 @@ function createLLMQuizValidatorRunner(): LLMQuizValidatorRunner {
   ) as LLMQuizValidatorRunner
 }
 
-test("the public version remains pinned exactly to 0.6.3", () => {
+test("the public version remains pinned exactly to 0.6.4", () => {
   const packageJson = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   ) as { version?: string }
@@ -10980,14 +11252,14 @@ test("the public version remains pinned exactly to 0.6.3", () => {
     "utf8",
   )
 
-  assert.equal(packageJson.version, "0.6.3")
-  assert.equal(packageLock.version, "0.6.3")
-  assert.equal(packageLock.packages?.[""]?.version, "0.6.3")
-  assert.match(entry, /const VERSION = "0\.6\.3"/u)
-  assert.match(bundle, /let [\w$]+="0\.6\.3",[\w$]+=globalThis/u)
-  assert.doesNotMatch(bundle, /let [\w$]+="0\.6\.2",[\w$]+=globalThis/u)
-  assert.match(browserSmoke, /window\.LiaLLM\.version === "0\.6\.3"/u)
-  assert.match(readme, /^version:\s+0\.6\.3$/mu)
+  assert.equal(packageJson.version, "0.6.4")
+  assert.equal(packageLock.version, "0.6.4")
+  assert.equal(packageLock.packages?.[""]?.version, "0.6.4")
+  assert.match(entry, /const VERSION = "0\.6\.4"/u)
+  assert.match(bundle, /let [\w$]+="0\.6\.4",[\w$]+=globalThis/u)
+  assert.doesNotMatch(bundle, /let [\w$]+="0\.6\.3",[\w$]+=globalThis/u)
+  assert.match(browserSmoke, /window\.LiaLLM\.version === "0\.6\.4"/u)
+  assert.match(readme, /^version:\s+0\.6\.4$/mu)
   assert.match(readme, /^script:\s+\.\/dist\/index\.js$/mu)
   assert.doesNotMatch(
     readme,
@@ -11304,7 +11576,7 @@ test("LLMQuiz forwards its explicit question and operator", async () => {
   await run(
     {
       LiaLLM: {
-        version: "0.6.3",
+        version: "0.6.4",
         parseMacroOptions,
         parseCriteriaBlock,
         parseReferenceVariants,
@@ -11344,7 +11616,7 @@ test("LLMQuiz rejects coverage without a criteria block before evaluation", asyn
   await run(
     {
       LiaLLM: {
-        version: "0.6.3",
+        version: "0.6.4",
         parseMacroOptions,
         parseCriteriaBlock,
         parseReferenceVariants,
@@ -11390,7 +11662,7 @@ test("LLMQuiz preserves required criteria when coverage is omitted", async () =>
   await run(
     {
       LiaLLM: {
-        version: "0.6.3",
+        version: "0.6.4",
         parseMacroOptions,
         parseCriteriaBlock: () => criteriaBlock,
         parseReferenceVariants,
@@ -11443,7 +11715,7 @@ test("LLMQuiz shares cloned coverage criteria and thresholds with language analy
   await run(
     {
       LiaLLM: {
-        version: "0.6.3",
+        version: "0.6.4",
         parseMacroOptions,
         parseCriteriaBlock: () => criteriaBlock,
         parseReferenceVariants,
@@ -12260,7 +12532,7 @@ test("download policy asks before mobile or uncertain large downloads", () => {
   )
 })
 
-test("quality model selection uses the large model when the safe school quota permits it", async () => {
+test("quality model selection defaults to small and keeps large explicitly selectable", async () => {
   const quota = 4 * 1024 * 1024 * 1024
   const usage = 378_614_439
   const selected = await estimateAndSelectQualityModel({
@@ -12269,9 +12541,9 @@ test("quality model selection uses the large model when the safe school quota pe
     },
   })
 
-  assert.equal(selected.model, LARGE_QUALITY_MODEL)
+  assert.equal(selected.model, SMALL_QUALITY_MODEL)
   assert.equal(selected.sufficient, true)
-  assert.equal(selected.reason, "large-fits")
+  assert.equal(selected.reason, "small-fits")
   assert.equal(selected.payloadCached, false)
   assert.equal(selected.storage.kind, "known")
   if (selected.storage.kind === "known") {
@@ -12279,9 +12551,17 @@ test("quality model selection uses the large model when the safe school quota pe
     assert.equal(selected.storage.safetyReserveBytes, STORAGE_SAFETY_RESERVE_BYTES)
     assert.ok(selected.storage.usableBytes > LARGE_QUALITY_MODEL.estimatedBytes)
   }
+  const explicitLarge = await estimateAndSelectQualityModel({
+    source: {
+      estimate: async () => ({ quota, usage }),
+    },
+    preferredTier: "large",
+  })
+  assert.equal(explicitLarge.model, LARGE_QUALITY_MODEL)
+  assert.equal(explicitLarge.reason, "large-fits")
 })
 
-test("quality model selection chooses small between thresholds and large at its exact boundary", () => {
+test("quality model selection keeps small at every viable default boundary", () => {
   const mediumStorage = storageAvailabilityFromEstimate({
     quota: 2_500_000_000,
     usage: 500_000_000,
@@ -12304,9 +12584,9 @@ test("quality model selection chooses small between thresholds and large at its 
       LARGE_QUALITY_MODEL.estimatedBytes,
     )
   }
-  assert.equal(exact.model, LARGE_QUALITY_MODEL)
+  assert.equal(exact.model, SMALL_QUALITY_MODEL)
   assert.equal(exact.sufficient, true)
-  assert.equal(exact.reason, "large-fits")
+  assert.equal(exact.reason, "small-fits")
 })
 
 test("quality model selection reports insufficient storage below the small boundary", () => {
@@ -12344,7 +12624,7 @@ test("quality model selection falls back to small for invalid and unsupported es
   assert.equal(unsupported.reason, "estimate-unavailable")
 })
 
-test("quality model selection keeps a cached large payload despite low free storage", () => {
+test("quality model selection does not activate an incomplete large cache by default", () => {
   const storage = storageAvailabilityFromEstimate({
     quota: STORAGE_SAFETY_RESERVE_BYTES,
     usage: STORAGE_SAFETY_RESERVE_BYTES,
@@ -12354,10 +12634,48 @@ test("quality model selection keeps a cached large payload despite low free stor
     cache: { large: { payloadCached: true } },
   })
 
-  assert.equal(selected.model, LARGE_QUALITY_MODEL)
-  assert.equal(selected.sufficient, true)
-  assert.equal(selected.reason, "large-payload-cached")
-  assert.equal(selected.payloadCached, true)
+  assert.equal(selected.model, SMALL_QUALITY_MODEL)
+  assert.equal(selected.sufficient, false)
+  assert.equal(selected.reason, "insufficient-storage")
+  assert.equal(selected.payloadCached, false)
+})
+
+test("quality model selection applies the small-first policy to complete large caches", () => {
+  const noDownloadSpace = storageAvailabilityFromEstimate({
+    quota: STORAGE_SAFETY_RESERVE_BYTES,
+    usage: STORAGE_SAFETY_RESERVE_BYTES,
+  })
+  const largeFallback = selectQualityModel({
+    storage: noDownloadSpace,
+    cache: { large: { cached: true, payloadCached: true } },
+  })
+  assert.equal(largeFallback.model, LARGE_QUALITY_MODEL)
+  assert.equal(largeFallback.reason, "large-cached")
+  assert.equal(largeFallback.payloadCached, true)
+
+  const ampleStorage = storageAvailabilityFromEstimate({
+    quota:
+      SMALL_QUALITY_MODEL.estimatedBytes + STORAGE_SAFETY_RESERVE_BYTES,
+    usage: 0,
+  })
+  const verifiedSmall = selectQualityModel({
+    storage: ampleStorage,
+    cache: { large: { cached: true, payloadCached: true } },
+  })
+  assert.equal(verifiedSmall.model, SMALL_QUALITY_MODEL)
+  assert.equal(verifiedSmall.reason, "small-fits")
+  assert.equal(verifiedSmall.payloadCached, false)
+
+  const bothCached = selectQualityModel({
+    storage: noDownloadSpace,
+    cache: {
+      large: { cached: true, payloadCached: true },
+      small: { cached: true, payloadCached: true },
+    },
+  })
+  assert.equal(bothCached.model, SMALL_QUALITY_MODEL)
+  assert.equal(bothCached.reason, "small-cached")
+  assert.equal(bothCached.payloadCached, true)
 })
 
 test("quality model selection prefers a complete small cache over an incomplete large cache", () => {
@@ -12377,7 +12695,7 @@ test("quality model selection prefers a complete small cache over an incomplete 
   assert.equal(selected.payloadCached, true)
 })
 
-test("quality model selection replaces a cached small tier only when its released bytes make large fit", () => {
+test("quality model selection never replaces small unless large is explicitly preferred", () => {
   const schoolStorage = storageAvailabilityFromEstimate({
     quota: 4_000_000_000,
     usage: 378_614_439 + SMALL_QUALITY_MODEL.estimatedBytes,
@@ -12386,9 +12704,18 @@ test("quality model selection replaces a cached small tier only when its release
     storage: schoolStorage,
     cache: { small: { payloadCached: true } },
   })
-  assert.equal(upgrade.model, LARGE_QUALITY_MODEL)
-  assert.equal(upgrade.reason, "large-fits-after-small-removal")
-  assert.equal(upgrade.replacedModel, SMALL_QUALITY_MODEL)
+  assert.equal(upgrade.model, SMALL_QUALITY_MODEL)
+  assert.equal(upgrade.reason, "small-payload-cached")
+  assert.equal(upgrade.replacedModel, undefined)
+
+  const explicitUpgrade = selectQualityModel({
+    preferredTier: "large",
+    storage: schoolStorage,
+    cache: { small: { payloadCached: true } },
+  })
+  assert.equal(explicitUpgrade.model, LARGE_QUALITY_MODEL)
+  assert.equal(explicitUpgrade.reason, "large-fits-after-small-removal")
+  assert.equal(explicitUpgrade.replacedModel, SMALL_QUALITY_MODEL)
 
   const oneByteShort = storageAvailabilityFromEstimate({
     quota:
