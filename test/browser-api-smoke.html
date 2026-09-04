@@ -1114,15 +1114,37 @@
 
       const activity = document.getElementById("activity-probe")
       const secondActivity = document.getElementById("activity-probe-two")
+      const capturedCheckButton = document.createElement("button")
+      capturedCheckButton.className = "lia-quiz__check"
+      document.body.append(capturedCheckButton)
+      capturedCheckButton.click()
+      const capturesQuizCheckActivation =
+        window.__liaLlmLastQuizCheckActivation?.button === capturedCheckButton &&
+        Number.isFinite(
+          window.__liaLlmLastQuizCheckActivation?.observedAt
+        )
+      capturedCheckButton.remove()
+      let activityCancelCalls = 0
       window.LiaLLM?.showActivity(
         "activity-probe",
         "run-one",
-        "preparing-compact"
+        "preparing-compact",
+        { onCancel: () => { activityCancelCalls += 1 } }
+      )
+      const activityCancelButton = activity?.shadowRoot?.querySelector(
+        ".lia-llm-activity-cancel"
       )
       const activityStarted =
         activity?.hidden === false &&
         activity?.style.display === "grid" &&
-        activity?.getAttribute("aria-busy") === "true" &&
+        activity?.getAttribute("role") === "group" &&
+        !activity?.hasAttribute("aria-busy") &&
+        activity?.shadowRoot?.querySelector(".lia-llm-activity-status")
+          ?.getAttribute("role") === "status" &&
+        activity?.shadowRoot?.querySelector(".lia-llm-activity-status")
+          ?.getAttribute("aria-live") === "polite" &&
+        activity?.shadowRoot?.querySelector(".lia-llm-activity-status")
+          ?.getAttribute("aria-atomic") === "true" &&
         activity?.shadowRoot?.querySelector(".lia-llm-activity-label")
           ?.textContent ===
           "Kompaktmodell wird vorbereitet …" &&
@@ -1130,11 +1152,33 @@
           ?.getAttribute("role") === "progressbar" &&
         !activity?.shadowRoot?.querySelector(".lia-llm-activity-track")
           ?.hasAttribute("aria-valuenow")
+      activityCancelButton?.click()
+      activityCancelButton?.click()
+      const activityCanBeCancelledOnce =
+        activityCancelCalls === 1 &&
+        activityCancelButton?.textContent === "Prüfung abbrechen" &&
+        activityCancelButton?.hidden === false &&
+        activityCancelButton?.disabled === true
+      window.LiaLLM?.showActivity(
+        "activity-probe",
+        "run-one",
+        "evaluating-compact"
+      )
+      const lateProgressKeepsCancelDisabled =
+        activityCancelButton?.disabled === true
+      let replacementCancelCalls = 0
       window.LiaLLM?.showActivity(
         "activity-probe",
         "run-two",
-        "selecting-model"
+        "selecting-model",
+        { onCancel: () => { replacementCancelCalls += 1 } }
       )
+      activityCancelButton?.click()
+      const replacementRunGetsFreshCancel =
+        activityCancelCalls === 1 &&
+        replacementCancelCalls === 1 &&
+        activityCancelButton?.hidden === false &&
+        activityCancelButton?.disabled === true
       window.LiaLLM?.showActivity(
         "activity-probe",
         "run-two",
@@ -1144,7 +1188,7 @@
       const potentialThinkingLimitIsShown =
         activity?.shadowRoot?.querySelector(".lia-llm-activity-countdown")
           ?.textContent ===
-          "Denkzeitbudget bei Bedarf: bis zu 2 s."
+          "Zusätzlicher Denkmodus bei Bedarf: bis zu 2 s; die Grundprüfung kann je nach Gerät länger dauern."
       window.LiaLLM?.showActivity(
         "activity-probe",
         "run-two",
@@ -1160,11 +1204,10 @@
       const countdownBeforeTick = countdown?.textContent
       const thinkingCountdownStartsAccessibly =
         countdownBeforeTick ===
-          "Denkzeitbudget: noch 2 s." &&
+          "Zusätzliche Denkzeit: noch 2 s." &&
         countdown?.getAttribute("aria-hidden") === "true" &&
-        activity?.getAttribute("aria-label")?.includes(
-          "noch 2 Sekunden"
-        ) === true
+        activity?.shadowRoot?.querySelector(".lia-llm-activity-status")
+          ?.getAttribute("aria-label")?.includes("noch 2 Sekunden") === true
       window.LiaLLM?.showActivity(
         "activity-probe",
         "run-one",
@@ -1181,9 +1224,9 @@
       const thinkingCountdownRuns =
         countdownAfterTick !== countdownBeforeTick &&
         (countdownAfterTick ===
-          "Denkzeitbudget: noch 1 s." ||
+          "Zusätzliche Denkzeit: noch 1 s." ||
           countdownAfterTick ===
-            "Denkzeitlimit erreicht – laufende Prüfung wird abgeschlossen …")
+            "Zusätzliche Denkzeit ist beendet. Die Auswertung wird ohne den Zusatzlauf abgeschlossen …")
       const staleRunCannotHideCurrent =
         activity?.hidden === false &&
         activity?.shadowRoot?.querySelector(".lia-llm-activity-message")
@@ -1198,13 +1241,56 @@
       const activitiesStayIsolated =
         activity?.hidden === true &&
         activity?.style.display === "none" &&
-        activity?.getAttribute("aria-busy") === "false" &&
+        activityCancelButton?.hidden === true &&
         secondActivity?.hidden === false &&
         secondActivity?.shadowRoot?.querySelector(".lia-llm-activity-label")
           ?.textContent ===
           "Antwort wird schnell geprüft …"
       window.LiaLLM?.showActivity("activity-probe-two", "second-run", "")
       const activityClears = secondActivity?.hidden === true
+      let rejectedCancelCalls = 0
+      window.LiaLLM?.showActivity(
+        "activity-probe-two",
+        "cancel-rejection-run",
+        "selecting-model",
+        {
+          onCancel: async () => {
+            rejectedCancelCalls += 1
+            if (rejectedCancelCalls === 1) {
+              throw new Error("synthetic cancel failure")
+            }
+          }
+        }
+      )
+      const rejectedCancelButton = secondActivity?.shadowRoot?.querySelector(
+        ".lia-llm-activity-cancel"
+      )
+      const cancelLivesOutsideStatus =
+        secondActivity?.shadowRoot
+          ?.querySelector(".lia-llm-activity-status")
+          ?.contains(rejectedCancelButton) === false
+      rejectedCancelButton?.click()
+      window.LiaLLM?.showActivity(
+        "activity-probe-two",
+        "cancel-rejection-run",
+        "evaluating-quality"
+      )
+      await Promise.resolve()
+      await Promise.resolve()
+      const rejectedCancelWasReenabled =
+        rejectedCancelButton?.disabled === false &&
+        rejectedCancelCalls === 1
+      rejectedCancelButton?.click()
+      await Promise.resolve()
+      const rejectedAsyncCancelIsRetryable =
+        rejectedCancelWasReenabled &&
+        rejectedCancelCalls === 2 &&
+        rejectedCancelButton?.disabled === true
+      window.LiaLLM?.showActivity(
+        "activity-probe-two",
+        "cancel-rejection-run",
+        ""
+      )
 
       const textareaOwner = document.getElementById("textarea-owner")
       const textareaHost = document.getElementById("textarea-host")
@@ -1867,7 +1953,7 @@
         cacheInfo?.engines?.quality?.estimatedBytes === selectedQualityBytes
       const matches = Boolean(
         window.LiaLLM &&
-        window.LiaLLM.version === "0.6.4" &&
+        window.LiaLLM.version === "0.6.5" &&
         typeof window.LiaLLM.evaluate === "function" &&
         typeof window.LiaLLM.debugReport === "function" &&
         typeof window.LiaLLM.feedbackForResult === "function" &&
@@ -1949,7 +2035,11 @@
         quizSpacingIsCompacted &&
         resultSeparatorMatchesTheme &&
         quizPresenceStartsOnce &&
+        capturesQuizCheckActivation &&
         activityStarted &&
+        activityCanBeCancelledOnce &&
+        lateProgressKeepsCancelDisabled &&
+        replacementRunGetsFreshCancel &&
         potentialThinkingLimitIsShown &&
         thinkingCountdownStartsAccessibly &&
         thinkingCountdownRuns &&
@@ -1957,6 +2047,8 @@
         staleRunCannotHideCurrent &&
         activitiesStayIsolated &&
         activityClears &&
+        cancelLivesOutsideStatus &&
+        rejectedAsyncCancelIsRetryable &&
         overlayLivesOnlyInShadow &&
         cachedActivationIsHidden &&
         cachedReadyIsHidden &&
@@ -2056,7 +2148,11 @@
         quizSpacingIsCompacted,
         resultSeparatorMatchesTheme,
         quizPresenceStartsOnce,
+        capturesQuizCheckActivation,
         activityStarted,
+        activityCanBeCancelledOnce,
+        lateProgressKeepsCancelDisabled,
+        replacementRunGetsFreshCancel,
         potentialThinkingLimitIsShown,
         thinkingCountdownStartsAccessibly,
         thinkingCountdownRuns,
@@ -2064,6 +2160,8 @@
         staleRunCannotHideCurrent,
         activitiesStayIsolated,
         activityClears,
+        cancelLivesOutsideStatus,
+        rejectedAsyncCancelIsRetryable,
         arrowDefaultPrevented: arrow.defaultPrevented,
         bubbledKeys,
         cachedActivationIsHidden,

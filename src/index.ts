@@ -35,13 +35,47 @@ import {
 } from "./solution-element.ts"
 import type { LiaLLMApi } from "./types.ts"
 
-const VERSION = "0.6.4"
+const VERSION = "0.6.5"
 
 interface LiaLLMGlobal {
   LiaLLM?: LiaLLMApi
+  __liaLlmQuizCheckCaptureInstalled?: boolean
+  __liaLlmLastQuizCheckActivation?: {
+    button: HTMLButtonElement
+    observedAt: number
+  }
 }
 
 const root = globalThis as typeof globalThis & LiaLLMGlobal
+
+if (
+  typeof document !== "undefined" &&
+  typeof HTMLButtonElement !== "undefined" &&
+  !root.__liaLlmQuizCheckCaptureInstalled
+) {
+  root.__liaLlmQuizCheckCaptureInstalled = true
+  document.addEventListener(
+    "click",
+    (event) => {
+      const path = typeof event.composedPath === "function"
+        ? event.composedPath()
+        : [event.target]
+      const button = path.find(
+        (candidate): candidate is HTMLButtonElement =>
+          candidate instanceof HTMLButtonElement &&
+          candidate.classList.contains("lia-quiz__check"),
+      )
+      if (button) {
+        root.__liaLlmLastQuizCheckActivation = {
+          button,
+          observedAt: Date.now(),
+        }
+      }
+    },
+    true,
+  )
+}
+
 let api = root.LiaLLM
 
 if (!api) {

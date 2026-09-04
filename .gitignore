@@ -4,3 +4,5 @@ node_modules/
 coverage/
 test-results/
 src/generated/webllm.js
+src/generated/webllm-worker-source.js
+src/generated/webllm-worker-source.d.ts

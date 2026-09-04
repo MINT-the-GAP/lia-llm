@@ -5,6 +5,11 @@ import { fileURLToPath } from "node:url"
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..")
 const source = resolve(root, "node_modules/@mlc-ai/web-llm/lib/index.js")
 const target = resolve(root, "src/generated/webllm.js")
+const workerSourceTarget = resolve(root, "src/generated/webllm-worker-source.js")
+const workerSourceTypesTarget = resolve(
+  root,
+  "src/generated/webllm-worker-source.d.ts",
+)
 const generatedDirectory = resolve(root, "src/generated")
 
 const originalSource = (await readFile(source, "utf8")).replace(
@@ -263,11 +268,55 @@ bundledSource = replaceExactlyOnce(
 
 await mkdir(generatedDirectory, { recursive: true })
 
-let current = ""
-try {
-  current = await readFile(target, "utf8")
-} catch {
-  // The generated runtime does not exist on a fresh checkout yet.
+async function writeGenerated(file, contents) {
+  let current = ""
+  try {
+    current = await readFile(file, "utf8")
+  } catch {
+    // The generated file does not exist on a fresh checkout yet.
+  }
+  if (current !== contents) await writeFile(file, contents, "utf8")
 }
 
-if (current !== bundledSource) await writeFile(target, bundledSource, "utf8")
+await writeGenerated(target, bundledSource)
+
+// LiaScript templates may load this bundle from another origin. Strip the ESM
+// export and embed a complete classic worker, which is later started through a
+// same-origin Blob URL.
+const workerExportPattern = /\nexport \{[^\n]+\};\s*$/u
+if (!workerExportPattern.test(bundledSource)) {
+  throw new Error(
+    "Die WebLLM-Exportzeile fuer den Quality-Worker wurde nicht gefunden.",
+  )
+}
+const workerRuntimeSource = bundledSource.replace(workerExportPattern, "\n")
+const workerBootstrap = [
+  "",
+  "// LiaLLM Quality worker bootstrap.",
+  "globalThis.__liaLlmArtifactFetch = async function (request) {",
+  "    const url = typeof request === 'string'",
+  "        ? request",
+  "        : request && typeof request.url === 'string'",
+  "            ? request.url",
+  "            : 'unbekanntes Artefakt';",
+  "    throw new Error('Quality worker cache miss: ' + url);",
+  "};",
+  "const liaLlmQualityWorkerHandler = new WebWorkerMLCEngineHandler();",
+  "globalThis.onmessage = function (event) {",
+  "    liaLlmQualityWorkerHandler.onmessage(event);",
+  "};",
+  "//# sourceURL=lia-llm-quality-worker.js",
+  "",
+].join("\n")
+const workerSourceModule =
+  "const qualityWorkerSource = " +
+  JSON.stringify(workerRuntimeSource + workerBootstrap) +
+  "\nexport default qualityWorkerSource\n"
+const workerSourceTypes = [
+  "declare const qualityWorkerSource: string",
+  "export default qualityWorkerSource",
+  "",
+].join("\n")
+
+await writeGenerated(workerSourceTarget, workerSourceModule)
+await writeGenerated(workerSourceTypesTarget, workerSourceTypes)

@@ -404,7 +404,7 @@ Modellbibliotheksrevision `025bcaf3780fa8254f5e5efd3bfea0a5397248f4`.
 
 Vor einem ungecacheten Quality-Download prüft das Template
 `navigator.storage.estimate()` mit einer Reserve von `max(512 MiB, 10 % der quota)`.
-Version 0.6.4 wählt 1.7B als erprobten Produktionsstandard, sobald diese Stufe sicher passt oder
+Version 0.6.5 wählt 1.7B als erprobten Produktionsstandard, sobald diese Stufe sicher passt oder
 ihre Gewichte bereits vorhanden sind; eine große Origin-Quote löst kein automatisches
 4B-Upgrade mehr aus. Bei unbekannter Quote bleibt 1.7B die konservative Auswahl; reicht eine
 bekannte Quote dafür nicht, startet kein neuer Quality-Download. Ein vollständig gecachtes
@@ -436,6 +436,7 @@ Die Ergebnisse vor und nach der 0.6.3-Kompatibilitätskorrektur sind getrennt zu
 | 0.6.3, Cap und JSON-Schema vor dem Einzelkriterienzusatz | 16/16 Einzelentscheidungen in rund 139 Sekunden | technisch vollständig; die Reproduktion erreichte aber nur 4/8, und die Gegenbehauptung wurde wegen falsch interpretierter `confidence=0` nicht bestätigt |
 | finaler 0.6.3-Stand | exakter `5_09`-Kriterienlauf | 2/2 Fälle in rund 139 Sekunden; Reproduktion 8/8, Gegenbehauptung mit vier Widersprüchen abgewiesen; 16/16 ohne GPU-, Grammar- oder Parserfehler |
 | 0.6.4, Kriterien-Batching und gezielter Recheck | exakter `5_09`-Kriterienlauf mit 1.7B | 2/2 Fälle in 25.655 ms + 27.741 ms; gemeldete Antwort 8/8, Gegenbehauptung am Himmelskriterium bestätigt; zwei Batchaufrufe plus ein Recheck ohne GPU-, Grammar- oder Parserfehler |
+| 0.6.5, kooperativer Completion-Abbruch | sichtbarer offizieller LiaScript-Renderer in Edge 152 und Firefox 155.0.1 | 15-s-Thinking-Deadline nach 15.002 ms beziehungsweise 15.072 ms; genau ein `interruptGenerate`, keine Worker-Terminierung und kein Geräteverlust; unmittelbarer Folgelauf im selben Worker jeweils 8/8 |
 
 Version 0.6.3 hält unveränderliche Shape-Tuples bis zum Engine-Abbau gültig, synchronisiert
 ausstehende GPU-Readbacks auch über spätere Queue-Arbeit hinweg und begrenzt jeden Command-Buffer
@@ -469,7 +470,7 @@ abweisen, ersetzt aber keine ausreichende semantische Modellleistung.
 
 Der reproduzierbare Inhalts-Stresstest wird nach einem aktuellen Build mit
 `npm run test:browser-adversarial` ausgeführt. Ein technisch erfolgreicher Lauf beweist nur die
-dort geprüften Fälle. Er wurde mit dem finalen 0.6.4-Stand noch nicht erneut vollständig belegt.
+dort geprüften Fälle. Er wurde mit dem finalen 0.6.5-Stand noch nicht erneut vollständig belegt.
 Der erfolgreiche Kriterienlauf unten ersetzt diesen 12-Fälle-Test nicht; umgekehrt widerlegt der
 frühere Geräteverlust nicht mehr die technische Lauffähigkeit des final gepatchten 1.7B-Stands.
 
@@ -492,6 +493,16 @@ abgewiesen. Statt 16 serieller Quality-Aufrufe benötigte der Lauf zwei Batchauf
 Recheck; alle endeten ohne GPU-, Grammar- oder Parserfehler. Die 59 Wörter lange
 Reproduktionsantwort löste insbesondere kein automatisches Thinking mehr aus, weil die
 dokumentierte Längenschwelle nun tatsächlich 160 Wörter beträgt.
+
+Der zusätzliche Headed-E2E-Lauf verwendete weder eine isolierte HTML-Fixture noch simulierte
+WebLLM-Antworten, sondern den sichtbaren offiziellen LiaScript-Renderer, die gerenderte
+`@LLMQuiz`-Oberfläche und normales WebGPU. Die Abbruch-/Neustart-Szenarien bestanden in Edge 152
+und Firefox 155.0.1; erfolgreiche `5_09`-Bewertungen erreichten jeweils 8 von 8 Kriterien. Ein
+separater Deadline-Lauf erzwang mit einer Antwort ab 160 Wörtern und 2.048 Completion-Tokens den
+adaptiven Thinking-Pfad. Die gesamte erste Bewertung dauerte in Edge 43.802 ms und in Firefox
+120.975 ms; nur der darin enthaltene Thinking-Abschnitt war auf 15 Sekunden begrenzt. Direkt danach
+bestand dieselbe kurze `5_09`-Antwort im unverändert geladenen Worker erneut mit 8 von 8 Kriterien.
+Im beobachteten Zeitraum traten weder `Buffer unmapped` noch ein verlorenes WebGPU-Gerät auf.
 
 Der normale npm-Kurzbefehl verwendet die produktive automatische Stufenwahl und bleibt nun auch
 bei großer Origin-Quote auf Qwen3-1.7B. Für eine zusätzlich erzwungene

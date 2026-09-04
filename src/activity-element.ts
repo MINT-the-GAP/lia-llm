@@ -11,6 +11,8 @@ interface ActivityState {
   thinkingTimeInitialMs?: number
   thinkingDeadlineMs?: number
   thinkingExpired?: boolean
+  onCancel?: () => void | Promise<void>
+  cancelRequested?: boolean
 }
 
 const activityById = new Map<string, ActivityState>()
@@ -28,6 +30,10 @@ const ACTIVITY_MESSAGES: Record<EvaluationProgressPhase, string> = {
 }
 
 const ACTIVITY_SHADOW_STYLE = `
+.lia-llm-activity-status {
+  display: grid;
+  gap: .08rem;
+}
 .lia-llm-activity-label {
   display: grid;
   gap: .08rem;
@@ -48,6 +54,28 @@ const ACTIVITY_SHADOW_STYLE = `
   overflow: hidden;
   border-radius: 999px;
   background: color-mix(in srgb, currentColor 16%, transparent);
+}
+.lia-llm-activity-cancel {
+  justify-self: end;
+  border: 1px solid currentColor;
+  border-radius: .3rem;
+  padding: .18rem .55rem;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  opacity: .88;
+}
+.lia-llm-activity-cancel:hover,
+.lia-llm-activity-cancel:focus-visible {
+  opacity: 1;
+}
+.lia-llm-activity-cancel:disabled {
+  cursor: default;
+  opacity: .5;
+}
+.lia-llm-activity-cancel[hidden] {
+  display: none;
 }
 .lia-llm-activity-fill {
   height: 100%;
@@ -74,6 +102,12 @@ function ensureActivityShadow(element: HTMLElement): ShadowRoot {
   const style = ownerDocument.createElement("style")
   style.textContent = ACTIVITY_SHADOW_STYLE
 
+  const status = ownerDocument.createElement("span")
+  status.className = "lia-llm-activity-status"
+  status.setAttribute("role", "status")
+  status.setAttribute("aria-live", "polite")
+  status.setAttribute("aria-atomic", "true")
+
   const label = ownerDocument.createElement("span")
   label.className = "lia-llm-activity-label"
 
@@ -94,7 +128,35 @@ function ensureActivityShadow(element: HTMLElement): ShadowRoot {
   const fill = ownerDocument.createElement("span")
   fill.className = "lia-llm-activity-fill"
   track.append(fill)
-  shadow.replaceChildren(style, label, track)
+  status.append(label, track)
+
+  const cancel = ownerDocument.createElement("button")
+  cancel.className = "lia-llm-activity-cancel"
+  cancel.type = "button"
+  cancel.textContent = "Prüfung abbrechen"
+  cancel.hidden = true
+  cancel.addEventListener("click", () => {
+    const state = activityById.get(element.id)
+    if (!state?.onCancel || cancel.disabled) return
+    const restoreCancellation = (): void => {
+      const current = activityById.get(element.id)
+      if (!current || current.runId !== state.runId) return
+      current.cancelRequested = false
+      renderActivity(element, current)
+    }
+    state.cancelRequested = true
+    cancel.disabled = true
+    try {
+      const result = state.onCancel()
+      if (result && typeof result.then === "function") {
+        void result.catch(restoreCancellation)
+      }
+    } catch {
+      restoreCancellation()
+    }
+  })
+
+  shadow.replaceChildren(style, status, cancel)
   return shadow
 }
 
@@ -145,6 +207,9 @@ function countdownText(
   const countdown = shadow.querySelector<HTMLElement>(
     ".lia-llm-activity-countdown",
   )
+  const status = shadow.querySelector<HTMLElement>(
+    ".lia-llm-activity-status",
+  )
   if (!countdown) return false
 
   if (state.thinkingDeadlineMs !== undefined) {
@@ -154,7 +219,7 @@ function countdownText(
     if (seconds > 0) {
       setCountdownContent(
         countdown,
-        `Denkzeitbudget: noch ${seconds} s.`,
+        `Zusätzliche Denkzeit: noch ${seconds} s.`,
         false,
       )
       return true
@@ -162,14 +227,14 @@ function countdownText(
 
     setCountdownContent(
       countdown,
-      "Denkzeitlimit erreicht – laufende Prüfung wird abgeschlossen …",
+      "Zusätzliche Denkzeit ist beendet. Die Auswertung wird ohne den Zusatzlauf abgeschlossen …",
       false,
     )
     if (!state.thinkingExpired) {
       state.thinkingExpired = true
-      element.setAttribute(
+      status?.setAttribute(
         "aria-label",
-        `${state.message} Denkzeitlimit erreicht. Die laufende Prüfung wird abgeschlossen.`,
+        `${state.message} Zusätzliche Denkzeit ist beendet. Die Auswertung wird ohne den Zusatzlauf abgeschlossen.`,
       )
     }
     return false
@@ -181,7 +246,7 @@ function countdownText(
   setCountdownContent(
     countdown,
     limitSeconds > 0
-      ? `Denkzeitbudget bei Bedarf: bis zu ${limitSeconds} s.`
+      ? `Zusätzlicher Denkmodus bei Bedarf: bis zu ${limitSeconds} s; die Grundprüfung kann je nach Gerät länger dauern.`
       : "",
     limitSeconds === 0,
   )
@@ -226,9 +291,11 @@ function renderActivity(
   const visible = Boolean(state)
   element.hidden = !visible
   element.style.display = visible ? "grid" : "none"
-  element.setAttribute("aria-busy", String(visible))
 
   const shadow = ensureActivityShadow(element)
+  const status = shadow.querySelector<HTMLElement>(
+    ".lia-llm-activity-status",
+  )
   const message = shadow.querySelector<HTMLElement>(
     ".lia-llm-activity-message",
   )
@@ -245,9 +312,16 @@ function renderActivity(
     if (state) track.setAttribute("aria-valuetext", state.message)
     else track.removeAttribute("aria-valuetext")
   }
+  const cancel = shadow.querySelector<HTMLButtonElement>(
+    ".lia-llm-activity-cancel",
+  )
+  if (cancel) {
+    cancel.hidden = !state?.onCancel
+    cancel.disabled = state?.cancelRequested ?? false
+  }
 
   if (!state) {
-    element.removeAttribute("aria-label")
+    status?.removeAttribute("aria-label")
     return
   }
 
@@ -255,15 +329,14 @@ function renderActivity(
     state.thinkingTimeInitialMs ?? state.thinkingTimeLimitMs
   const announcedSeconds = activityCountdownSeconds(announcedTimeMs ?? 0)
   if (announcedSeconds > 0) {
-    const qualifier = state.thinkingDeadlineMs === undefined
-      ? "bei Bedarf bis zu"
-      : "noch"
-    element.setAttribute(
+    status?.setAttribute(
       "aria-label",
-      `${state.message} Denkzeitbudget: ${qualifier} ${announcedSeconds} Sekunden.`,
+      state.thinkingDeadlineMs === undefined
+        ? `${state.message} Die Grundprüfung kann je nach Gerät länger dauern. Zusätzlicher Denkmodus bei Bedarf: bis zu ${announcedSeconds} Sekunden.`
+        : `${state.message} Zusätzliche Denkzeit: noch ${announcedSeconds} Sekunden.`,
     )
   } else {
-    element.removeAttribute("aria-label")
+    status?.removeAttribute("aria-label")
   }
   countdownText(element, state)
 }
@@ -310,6 +383,13 @@ export function showActivity(
       message: options.message?.trim() || ACTIVITY_MESSAGES[phase],
       thinkingTimeLimitMs,
     }
+    const onCancel =
+      options.onCancel ??
+      (current?.runId === normalizedRunId ? current.onCancel : undefined)
+    if (onCancel) state.onCancel = onCancel
+    if (current?.runId === normalizedRunId && current.cancelRequested) {
+      state.cancelRequested = true
+    }
     if (thinkingTimeRemainingMs !== undefined) {
       state.thinkingTimeInitialMs = thinkingTimeRemainingMs
       state.thinkingDeadlineMs = Date.now() + thinkingTimeRemainingMs
@@ -343,9 +423,8 @@ export function registerActivityElement(): void {
 
   class LiaLLMActivityElement extends HTMLElement {
     connectedCallback(): void {
-      this.setAttribute("role", "status")
-      this.setAttribute("aria-live", "polite")
-      this.setAttribute("aria-atomic", "true")
+      this.setAttribute("role", "group")
+      this.setAttribute("aria-label", "Lokale Antwortauswertung")
       this.style.width = "min(22rem, 100%)"
       this.style.margin = ".35rem 0 .15rem auto"
       this.style.gap = ".25rem"
@@ -362,7 +441,6 @@ export function registerActivityElement(): void {
       activityById.delete(this.id)
       this.hidden = true
       this.style.display = "none"
-      this.setAttribute("aria-busy", "false")
     }
   }
 

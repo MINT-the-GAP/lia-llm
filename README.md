@@ -1,6 +1,6 @@
 <!--
 author:      MINT-the-GAP, Martin Lommatzsch
-version:     0.6.4
+version:     0.6.5
 language:    de
 narrator:    Deutsch Female
 comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
@@ -33,6 +33,29 @@ const solutionVariantId = "lia-llm-solution-variant-@0"
 const runId = activityId + "-" + Date.now().toString(36) + "-" +
   Math.random().toString(36).slice(2)
 const evaluationController = new AbortController()
+const rememberedCheckActivation = window.__liaLlmLastQuizCheckActivation
+if (rememberedCheckActivation) {
+  delete window.__liaLlmLastQuizCheckActivation
+}
+let activeCheckButton =
+  typeof document !== "undefined" &&
+  typeof HTMLButtonElement !== "undefined" &&
+  document.activeElement instanceof HTMLButtonElement &&
+  document.activeElement.classList.contains("lia-quiz__check")
+    ? document.activeElement
+    : typeof HTMLButtonElement !== "undefined" &&
+        rememberedCheckActivation?.button instanceof HTMLButtonElement &&
+        rememberedCheckActivation.button.isConnected &&
+        Date.now() - rememberedCheckActivation.observedAt < 2000
+      ? rememberedCheckActivation.button
+      : null
+let checkButtonInitialDisabled = false
+let checkButtonInitialAriaBusy = null
+const activeQuizRuns =
+  window.__liaLlmActiveQuizRuns instanceof Map
+    ? window.__liaLlmActiveQuizRuns
+    : new Map()
+window.__liaLlmActiveQuizRuns = activeQuizRuns
 const optionSource = `@'1`
 const question = `@'2`
 const referenceSource = `@'3`
@@ -46,16 +69,36 @@ let evaluationCriteria
 let evaluationThresholds = null
 let quizOptions = null
 
-window.LiaLLM?.showFeedback?.(feedbackId, "")
-window.LiaLLM?.showActivity?.(activityId, runId, "selecting-model")
-window.LiaLLM?.setSolutionVariant?.(solutionVariantId, runId)
-
 function clearActivity() {
-  window.LiaLLM?.showActivity?.(activityId, runId, "")
+  try {
+    window.LiaLLM?.showActivity?.(activityId, runId, "")
+  } catch {}
 }
 
 function clearSolutionVariant() {
-  window.LiaLLM?.clearSolutionVariant?.(solutionVariantId, runId)
+  try {
+    window.LiaLLM?.clearSolutionVariant?.(solutionVariantId, runId)
+  } catch {}
+}
+
+function setCheckButtonBusy(busy) {
+  if (!activeCheckButton?.isConnected) return
+  activeCheckButton.disabled = busy || checkButtonInitialDisabled
+  if (busy) {
+    activeCheckButton.setAttribute("aria-busy", "true")
+  } else if (checkButtonInitialAriaBusy === null) {
+    activeCheckButton.removeAttribute("aria-busy")
+  } else {
+    activeCheckButton.setAttribute("aria-busy", checkButtonInitialAriaBusy)
+  }
+}
+
+function releaseQuizRun() {
+  if (activeQuizRuns.get(activityId) !== supersedeEvaluation) return
+  activeQuizRuns.delete(activityId)
+  try {
+    setCheckButtonBusy(false)
+  } catch {}
 }
 
 function showLearnerFeedback(feedback, languageCheck) {
@@ -70,11 +113,13 @@ function showLearnerFeedback(feedback, languageCheck) {
           ...(languageCheck ? { languageCheck } : {})
         }
       : undefined
-  window.LiaLLM?.showFeedback?.(
-    feedbackId,
-    visibleFeedback?.message ?? "",
-    displayOptions
-  )
+  try {
+    window.LiaLLM?.showFeedback?.(
+      feedbackId,
+      visibleFeedback?.message ?? "",
+      displayOptions
+    )
+  } catch {}
 }
 
 function stoppedError() {
@@ -86,6 +131,7 @@ function stoppedError() {
 function finishQuiz(value) {
   if (!active || finished) return
   finished = true
+  releaseQuizRun()
   clearActivity()
   send.lia(value)
 }
@@ -93,9 +139,12 @@ function finishQuiz(value) {
 function finishUnassessed(message) {
   if (!active || finished) return
   finished = true
+  releaseQuizRun()
   clearActivity()
   clearSolutionVariant()
-  window.LiaLLM?.showFeedback?.(feedbackId, "")
+  try {
+    window.LiaLLM?.showFeedback?.(feedbackId, "")
+  } catch {}
   send.lia(message, [], false)
 }
 
@@ -104,22 +153,77 @@ function finishTechnicalError(error) {
   finishUnassessed(message)
 }
 
-send.handle("stop", () => {
+function abortEvaluation() {
+  if (finished) return
   active = false
   finished = true
   evaluationController.abort()
+  releaseQuizRun()
   clearActivity()
   clearSolutionVariant()
-  window.LiaLLM?.showFeedback?.(feedbackId, "")
-})
+  try {
+    window.LiaLLM?.showFeedback?.(feedbackId, "")
+  } catch {}
+  return true
+}
+
+function restoreCheckButtonFocus() {
+  if (activeCheckButton?.isConnected && !activeCheckButton.disabled) {
+    try {
+      activeCheckButton.focus({ preventScroll: true })
+    } catch {}
+  }
+}
+
+function stopEvaluation() {
+  abortEvaluation()
+}
+
+function stopWaitingState() {
+  if (typeof send.stop === "function") send.stop()
+  else send.lia("LIA: stop")
+}
+
+function supersedeEvaluation() {
+  if (!abortEvaluation()) return
+  stopWaitingState()
+}
+
+function cancelEvaluation() {
+  if (!abortEvaluation()) return
+  stopWaitingState()
+  restoreCheckButtonFocus()
+  if (typeof queueMicrotask === "function") {
+    queueMicrotask(restoreCheckButtonFocus)
+  }
+}
 
 Promise.resolve()
   .then(() => {
+    const previousQuizRun = activeQuizRuns.get(activityId)
+    if (typeof previousQuizRun === "function") previousQuizRun()
+    checkButtonInitialDisabled = activeCheckButton?.disabled ?? false
+    checkButtonInitialAriaBusy =
+      activeCheckButton?.getAttribute("aria-busy") ?? null
+    activeQuizRuns.set(activityId, supersedeEvaluation)
+    setCheckButtonBusy(true)
+    try {
+      window.LiaLLM?.showFeedback?.(feedbackId, "")
+      window.LiaLLM?.showActivity?.(
+        activityId,
+        runId,
+        "selecting-model",
+        { onCancel: cancelEvaluation }
+      )
+      window.LiaLLM?.setSolutionVariant?.(solutionVariantId, runId)
+    } catch {}
+    send.handle("stop", stopEvaluation)
+
     if (!window.LiaLLM) {
       throw new Error("lia-llm konnte nicht geladen werden.")
     }
-    if (window.LiaLLM.version !== "0.6.4") {
-      throw new Error(`lia-llm 0.6.4 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
+    if (window.LiaLLM.version !== "0.6.5") {
+      throw new Error(`lia-llm 0.6.5 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
     }
 
     const options = window.LiaLLM.parseMacroOptions(optionSource)
@@ -170,7 +274,8 @@ Promise.resolve()
         window.LiaLLM?.showActivity?.(activityId, runId, progress.phase, {
           message: progress.message,
           thinkingTimeLimitMs: progress.thinkingTimeLimitMs,
-          thinkingTimeRemainingMs: progress.thinkingTimeRemainingMs
+          thinkingTimeRemainingMs: progress.thinkingTimeRemainingMs,
+          onCancel: cancelEvaluation
         })
       }
     })
@@ -193,11 +298,13 @@ Promise.resolve()
         result.selectedReferenceIndex < referenceVariants.length
           ? result.selectedReferenceIndex
           : 0
-      window.LiaLLM?.setSolutionVariant?.(
-        solutionVariantId,
-        runId,
-        selectedReferenceIndex
-      )
+      try {
+        window.LiaLLM?.setSolutionVariant?.(
+          solutionVariantId,
+          runId,
+          selectedReferenceIndex
+        )
+      } catch {}
     } else {
       clearSolutionVariant()
     }
@@ -369,7 +476,7 @@ die Musterlösung oder der Kriterienblock.
 | `assessmentengine` | `compact`, `quality` | automatisch | Wählt die Engine der Inhaltsprüfung; normale Prüfungen verwenden `compact`, Operator- oder positive Thinking-Vorgaben `quality` |
 | `Rechtschreibung` | `0`, `1`, `false`, `true` | `false` | Bietet nach der Inhaltsprüfung eine getrennte Prüfung von Rechtschreibung und Zeichensetzung an; benötigt `feedback=1` |
 | `Satzbau` | `0`, `1`, `false`, `true` | `false` | Bietet nach der Inhaltsprüfung eine getrennte Prüfung von Grammatik und Satzbau an; benötigt `feedback=1` |
-| `maxthinkingtime` | `0s`, `5s`, `10s`, `15s`, `20s`, `30s` | im adaptiven Zweitlauf `15s` | Begrenzt die zusätzliche Denkzeit; `0s` deaktiviert den Thinking-Lauf |
+| `maxthinkingtime` | `0s`, `5s`, `10s`, `15s`, `20s`, `30s` | im adaptiven Zweitlauf `15s` | Begrenzt ausschließlich die zusätzliche Denkzeit, nicht Modellstart oder Grundprüfung; `0s` deaktiviert den Thinking-Lauf |
 | `maxthinkingtokens` | `low`, `medium`, `high`, `ultra`, `extreme` | im adaptiven Zweitlauf `medium` | Begrenzt das Thinking-Ausgabebudget auf 256, 512, 768, 1024 beziehungsweise 2048 Tokens |
 
 Mit den Standardwerten für alle optionalen Einträge genügt die Minimalform
@@ -654,15 +761,26 @@ jede nicht ausdrücklich gesetzte Dimension adaptiv auf `maxthinkingtime=30s` be
 `maxthinkingtokens=ultra` angehoben. Eine explizit gesetzte Zeit oder Tokenstufe bleibt jeweils
 erhalten; nur die jeweils fehlende Angabe wird automatisch ergänzt.
 
-Die Zeitangabe begrenzt nur den zusätzlichen Thinking-Lauf nach dem schnellen Erstdurchlauf; Laden
-und Initialisieren des Modells zählen nicht dazu. Sie ist unter WebGPU eine weiche Obergrenze, weil
-ein bereits laufender GPU-Schritt erst anschließend unterbrochen werden kann. `0s` deaktiviert
-sowohl den optionalen Einzelrecheck als auch den Thinking-Lauf. Die Tokenpresets entsprechen
+Die Zeitangabe begrenzt nur den zusätzlichen Thinking-Lauf nach dem schnellen Erstdurchlauf; Laden,
+Initialisieren und die Grundprüfung des Modells zählen nicht dazu. Bei Ablauf wird die laufende
+Generierung kooperativ unterbrochen und das Ergebnis des Thinking-Laufs verworfen. Die Oberfläche
+wird sofort freigegeben; intern darf der WebLLM-Aufruf noch höchstens zehn Sekunden kontrolliert
+auslaufen, bevor ein festhängender Worker hart beendet wird. Ein unmittelbar gestarteter neuer Lauf
+wartet diese kurze Bereinigung ab und verwendet den intakten Worker anschließend weiter. Bereits an
+die GPU übergebene Arbeit kann währenddessen technisch noch kurz auslaufen. `0s` deaktiviert sowohl
+den optionalen Einzelrecheck als auch den Thinking-Lauf. Die Tokenpresets entsprechen
 `low=256`, `medium=512`, `high=768`,
 `ultra=1024` und `extreme=2048`. Dieses Gesamt-Completion-Budget umfasst sowohl den internen
 `<think>`-Block als auch das abschließende JSON und gilt als gemeinsames Budget für die gesamte
 Antwort, nicht erneut pro Kriterium. `ultra` ist nur für leistungsfähige Geräte gedacht;
 `extreme` ist eine experimentelle Desktop-Option und keine Empfehlung für Schulgeräte.
+
+Unabhängig vom Thinking-Budget verhindert der Quality-Worker endlose einzelne Modellaufrufe mit
+technischen Obergrenzen: Die Worker-Initialisierung wird nach 120 Sekunden und jede einzelne
+Modell-Completion der Grundprüfung nach 150 Sekunden hart beendet. Die 150 Sekunden sind deshalb
+keine Obergrenze für die gesamte Prüfung, falls diese mehrere Completions benötigt. Ein solcher
+Timeout verwirft den Worker, sperrt Quality aber nicht dauerhaft; eine erneute Prüfung startet einen
+frischen Worker aus dem vorhandenen Cache.
 
 Bei „Antwort wird gründlich geprüft …“ zeigt die Aktivitätsanzeige zunächst, wie viel zusätzliche
 Denkzeit bei Bedarf höchstens vorgesehen ist. Erst wenn der adaptive Thinking-Lauf tatsächlich
@@ -779,8 +897,10 @@ Sprachmodelllauf. Die angeforderten Fehlerstatistiken entstehen gemeinsam nach d
 Lauf besitzt ein eigenes Abbruchsignal und kein Inhalts-Thinking-Budget. Das bereits ausgegebene
 Inhaltsurteil, seine Qualität und die ausgewählte Musterlösung werden dadurch nicht mehr verändert.
 Währenddessen kann weitergearbeitet oder die Folie gewechselt werden; eine neue Inhaltsprüfung
-beendet einen noch laufenden optionalen Sprachjob, während ein bereits erlaubter Download und der
-Modellcache erhalten bleiben.
+beendet einen noch laufenden optionalen Sprachjob. Bereits vollständig geladene Cache-Artefakte
+bleiben erhalten. Eine noch laufende gemeinsame Quality-Vorbereitung läuft nur weiter, solange
+mindestens ein anderer aktiver Inhalts- oder Sprachlauf auf sie wartet; andernfalls wird sie
+abgebrochen.
 
 Die Grammatikprüfung darf bewusst länger dauern als die bisherige Statistik: Nach der allgemeinen
 Sprachanalyse erzeugt der Browser selbst sichere Wortpositionen und Optionen. Stimmen Worttoken,
@@ -894,6 +1014,17 @@ Schwelle liegen. Das stärkere Quality-Modell ist eine optionale Erweiterung:
 5. Reicht ein bekanntes Speicherbudget nicht einmal für die kleinere Quality-Stufe, startet kein
    Quality-Download. Bei Ablehnung, ungültigem Qwen-Ergebnis, fehlendem WebGPU oder Geräteverlust
    bleibt der vorgesehene Kompakt- beziehungsweise `uncertain`-Fallback erhalten.
+6. Während einer laufenden Auswertung ist der zugehörige **Prüfen**-Button gesperrt; die sichtbare
+   Aktivitätsanzeige bietet stattdessen **Prüfung abbrechen** an. Der Abbruch beendet die laufende
+   Prüfung und gibt das Quiz mit `LIA: stop` ohne neues richtig/falsch-Ergebnis frei. Während einer
+   Quality-Auswertung wird die aktive Generierung zuerst kooperativ unterbrochen und kontrolliert
+   auslaufen gelassen, damit der WebGPU-Zustand für den nächsten Versuch erhalten bleibt. Nur wenn
+   der Aufruf innerhalb von zehn Sekunden nicht endet oder noch die Worker-Vorbereitung läuft, wird
+   der isolierte Worker hart beendet. Wird derselbe Makrolauf technisch trotzdem erneut ausgelöst,
+   beendet der neue Lauf zuerst den Wartezustand seines Vorgängers und wartet nötigenfalls auf diese
+   Bereinigung. Bereits an die GPU übergebene Arbeit kann dabei noch kurz auslaufen. Ein bereits
+   gestarteter Kompaktlauf kann aufgrund der zugrunde liegenden WASM-Laufzeit ebenfalls technisch zu
+   Ende laufen, liefert nach dem Abbruch aber kein verspätetes Quizresultat.
 
 Wurde `assessmentengine=quality` ausdrücklich für atomare Kriterien angefordert, ist ein
 `failed`- oder `uncertain`-Befund des Kompaktmodells bei nicht verfügbarer Quality-Prüfung kein
@@ -958,6 +1089,18 @@ Widerspruch abgewiesen. Die beiden Batchdurchläufe und der eine Recheck endeten
 Grammar- oder Parserfehler. Das ist ein gezielter Nachweis für diesen 1.7B-Lauf auf diesem Host,
 aber noch keine allgemeine Freigabe: Qwen3-4B, der vollständige
 Cold→Neustart→Offline→Clear-Ablauf und die tatsächlichen Schulgeräte bleiben separat zu prüfen.
+
+Version 0.6.5 wurde zusätzlich im sichtbaren offiziellen LiaScript-Renderer mit Edge 152 und
+Firefox 155.0.1, jeweils mit normalem WebGPU und einem warmen 1.7B-Cache, geprüft. Abbruch und
+unmittelbarer Neustart sowie ein technisch erzwungener Ersatzlauf hinterließen in beiden Browsern
+keinen aktiven Quizlauf und keine sichtbare Ladeanzeige; die erfolgreichen `5_09`-Läufe erfüllten
+jeweils 8 von 8 Kriterien. Ein gezielt erzwungener Thinking-Lauf endete in Edge nach 15.002 ms und
+in Firefox nach 15.072 ms. Beide Browser sendeten genau einen kooperativen
+`interruptGenerate`-Aufruf, beendeten den Quality-Worker dabei nicht und verwendeten ihn für den
+sofort folgenden erfolgreichen 8-von-8-Lauf weiter. Die gesamte erste Prüfung dauerte dennoch
+43.802 ms beziehungsweise 120.975 ms, weil Modellstart und Grundprüfung – wie oben beschrieben –
+nicht zum 15-Sekunden-Thinking-Budget gehören.
+
 Die zwischenzeitlich geprüfte 0.6B-Variante bestand den semantischen Stresstest nur in 6 von 12
 Fällen und wird nicht als Bewertungsmodell ausgeliefert.
 
@@ -989,10 +1132,12 @@ einen Qwen-Download noch eine WebGPU-Initialisierung. Nur eine ausdrückliche
 Quality-Auswahl beziehungsweise die kompatible implizite Auswahl durch Operator, Sprachanalyse oder
 aktiviertes Thinking startet den Quality-Pfad. Dieser wartet bei einem ungecachten oder nur teilweise
 gecachten Qualitätsmodell höchstens 30 Sekunden, bei einem vollständig gecachten Warmstart höchstens
-180 Sekunden. Danach greift der jeweils vorgesehene Kompakt- beziehungsweise `uncertain`-Fallback;
-die dadurch gestartete globale Quality-Vorbereitung läuft jedoch sichtbar bis zum vollständigen
-Cache weiter. Weder das Ende der Quiz-Auswertung noch deren `stop`-Signal bricht diesen
-Hintergrunddownload ab.
+180 Sekunden. Danach greift der jeweils vorgesehene Kompakt- beziehungsweise `uncertain`-Fallback.
+Hat dieser Zeit-Fallback die globale Quality-Vorbereitung bereits bewusst vom Quiz gelöst, läuft sie
+sichtbar bis zum vollständigen Cache weiter; ein späteres Ende dieses bereits abgeschlossenen
+Quizlaufs bricht den losgelösten Hintergrunddownload nicht ab. Wird eine noch wartende Prüfung
+dagegen ausdrücklich abgebrochen, endet auch ihre Quality-Vorbereitung, sobald kein anderer aktiver
+Lauf mehr auf dieselbe Vorbereitung wartet.
 
 Vor jedem noch nicht vollständig gecachten Quality-Download wird unabhängig von Verbindungsart und
 Gerät ausdrücklich gefragt. Das Dialogfeld nennt das ausgewählte Modell, die geschätzte
@@ -1112,7 +1257,10 @@ Eine umgekehrte Kernaussage muss falsch bleiben:
 
 > Eis schwimmt, weil es eine höhere Dichte als flüssiges Wasser besitzt.
 
-Beim Folienwechsel beendet der Makro-`stop`-Handler nur die Ausgabe der verlassenen Aufgabe.
-Ein bereits erlaubter Hintergrunddownload und der globale Modellcache bleiben erhalten. Dadurch
-erscheint kein verspätetes Quizresultat auf einer anderen Folie, das vorbereitete Modell steht aber
-für spätere Aufgaben weiter zur Verfügung.
+Beim Folienwechsel beendet der Makro-`stop`-Handler die Ausgabe und die aktive Auswertung der
+verlassenen Aufgabe. Vollständig geladene Cache-Artefakte bleiben erhalten. Eine noch gemeinsam
+genutzte Quality-Vorbereitung läuft für andere aktive Aufgaben weiter; ohne weiteren Interessenten
+wird sie abgebrochen. Nur eine nach dem oben beschriebenen Zeit-Fallback bereits bewusst losgelöste
+Hintergrundvorbereitung läuft unabhängig vom beendeten Quiz weiter. Dadurch erscheint kein
+verspätetes Quizresultat auf einer anderen Folie; ein bereits vorbereitetes Modell steht für spätere
+Aufgaben weiterhin zur Verfügung.

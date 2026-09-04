@@ -5,6 +5,7 @@ import { test } from "node:test"
 
 import { env } from "@huggingface/transformers"
 import * as webLlm from "../src/generated/webllm.js"
+import qualityWorkerSource from "../src/generated/webllm-worker-source.js"
 import {
   aggregateCriteria,
   bestReferenceVariantIndex,
@@ -137,6 +138,9 @@ import {
   prefetchQualityArtifacts,
   QualityOutputError,
   QualityEvaluator,
+  QualityWorkerRuntimeError,
+  QualityWorkerSupervisor,
+  QualityWorkerTimeoutError,
   referenceAnchoredSpelling,
   qualityDiagnosticForCriteria,
   QUALITY_CRITERIA_BATCH_INSTRUCTION,
@@ -4645,6 +4649,792 @@ test('quality error guards separate fatal runtime failures from request-local co
   assert.equal(isRecoverableQualityRequestError(new Error('temporary fetch failure')), false)
 })
 
+class FakeQualityWorker extends EventTarget {
+  onmessage: ((event: MessageEvent) => unknown) | null = null
+  readonly messages: unknown[] = []
+  terminateCalls = 0
+
+  postMessage(message: unknown): void {
+    this.messages.push(message)
+  }
+
+  terminate(): void {
+    this.terminateCalls += 1
+  }
+
+  fail(message: string): void {
+    const event = new Event('error')
+    Object.defineProperty(event, 'message', { value: message })
+    this.dispatchEvent(event)
+  }
+}
+
+test('generated Quality worker source is self-contained classic JavaScript', () => {
+  assert.ok(qualityWorkerSource.length > 1_000_000)
+  assert.equal(/\nexport \{[^\n]+\};\s*$/u.test(qualityWorkerSource), false)
+  assert.match(qualityWorkerSource, /new WebWorkerMLCEngineHandler\(\)/u)
+  assert.match(qualityWorkerSource, /Quality worker cache miss/u)
+  assert.doesNotThrow(() => new Function(qualityWorkerSource))
+})
+
+test('QualityWorkerSupervisor hard-stops a reload whose RPC never settles', async () => {
+  const worker = new FakeQualityWorker()
+  const revoked: string[] = []
+  let unloadCalls = 0
+  const engine = {
+    reload: async () => await new Promise<void>(() => undefined),
+    unload: async () => {
+      unloadCalls += 1
+    },
+    interruptGenerate: async () => undefined,
+    chat: { completions: { create: async () => ({ choices: [] }) } },
+  }
+  const supervisor = new QualityWorkerSupervisor({
+    workerSource: 'worker source',
+    reloadTimeoutMs: 10,
+    createObjectUrl: () => 'blob:reload-timeout',
+    revokeObjectUrl: (url) => revoked.push(url),
+    createWorker: () => worker,
+    createEngine: () => engine,
+  })
+
+  await assert.rejects(
+    supervisor.start(
+      createQualityAppConfig(webLlm.prebuiltAppConfig, SMALL_QUALITY_MODEL),
+      SMALL_QUALITY_MODEL.id,
+      () => undefined,
+    ),
+    (error: unknown) =>
+      error instanceof QualityWorkerTimeoutError &&
+      error.operation === 'reload' &&
+      isFatalQualityEngineError(error),
+  )
+  assert.equal(worker.terminateCalls, 1)
+  assert.deepEqual(revoked, ['blob:reload-timeout'])
+  assert.equal(unloadCalls, 0)
+})
+
+test('QualityWorkerSupervisor makes a stuck completion fatal without unload RPC', async () => {
+  const worker = new FakeQualityWorker()
+  const revoked: string[] = []
+  let unloadCalls = 0
+  const engine = {
+    reload: async () => undefined,
+    unload: async () => {
+      unloadCalls += 1
+    },
+    interruptGenerate: async () => undefined,
+    chat: { completions: { create: async () => ({ choices: [] }) } },
+  }
+  const supervisor = new QualityWorkerSupervisor({
+    workerSource: 'worker source',
+    completionTimeoutMs: 10,
+    createObjectUrl: () => 'blob:completion-timeout',
+    revokeObjectUrl: (url) => revoked.push(url),
+    createWorker: () => worker,
+    createEngine: () => engine,
+  })
+  const loaded = await supervisor.start(
+    createQualityAppConfig(webLlm.prebuiltAppConfig, SMALL_QUALITY_MODEL),
+    SMALL_QUALITY_MODEL.id,
+    () => undefined,
+  )
+
+  await assert.rejects(
+    supervisor.run(loaded, async () =>
+      await new Promise<never>(() => undefined)
+    ),
+    (error: unknown) =>
+      error instanceof QualityWorkerTimeoutError &&
+      error.operation === 'completion' &&
+      isFatalQualityEngineError(error),
+  )
+  assert.equal(worker.terminateCalls, 1)
+  assert.deepEqual(revoked, ['blob:completion-timeout'])
+  assert.equal(unloadCalls, 0)
+})
+
+test('QualityWorkerSupervisor cooperatively aborts and drains a completion before reuse', async () => {
+  const worker = new FakeQualityWorker()
+  let interruptCalls = 0
+  let resolveFirst!: (value: string) => void
+  let reportFirstStarted!: () => void
+  const firstStarted = new Promise<void>((resolve) => {
+    reportFirstStarted = resolve
+  })
+  const engine = {
+    reload: async () => undefined,
+    unload: async () => undefined,
+    interruptGenerate: async () => {
+      interruptCalls += 1
+    },
+    chat: { completions: { create: async () => ({ choices: [] }) } },
+  }
+  const supervisor = new QualityWorkerSupervisor({
+    workerSource: 'worker source',
+    completionAbortGraceMs: 1_000,
+    createObjectUrl: () => 'blob:completion-cooperative-abort',
+    revokeObjectUrl: () => undefined,
+    createWorker: () => worker,
+    createEngine: () => engine,
+  })
+  const loaded = await supervisor.start(
+    createQualityAppConfig(webLlm.prebuiltAppConfig, SMALL_QUALITY_MODEL),
+    SMALL_QUALITY_MODEL.id,
+    () => undefined,
+  )
+  const controller = new AbortController()
+  const first = supervisor.run(
+    loaded,
+    async () => {
+      reportFirstStarted()
+      return await new Promise<string>((resolve) => {
+        resolveFirst = resolve
+      })
+    },
+    controller.signal,
+  )
+  await firstStarted
+  controller.abort()
+  await assert.rejects(first, { name: 'AbortError' })
+  assert.equal(interruptCalls, 1)
+  assert.equal(worker.terminateCalls, 0)
+  assert.equal(supervisor.owns(loaded), true)
+
+  let secondStarted = false
+  const second = supervisor.run(loaded, async () => {
+    secondStarted = true
+    return 'second'
+  })
+  await Promise.resolve()
+  await Promise.resolve()
+  assert.equal(secondStarted, false)
+  resolveFirst('discarded')
+  assert.equal(await second, 'second')
+  assert.equal(worker.terminateCalls, 0)
+  assert.equal(supervisor.owns(loaded), true)
+})
+
+test('QualityWorkerSupervisor discards a worker after a late fatal completion rejection', async () => {
+  const worker = new FakeQualityWorker()
+  let rejectFirst!: (error: Error) => void
+  let reportFirstStarted!: () => void
+  const firstStarted = new Promise<void>((resolve) => {
+    reportFirstStarted = resolve
+  })
+  let failure: Error | undefined
+  const engine = {
+    reload: async () => undefined,
+    unload: async () => undefined,
+    interruptGenerate: async () => undefined,
+    chat: { completions: { create: async () => ({ choices: [] }) } },
+  }
+  const supervisor = new QualityWorkerSupervisor({
+    workerSource: 'worker source',
+    completionAbortGraceMs: 1_000,
+    createObjectUrl: () => 'blob:completion-late-device-loss',
+    revokeObjectUrl: () => undefined,
+    createWorker: () => worker,
+    createEngine: () => engine,
+  })
+  const loaded = await supervisor.start(
+    createQualityAppConfig(webLlm.prebuiltAppConfig, SMALL_QUALITY_MODEL),
+    SMALL_QUALITY_MODEL.id,
+    () => undefined,
+    (_engine, error) => {
+      failure = error
+    },
+  )
+  const controller = new AbortController()
+  const first = supervisor.run(
+    loaded,
+    async () => {
+      reportFirstStarted()
+      return await new Promise<string>((_resolve, reject) => {
+        rejectFirst = reject
+      })
+    },
+    controller.signal,
+  )
+  await firstStarted
+  controller.abort()
+  await assert.rejects(first, { name: 'AbortError' })
+  assert.equal(supervisor.owns(loaded), true)
+
+  const deviceError = new Error(
+    'DXGI_ERROR_DEVICE_REMOVED while the generation was aborted',
+  )
+  rejectFirst(deviceError)
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(worker.terminateCalls, 1)
+  assert.equal(supervisor.owns(loaded), false)
+  assert.equal(failure, deviceError)
+})
+
+test('AutomaticEvaluator circuit-breaks late fatal completions and Worker crashes for the session', async () => {
+  const workers: FakeQualityWorker[] = []
+  let reloadCalls = 0
+  let completionCalls = 0
+  const rejectCompletions: Array<(error: Error) => void> = []
+  const reportCompletionStarted: Array<() => void> = []
+  const completionStarted = Array.from(
+    { length: 2 },
+    (_, index) =>
+      new Promise<void>((resolve) => {
+        reportCompletionStarted[index] = resolve
+      }),
+  )
+  const engine = {
+    reload: async () => {
+      reloadCalls += 1
+    },
+    unload: async () => undefined,
+    interruptGenerate: async () => undefined,
+    chat: {
+      completions: {
+        create: async () => {
+          const index = completionCalls
+          completionCalls += 1
+          if (index >= completionStarted.length) {
+            throw new Error('A fatal Quality session must not run again.')
+          }
+          reportCompletionStarted[index]!()
+          return await new Promise<never>((_resolve, reject) => {
+            rejectCompletions[index] = reject
+          })
+        },
+      },
+    },
+  }
+  const supervisor = new QualityWorkerSupervisor({
+    workerSource: 'worker source',
+    completionAbortGraceMs: 1_000,
+    createObjectUrl: () => `blob:late-fatal-session-${workers.length + 1}`,
+    revokeObjectUrl: () => undefined,
+    createWorker: () => {
+      const worker = new FakeQualityWorker()
+      workers.push(worker)
+      return worker
+    },
+    createEngine: () => engine,
+  })
+  const quality = new QualityEvaluator(supervisor)
+  const selection = {
+    model: SMALL_QUALITY_MODEL,
+    sufficient: true,
+    reason: 'small-cached' as const,
+    payloadCached: true,
+    storage: { kind: 'unknown' as const, reason: 'unsupported' as const },
+  }
+  const cacheInfo: ModelCacheInfo = {
+    supported: true,
+    cached: true,
+    downloadCached: true,
+    filesCached: 4,
+    filesTotal: 4,
+    estimatedBytes: SMALL_QUALITY_MODEL.estimatedBytes,
+    qualitySelection: selection,
+  }
+  const qualityInternals = quality as unknown as {
+    engine: typeof engine | null
+    loadedModel: typeof SMALL_QUALITY_MODEL | null
+    modelSelection: typeof selection | null
+    handleWorkerFailure(failedEngine: typeof engine, error: Error): void
+    createEngine(
+      networkAuthorized: boolean,
+      signal?: AbortSignal,
+    ): Promise<typeof engine>
+  }
+  const startManagedEngine = (signal?: AbortSignal) =>
+    supervisor.start(
+      createQualityAppConfig(webLlm.prebuiltAppConfig, SMALL_QUALITY_MODEL),
+      SMALL_QUALITY_MODEL.id,
+      () => undefined,
+      (failedEngine, error) =>
+        qualityInternals.handleWorkerFailure(
+          failedEngine as typeof engine,
+          error,
+        ),
+      signal,
+    )
+  qualityInternals.modelSelection = selection
+  ;(
+    quality as unknown as {
+      getCacheInfo(): Promise<ModelCacheInfo>
+    }
+  ).getCacheInfo = async () => cacheInfo
+  qualityInternals.createEngine = async (_networkAuthorized, signal) =>
+    startManagedEngine(signal)
+  const loaded = await startManagedEngine()
+  qualityInternals.engine = loaded
+  qualityInternals.loadedModel = SMALL_QUALITY_MODEL
+
+  const compactStatus: RuntimeStatus = {
+    phase: 'ready',
+    assessmentEngine: 'compact',
+    modelId: 'compact-late-fatal-fallback',
+    revision: 'test',
+    device: 'wasm',
+    dtype: 'q8',
+  }
+  let compactEvaluateCalls = 0
+  const compact = {
+    getStatus: () => compactStatus,
+    getCacheInfo: async () => ({
+      supported: true,
+      cached: true,
+      downloadCached: true,
+      filesCached: 1,
+      filesTotal: 1,
+      estimatedBytes: 1,
+    }),
+    preload: async () => compactStatus,
+    evaluate: async (request: EvaluationRequest) => {
+      compactEvaluateCalls += 1
+      const value = evaluation('passed', [result('overall', 'met', true)])
+      value.answer = request.answer
+      value.model.id = compactStatus.modelId
+      value.model.device = compactStatus.device
+      value.model.dtype = compactStatus.dtype
+      value.model.task = 'natural-language-inference'
+      return value
+    },
+    unloadRuntime: async () => undefined,
+    clearCache: async () => 0,
+  }
+  const automatic = new AutomaticEvaluator(compact as never, quality)
+  const automaticInternals = automatic as unknown as {
+    qualityReady: boolean
+    qualityDegraded: boolean
+  }
+  automaticInternals.qualityReady = true
+  const request: EvaluationRequest = {
+    question: 'Warum schwimmt Eis?',
+    answer: 'Gefrorenes Wasser besitzt eine geringere Dichte und schwimmt.',
+    reference: 'Eis schwimmt, weil seine Dichte geringer als die von Wasser ist.',
+    assessmentEngine: 'quality',
+  }
+
+  const controller = new AbortController()
+  const first = automatic.evaluate(request, {
+    signal: controller.signal,
+    maxThinkingTimeMs: 0,
+  })
+  await completionStarted[0]
+  controller.abort()
+  await assert.rejects(first, { name: 'AbortError' })
+
+  rejectCompletions[0]!(
+    new Error('DXGI_ERROR_DEVICE_REMOVED while generation was aborted'),
+  )
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(workers[0]?.terminateCalls, 1)
+  assert.equal(workers.length, 1)
+  assert.equal(reloadCalls, 1)
+
+  const fallback = await automatic.evaluate(request)
+  assert.equal(fallback.model.id, 'compact-late-fatal-fallback')
+  assert.equal(compactEvaluateCalls, 1)
+  assert.equal(completionCalls, 1)
+  assert.equal(workers.length, 1)
+  assert.equal(reloadCalls, 1)
+
+  await automatic.clearCache()
+  const resetEngine = await startManagedEngine()
+  qualityInternals.engine = resetEngine
+  qualityInternals.loadedModel = SMALL_QUALITY_MODEL
+  qualityInternals.modelSelection = selection
+  automaticInternals.qualityReady = true
+  automaticInternals.qualityDegraded = false
+  assert.equal(workers.length, 2)
+  assert.equal(reloadCalls, 2)
+
+  const crashController = new AbortController()
+  const beforeWorkerCrash = automatic.evaluate(request, {
+    signal: crashController.signal,
+    maxThinkingTimeMs: 0,
+  })
+  await completionStarted[1]
+  crashController.abort()
+  await assert.rejects(beforeWorkerCrash, { name: 'AbortError' })
+  workers[1]!.fail('Worker connection failed after generation was aborted')
+  await new Promise((resolve) => setTimeout(resolve, 0))
+
+  const crashFallback = await automatic.evaluate(request)
+  assert.equal(crashFallback.model.id, 'compact-late-fatal-fallback')
+  assert.equal(compactEvaluateCalls, 2)
+  assert.equal(completionCalls, 2)
+  assert.equal(workers[1]?.terminateCalls, 1)
+  assert.equal(workers.length, 2)
+  assert.equal(reloadCalls, 2)
+  await automatic.clearCache()
+})
+
+test('QualityWorkerSupervisor accepts a late plain interrupt rejection as a clean drain', async () => {
+  const worker = new FakeQualityWorker()
+  let rejectFirst!: (error: Error) => void
+  let reportFirstStarted!: () => void
+  const firstStarted = new Promise<void>((resolve) => {
+    reportFirstStarted = resolve
+  })
+  const engine = {
+    reload: async () => undefined,
+    unload: async () => undefined,
+    interruptGenerate: async () => undefined,
+    chat: { completions: { create: async () => ({ choices: [] }) } },
+  }
+  const supervisor = new QualityWorkerSupervisor({
+    workerSource: 'worker source',
+    completionAbortGraceMs: 1_000,
+    createObjectUrl: () => 'blob:completion-late-interrupt',
+    revokeObjectUrl: () => undefined,
+    createWorker: () => worker,
+    createEngine: () => engine,
+  })
+  const loaded = await supervisor.start(
+    createQualityAppConfig(webLlm.prebuiltAppConfig, SMALL_QUALITY_MODEL),
+    SMALL_QUALITY_MODEL.id,
+    () => undefined,
+  )
+  const controller = new AbortController()
+  const first = supervisor.run(
+    loaded,
+    async () => {
+      reportFirstStarted()
+      return await new Promise<string>((_resolve, reject) => {
+        rejectFirst = reject
+      })
+    },
+    controller.signal,
+  )
+  await firstStarted
+  controller.abort()
+  await assert.rejects(first, { name: 'AbortError' })
+
+  const interrupted = new Error('generation aborted by interrupt request')
+  interrupted.name = 'RuntimeError'
+  rejectFirst(interrupted)
+  assert.equal(
+    await supervisor.run(loaded, async () => 'reused'),
+    'reused',
+  )
+  assert.equal(worker.terminateCalls, 0)
+  assert.equal(supervisor.owns(loaded), true)
+})
+
+test('QualityWorkerSupervisor cooperatively drains an explicit completion deadline', async () => {
+  const worker = new FakeQualityWorker()
+  let interruptCalls = 0
+  let resolveFirst!: (value: string) => void
+  let reportFirstStarted!: () => void
+  const firstStarted = new Promise<void>((resolve) => {
+    reportFirstStarted = resolve
+  })
+  const engine = {
+    reload: async () => undefined,
+    unload: async () => undefined,
+    interruptGenerate: async () => {
+      interruptCalls += 1
+    },
+    chat: { completions: { create: async () => ({ choices: [] }) } },
+  }
+  const supervisor = new QualityWorkerSupervisor({
+    workerSource: 'worker source',
+    completionAbortGraceMs: 1_000,
+    createObjectUrl: () => 'blob:completion-soft-deadline',
+    revokeObjectUrl: () => undefined,
+    createWorker: () => worker,
+    createEngine: () => engine,
+  })
+  const loaded = await supervisor.start(
+    createQualityAppConfig(webLlm.prebuiltAppConfig, SMALL_QUALITY_MODEL),
+    SMALL_QUALITY_MODEL.id,
+    () => undefined,
+  )
+  const first = supervisor.run(
+    loaded,
+    async () => {
+      reportFirstStarted()
+      return await new Promise<string>((resolve) => {
+        resolveFirst = resolve
+      })
+    },
+    undefined,
+    10,
+  )
+  await firstStarted
+  await assert.rejects(
+    first,
+    (error: unknown) =>
+      error instanceof QualityWorkerTimeoutError &&
+      error.operation === 'completion' &&
+      error.timeoutMs === 10,
+  )
+  assert.equal(interruptCalls, 1)
+  assert.equal(worker.terminateCalls, 0)
+
+  let secondStarted = false
+  const second = supervisor.run(loaded, async () => {
+    secondStarted = true
+    return 'second'
+  })
+  await Promise.resolve()
+  await Promise.resolve()
+  assert.equal(secondStarted, false)
+  resolveFirst('discarded')
+  assert.equal(await second, 'second')
+  assert.equal(worker.terminateCalls, 0)
+  assert.equal(supervisor.owns(loaded), true)
+})
+
+test('QualityWorkerSupervisor hard-stops a completion that cannot drain after abort', async () => {
+  const worker = new FakeQualityWorker()
+  let interruptCalls = 0
+  let reportStarted!: () => void
+  const started = new Promise<void>((resolve) => {
+    reportStarted = resolve
+  })
+  let failure: Error | undefined
+  const engine = {
+    reload: async () => undefined,
+    unload: async () => undefined,
+    interruptGenerate: async () => {
+      interruptCalls += 1
+    },
+    chat: { completions: { create: async () => ({ choices: [] }) } },
+  }
+  const supervisor = new QualityWorkerSupervisor({
+    workerSource: 'worker source',
+    completionAbortGraceMs: 10,
+    createObjectUrl: () => 'blob:completion-stuck-abort',
+    revokeObjectUrl: () => undefined,
+    createWorker: () => worker,
+    createEngine: () => engine,
+  })
+  const loaded = await supervisor.start(
+    createQualityAppConfig(webLlm.prebuiltAppConfig, SMALL_QUALITY_MODEL),
+    SMALL_QUALITY_MODEL.id,
+    () => undefined,
+    (_engine, error) => {
+      failure = error
+    },
+  )
+  const controller = new AbortController()
+  const completion = supervisor.run(
+    loaded,
+    async () => {
+      reportStarted()
+      return await new Promise<never>(() => undefined)
+    },
+    controller.signal,
+  )
+  await started
+  controller.abort()
+  await assert.rejects(completion, { name: 'AbortError' })
+  assert.equal(interruptCalls, 1)
+  assert.equal(worker.terminateCalls, 0)
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(worker.terminateCalls, 1)
+  assert.equal(supervisor.owns(loaded), false)
+  assert.equal(failure instanceof QualityWorkerTimeoutError, true)
+  assert.equal((failure as QualityWorkerTimeoutError | undefined)?.operation, 'completion')
+  assert.equal((failure as QualityWorkerTimeoutError | undefined)?.timeoutMs, 10)
+})
+
+test('QualityWorkerSupervisor keeps an idle worker for a pre-aborted completion', async () => {
+  const worker = new FakeQualityWorker()
+  let operationCalls = 0
+  const engine = {
+    reload: async () => undefined,
+    unload: async () => undefined,
+    interruptGenerate: async () => undefined,
+    chat: { completions: { create: async () => ({ choices: [] }) } },
+  }
+  const supervisor = new QualityWorkerSupervisor({
+    workerSource: 'worker source',
+    createObjectUrl: () => 'blob:completion-pre-aborted',
+    revokeObjectUrl: () => undefined,
+    createWorker: () => worker,
+    createEngine: () => engine,
+  })
+  const loaded = await supervisor.start(
+    createQualityAppConfig(webLlm.prebuiltAppConfig, SMALL_QUALITY_MODEL),
+    SMALL_QUALITY_MODEL.id,
+    () => undefined,
+  )
+  const controller = new AbortController()
+  controller.abort()
+  await assert.rejects(
+    supervisor.run(
+      loaded,
+      async () => {
+        operationCalls += 1
+        return 'unreachable'
+      },
+      controller.signal,
+    ),
+    { name: 'AbortError' },
+  )
+  assert.equal(operationCalls, 0)
+  assert.equal(worker.terminateCalls, 0)
+  assert.equal(supervisor.owns(loaded), true)
+})
+
+test('QualityWorkerSupervisor aborts a stuck reload and starts a fresh worker', async () => {
+  const workers: FakeQualityWorker[] = []
+  const revoked: string[] = []
+  const progressCallbacks: Array<
+    (progress: { progress: number; text: string }) => void
+  > = []
+  const reported: string[] = []
+  let reloadCalls = 0
+  let unloadCalls = 0
+  const supervisor = new QualityWorkerSupervisor({
+    workerSource: 'worker source',
+    createObjectUrl: () => 'blob:worker-' + (workers.length + 1),
+    revokeObjectUrl: (url) => revoked.push(url),
+    createWorker: () => {
+      const worker = new FakeQualityWorker()
+      workers.push(worker)
+      return worker
+    },
+    createEngine: (_worker, _appConfig, onProgress) => {
+      const engineIndex = progressCallbacks.length
+      progressCallbacks.push(onProgress)
+      return {
+        reload: async () => {
+          reloadCalls += 1
+          if (engineIndex === 0) {
+            await new Promise<void>(() => undefined)
+          }
+        },
+        unload: async () => {
+          unloadCalls += 1
+        },
+        interruptGenerate: async () => undefined,
+        chat: { completions: { create: async () => ({ choices: [] }) } },
+      }
+    },
+  })
+  const appConfig = createQualityAppConfig(
+    webLlm.prebuiltAppConfig,
+    SMALL_QUALITY_MODEL,
+  )
+  const controller = new AbortController()
+  const firstStart = supervisor.start(
+    appConfig,
+    SMALL_QUALITY_MODEL.id,
+    (progress) => reported.push('first:' + progress.text),
+    undefined,
+    controller.signal,
+  )
+  progressCallbacks[0]?.({ progress: 0.5, text: 'current' })
+  controller.abort()
+  await assert.rejects(firstStart, { name: 'AbortError' })
+  assert.equal(workers[0]?.terminateCalls, 1)
+
+  const secondEngine = await supervisor.start(
+    appConfig,
+    SMALL_QUALITY_MODEL.id,
+    (progress) => reported.push('second:' + progress.text),
+  )
+  progressCallbacks[0]?.({ progress: 0.9, text: 'stale' })
+  progressCallbacks[1]?.({ progress: 1, text: 'ready' })
+  assert.equal(await supervisor.run(secondEngine, async () => 'recovered'), 'recovered')
+  assert.deepEqual(reported, ['first:current', 'second:ready'])
+  assert.equal(reloadCalls, 2)
+  assert.equal(unloadCalls, 0)
+  supervisor.stop()
+  assert.equal(workers[1]?.terminateCalls, 1)
+  assert.deepEqual(revoked, ['blob:worker-1', 'blob:worker-2'])
+})
+
+test('QualityWorkerSupervisor races completion against Worker error events', async () => {
+  const worker = new FakeQualityWorker()
+  let failure: Error | undefined
+  const engine = {
+    reload: async () => undefined,
+    unload: async () => undefined,
+    interruptGenerate: async () => undefined,
+    chat: { completions: { create: async () => ({ choices: [] }) } },
+  }
+  const supervisor = new QualityWorkerSupervisor({
+    workerSource: 'worker source',
+    createObjectUrl: () => 'blob:worker-error',
+    revokeObjectUrl: () => undefined,
+    createWorker: () => worker,
+    createEngine: () => engine,
+  })
+  const loaded = await supervisor.start(
+    createQualityAppConfig(webLlm.prebuiltAppConfig, SMALL_QUALITY_MODEL),
+    SMALL_QUALITY_MODEL.id,
+    () => undefined,
+    (_failedEngine, error) => {
+      failure = error
+    },
+  )
+  const stuck = supervisor.run(
+    loaded,
+    async () => await new Promise<never>(() => undefined),
+  )
+  worker.fail('Buffer unmapped')
+
+  await assert.rejects(stuck, QualityWorkerRuntimeError)
+  assert.equal(isFatalQualityEngineError(failure), true)
+  assert.match(failure?.message ?? '', /Buffer unmapped/u)
+  assert.equal(worker.terminateCalls, 1)
+})
+
+test('QualityEvaluator clearCache synchronously terminates a stuck managed Worker', async () => {
+  const worker = new FakeQualityWorker()
+  let unloadCalls = 0
+  let signalCompletionStarted!: () => void
+  const completionStarted = new Promise<void>((resolve) => {
+    signalCompletionStarted = resolve
+  })
+  const engine = {
+    reload: async () => undefined,
+    unload: async () => {
+      unloadCalls += 1
+    },
+    interruptGenerate: async () => undefined,
+    chat: { completions: { create: async () => {
+      signalCompletionStarted()
+      return await new Promise<never>(() => undefined)
+    } } },
+  }
+  const supervisor = new QualityWorkerSupervisor({
+    workerSource: 'worker source',
+    createObjectUrl: () => 'blob:clear-cache',
+    revokeObjectUrl: () => undefined,
+    createWorker: () => worker,
+    createEngine: () => engine,
+  })
+  const loaded = await supervisor.start(
+    createQualityAppConfig(webLlm.prebuiltAppConfig, SMALL_QUALITY_MODEL),
+    SMALL_QUALITY_MODEL.id,
+    () => undefined,
+  )
+  const evaluator = new QualityEvaluator(supervisor)
+  ;(evaluator as unknown as { engine: typeof engine | null }).engine = loaded
+  const evaluation = evaluator.evaluate(
+    {
+      question: 'Nenne das Ergebnis.',
+      answer: 'Eine hinreichend lange Antwort.',
+      reference: 'Eine hinreichend lange Antwort.',
+    },
+    { maxThinkingTimeMs: 0 },
+  )
+  await completionStarted
+
+  const clearing = evaluator.clearCache()
+  assert.equal(worker.terminateCalls, 1)
+  assert.equal(unloadCalls, 0)
+  await assert.rejects(evaluation, { name: 'AbortError' })
+  assert.equal(await clearing, 0)
+  assert.equal(evaluator.getStatus().phase, 'idle')
+})
+
 test('QualityEvaluator treats an unmapped buffer during thinking as fatal', async () => {
   let calls = 0
   let unloadCalls = 0
@@ -7872,6 +8662,78 @@ test("QualityEvaluator keeps a cache-only preload network-blocked", async () => 
   assert.equal(networkAuthorized, false)
 })
 
+test("QualityEvaluator aborts a direct preload before post-probe cache mutation", async () => {
+  const storage = new RuntimeCacheStorageStub()
+  const modelCache = new MemoryRuntimeCache()
+  storage.cachesByName.set("webllm/model", modelCache)
+  storage.cachesByName.set("webllm/config", new MemoryRuntimeCache())
+  storage.cachesByName.set("webllm/wasm", new MemoryRuntimeCache())
+  const legacyUrl =
+    LEGACY_QUALITY_CACHE_TARGETS[0]!.modelUrl +
+    "params/params_shard_0.bin"
+  modelCache.seed(legacyUrl, new Response("keep-after-abort"))
+
+  const selection = selectQualityModel({
+    storage: { kind: "unknown", reason: "unsupported" },
+  })
+  const cacheInfo: ModelCacheInfo = {
+    supported: true,
+    cached: false,
+    downloadCached: false,
+    filesCached: 0,
+    filesTotal: 4,
+    estimatedBytes: SMALL_QUALITY_MODEL.estimatedBytes,
+    qualitySelection: selection,
+  }
+  let releaseProbe!: () => void
+  let reportProbeStarted!: () => void
+  const probeStarted = new Promise<void>((resolve) => {
+    reportProbeStarted = resolve
+  })
+  const probeBarrier = new Promise<void>((resolve) => {
+    releaseProbe = resolve
+  })
+  const evaluator = new QualityEvaluator()
+  let createCalls = 0
+  const internals = evaluator as unknown as {
+    loadPromise: Promise<{ unload(): Promise<void> }> | null
+    model: typeof SMALL_QUALITY_MODEL
+    modelSelection: typeof selection
+    createEngine(): Promise<{ unload(): Promise<void> }>
+  }
+  internals.model = SMALL_QUALITY_MODEL
+  internals.modelSelection = selection
+  ;(
+    evaluator as unknown as {
+      getCacheInfo(): Promise<ModelCacheInfo>
+    }
+  ).getCacheInfo = async () => {
+    reportProbeStarted()
+    await probeBarrier
+    return cacheInfo
+  }
+  internals.createEngine = async () => {
+    createCalls += 1
+    return { unload: async () => undefined }
+  }
+
+  await withCacheStorage(storage.asCacheStorage(), async () => {
+    const controller = new AbortController()
+    const preload = evaluator.preload(undefined, true, controller.signal)
+    await probeStarted
+    const internalLoad = internals.loadPromise
+    assert.ok(internalLoad)
+    controller.abort()
+    await assert.rejects(preload, { name: "AbortError" })
+    releaseProbe()
+    await assert.rejects(internalLoad, { name: "AbortError" })
+  })
+
+  assert.equal(createCalls, 0)
+  assert.equal(modelCache.has(legacyUrl), true)
+  assert.equal(evaluator.getStatus().phase, "idle")
+})
+
 test("QualityEvaluator requires fresh consent when a cached artifact is corrupt", async () => {
   const storage = new RuntimeCacheStorageStub()
   const configCache = new MemoryRuntimeCache()
@@ -8058,7 +8920,7 @@ test("QualityEvaluator clearCache cancels a preload before its download starts",
   assert.equal(evaluator.getStatus().phase, "idle")
 })
 
-test("QualityEvaluator waits for fatal engine cleanup before reloading", async () => {
+test("QualityEvaluator waits for non-hardware engine cleanup before reloading", async () => {
   let releaseUnload!: () => void
   let signalUnloadStarted!: () => void
   const unloadStarted = new Promise<void>((resolve) => {
@@ -8080,7 +8942,7 @@ test("QualityEvaluator waits for fatal engine cleanup before reloading", async (
     createEngine(): Promise<typeof newEngine>
   }
   internals.engine = oldEngine
-  internals.failEngine(new Error("Object has already been disposed"))
+  internals.failEngine(new Error("Temporary evaluation runtime failure"))
 
   let createCalls = 0
   internals.createEngine = async () => {
@@ -9737,7 +10599,13 @@ class ForegroundWaitMockEvaluator {
   preloadCalls = 0
   evaluateCalls = 0
   unloadCalls = 0
+  cancelPreloadCalls = 0
   resultStatus: EvaluationResult["status"] = "passed"
+  preloadHook?: (
+    call: number,
+    signal: AbortSignal | undefined,
+  ) => Promise<void>
+  evaluateHook?: (call: number) => Promise<void>
   private readonly cacheInfo: ModelCacheInfo
   private readonly preloadBarrier: Promise<void>
   private releasePreloadBarrier: () => void = () => undefined
@@ -9784,15 +10652,24 @@ class ForegroundWaitMockEvaluator {
     return { ...this.cacheInfo }
   }
 
-  async preload(): Promise<RuntimeStatus> {
+  async preload(
+    _cache?: ModelCacheInfo,
+    _diagnosticRunStarted = false,
+    signal?: AbortSignal,
+  ): Promise<RuntimeStatus> {
     this.preloadCalls += 1
-    if (this.preloadCalls === 1) await this.preloadBarrier
+    if (this.preloadHook) {
+      await this.preloadHook(this.preloadCalls, signal)
+    } else if (this.preloadCalls === 1) {
+      await this.preloadBarrier
+    }
     this.status.phase = "ready"
     return this.status
   }
 
   async evaluate(request: EvaluationRequest): Promise<EvaluationResult> {
     this.evaluateCalls += 1
+    await this.evaluateHook?.(this.evaluateCalls)
     const criterionStatus =
       this.resultStatus === "passed"
         ? "met"
@@ -9815,6 +10692,11 @@ class ForegroundWaitMockEvaluator {
 
   async unloadRuntime(): Promise<void> {
     this.unloadCalls += 1
+    this.status.phase = "idle"
+  }
+
+  cancelPreload(): void {
+    this.cancelPreloadCalls += 1
     this.status.phase = "idle"
   }
 
@@ -9896,6 +10778,304 @@ async function withForegroundQualityRuntime<T>(
     }
   }
 }
+
+test("automatic evaluator aborts pending quality consent and restarts immediately", async () => {
+  await withForegroundQualityRuntime(async () => {
+    const compact = new ForegroundWaitMockEvaluator(
+      "compact-consent-cancel",
+      "compact",
+      foregroundWaitCache(true),
+    )
+    const quality = new ForegroundWaitMockEvaluator(
+      "quality-consent-cancel",
+      "quality",
+      foregroundWaitCache(false),
+    )
+    const automatic = new AutomaticEvaluator(compact as never, quality as never)
+    const request: EvaluationRequest = {
+      question: "Warum schwimmt Eis?",
+      answer: "Gefrorenes Wasser ist weniger dicht und schwimmt deshalb.",
+      reference: "Eis besitzt eine geringere Dichte als Wasser.",
+      assessmentEngine: "quality",
+    }
+    const dispatchDescriptor = Object.getOwnPropertyDescriptor(
+      globalThis,
+      "dispatchEvent",
+    )
+    const forwardEvent = globalThis.dispatchEvent.bind(globalThis)
+    let consentCalls = 0
+    let firstConsent: ModelDownloadConsentDetail | undefined
+    let reportConsent!: () => void
+    const consentStarted = new Promise<void>((resolve) => {
+      reportConsent = resolve
+    })
+    Object.defineProperty(globalThis, "dispatchEvent", {
+      configurable: true,
+      value: (event: Event): boolean => {
+        if (event.type !== DOWNLOAD_CONSENT_EVENT) return forwardEvent(event)
+        const detail = (event as CustomEvent<ModelDownloadConsentDetail>).detail
+        consentCalls += 1
+        detail.handled = true
+        if (consentCalls === 1) {
+          firstConsent = detail
+          reportConsent()
+        } else {
+          detail.respond(true)
+        }
+        return true
+      },
+    })
+
+    try {
+      const controller = new AbortController()
+      const canceled = automatic.evaluate(request, { signal: controller.signal })
+      await consentStarted
+      controller.abort()
+      const restarted = automatic.evaluate(request)
+
+      await assert.rejects(canceled, { name: "AbortError" })
+      const restartedResult = await restarted
+      assert.ok(firstConsent)
+      assert.equal(firstConsent.signal?.aborted, true)
+      assert.equal(consentCalls, 2)
+      assert.equal(quality.cancelPreloadCalls, 1)
+      assert.equal(quality.preloadCalls, 1)
+      assert.equal(restartedResult.model.id, "quality-consent-cancel")
+    } finally {
+      if (dispatchDescriptor) {
+        Object.defineProperty(globalThis, "dispatchEvent", dispatchDescriptor)
+      }
+    }
+  })
+})
+
+test("automatic evaluator keeps a shared uncached upgrade alive until its last waiter cancels", async () => {
+  await withForegroundQualityRuntime(async () => {
+    const compact = new ForegroundWaitMockEvaluator(
+      "compact-shared-cancel",
+      "compact",
+      foregroundWaitCache(true),
+    )
+    const quality = new ForegroundWaitMockEvaluator(
+      "quality-shared-cancel",
+      "quality",
+      foregroundWaitCache(false),
+    )
+    let firstSignal: AbortSignal | undefined
+    let reportPreload!: () => void
+    const preloadStarted = new Promise<void>((resolve) => {
+      reportPreload = resolve
+    })
+    quality.preloadHook = async (call, signal) => {
+      if (call !== 1) return
+      firstSignal = signal
+      reportPreload()
+      await new Promise<void>((_resolve, reject) => {
+        const abort = (): void => {
+          const error = new Error("quality preload canceled")
+          error.name = "AbortError"
+          reject(error)
+        }
+        if (signal?.aborted) abort()
+        else signal?.addEventListener("abort", abort, { once: true })
+      })
+    }
+    const automatic = new AutomaticEvaluator(
+      compact as never,
+      quality as never,
+      { uncachedQualityWaitMs: 5_000 },
+    )
+    const request: EvaluationRequest = {
+      question: "Warum schwimmt Eis?",
+      answer: "Gefrorenes Wasser ist weniger dicht und schwimmt deshalb.",
+      reference: "Eis besitzt eine geringere Dichte als Wasser.",
+      assessmentEngine: "quality",
+    }
+    const firstController = new AbortController()
+    const secondController = new AbortController()
+    const first = automatic.evaluate(request, {
+      signal: firstController.signal,
+    })
+    await preloadStarted
+    const second = automatic.evaluate(request, {
+      signal: secondController.signal,
+    })
+    for (let attempt = 0; attempt < 50 && compact.evaluateCalls < 2; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    assert.equal(compact.evaluateCalls, 2)
+
+    firstController.abort()
+    await assert.rejects(first, { name: "AbortError" })
+    assert.equal(quality.cancelPreloadCalls, 0)
+    assert.equal(firstSignal?.aborted, false)
+
+    secondController.abort()
+    const restarted = automatic.evaluate(request)
+    await assert.rejects(second, { name: "AbortError" })
+    const restartedResult = await restarted
+    assert.equal(firstSignal?.aborted, true)
+    assert.equal(quality.cancelPreloadCalls, 1)
+    assert.equal(quality.preloadCalls, 2)
+    assert.equal(quality.evaluateCalls, 1)
+    assert.equal(restartedResult.model.id, "quality-shared-cancel")
+  })
+})
+
+test("automatic evaluator scopes cancellation to the exact quality upgrade attempt", async () => {
+  await withForegroundQualityRuntime(async () => {
+    const compact = new ForegroundWaitMockEvaluator(
+      "compact-upgrade-epoch",
+      "compact",
+      foregroundWaitCache(true),
+    )
+    const quality = new ForegroundWaitMockEvaluator(
+      "quality-upgrade-epoch",
+      "quality",
+      foregroundWaitCache(false),
+    )
+    let releaseFirstCompact!: () => void
+    const firstCompactBarrier = new Promise<void>((resolve) => {
+      releaseFirstCompact = resolve
+    })
+    compact.evaluateHook = async (call) => {
+      if (call === 1) await firstCompactBarrier
+    }
+
+    let reportFirstFailure!: () => void
+    const firstFailure = new Promise<void>((resolve) => {
+      reportFirstFailure = resolve
+    })
+    let reportSecondPreload!: () => void
+    const secondPreloadStarted = new Promise<void>((resolve) => {
+      reportSecondPreload = resolve
+    })
+    let releaseSecondPreload: () => void = () => undefined
+    let secondSignal: AbortSignal | undefined
+    quality.preloadHook = async (call, signal) => {
+      if (call === 1) {
+        reportFirstFailure()
+        throw new Error("transient first quality upgrade failure")
+      }
+      if (call !== 2) return
+      secondSignal = signal
+      reportSecondPreload()
+      await new Promise<void>((resolve, reject) => {
+        releaseSecondPreload = resolve
+        const abort = (): void => {
+          const error = new Error("second quality upgrade canceled")
+          error.name = "AbortError"
+          reject(error)
+        }
+        if (signal?.aborted) abort()
+        else signal?.addEventListener("abort", abort, { once: true })
+      })
+    }
+
+    const automatic = new AutomaticEvaluator(
+      compact as never,
+      quality as never,
+      { uncachedQualityWaitMs: 5_000 },
+    )
+    const request: EvaluationRequest = {
+      question: "Warum schwimmt Eis?",
+      answer: "Gefrorenes Wasser ist weniger dicht und schwimmt deshalb.",
+      reference: "Eis besitzt eine geringere Dichte als Wasser.",
+      assessmentEngine: "quality",
+    }
+    const firstController = new AbortController()
+    const secondController = new AbortController()
+    const first = automatic.evaluate(request, {
+      signal: firstController.signal,
+    })
+    await firstFailure
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    const second = automatic.evaluate(request, {
+      signal: secondController.signal,
+    })
+    await secondPreloadStarted
+    secondController.abort()
+    await assert.rejects(second, { name: "AbortError" })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    const secondWasAborted = secondSignal?.aborted === true
+    if (!secondWasAborted) releaseSecondPreload()
+    assert.equal(secondWasAborted, true)
+    assert.equal(quality.cancelPreloadCalls, 1)
+
+    releaseFirstCompact()
+    const firstResult = await first
+    assert.equal(firstResult.model.id, "compact-upgrade-epoch")
+    assert.equal(quality.cancelPreloadCalls, 1)
+  })
+})
+
+test("automatic evaluator retries quality after a worker reload hard timeout", async () => {
+  await withForegroundQualityRuntime(async () => {
+    const compact = new ForegroundWaitMockEvaluator(
+      "compact-reload-timeout",
+      "compact",
+      foregroundWaitCache(true),
+    )
+    const quality = new ForegroundWaitMockEvaluator(
+      "quality-reload-timeout",
+      "quality",
+      foregroundWaitCache(true),
+    )
+    quality.preloadHook = async (call) => {
+      if (call === 1) throw new QualityWorkerTimeoutError("reload", 120_000)
+    }
+    const automatic = new AutomaticEvaluator(compact as never, quality as never)
+    const request: EvaluationRequest = {
+      question: "Warum schwimmt Eis?",
+      answer: "Gefrorenes Wasser ist weniger dicht und schwimmt deshalb.",
+      reference: "Eis besitzt eine geringere Dichte als Wasser.",
+      assessmentEngine: "quality",
+    }
+
+    const timedOut = await automatic.evaluate(request)
+    const retried = await automatic.evaluate(request)
+    assert.equal(timedOut.model.id, "compact-reload-timeout")
+    assert.equal(retried.model.id, "quality-reload-timeout")
+    assert.equal(quality.preloadCalls, 2)
+    assert.equal(quality.evaluateCalls, 1)
+  })
+})
+
+test("automatic evaluator retries quality after a worker completion hard timeout", async () => {
+  await withForegroundQualityRuntime(async () => {
+    const compact = new ForegroundWaitMockEvaluator(
+      "compact-completion-timeout",
+      "compact",
+      foregroundWaitCache(true),
+    )
+    const quality = new ForegroundWaitMockEvaluator(
+      "quality-completion-timeout",
+      "quality",
+      foregroundWaitCache(true),
+    )
+    quality.evaluateHook = async (call) => {
+      if (call === 1) {
+        throw new QualityWorkerTimeoutError("completion", 150_000)
+      }
+    }
+    const automatic = new AutomaticEvaluator(compact as never, quality as never)
+    const request: EvaluationRequest = {
+      question: "Warum schwimmt Eis?",
+      answer: "Gefrorenes Wasser ist weniger dicht und schwimmt deshalb.",
+      reference: "Eis besitzt eine geringere Dichte als Wasser.",
+      assessmentEngine: "quality",
+    }
+
+    const timedOut = await automatic.evaluate(request)
+    const retried = await automatic.evaluate(request)
+    assert.equal(timedOut.model.id, "compact-completion-timeout")
+    assert.equal(retried.model.id, "quality-completion-timeout")
+    assert.equal(quality.preloadCalls, 2)
+    assert.equal(quality.evaluateCalls, 2)
+  })
+})
 
 test("automatic evaluator never downloads uncached quality after consent is denied", async () => {
   const replacementSelection = selectQualityModel({
@@ -11237,7 +12417,7 @@ function createLLMQuizValidatorRunner(): LLMQuizValidatorRunner {
   ) as LLMQuizValidatorRunner
 }
 
-test("the public version remains pinned exactly to 0.6.4", () => {
+test("the public version remains pinned exactly to 0.6.5", () => {
   const packageJson = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   ) as { version?: string }
@@ -11252,14 +12432,14 @@ test("the public version remains pinned exactly to 0.6.4", () => {
     "utf8",
   )
 
-  assert.equal(packageJson.version, "0.6.4")
-  assert.equal(packageLock.version, "0.6.4")
-  assert.equal(packageLock.packages?.[""]?.version, "0.6.4")
-  assert.match(entry, /const VERSION = "0\.6\.4"/u)
-  assert.match(bundle, /let [\w$]+="0\.6\.4",[\w$]+=globalThis/u)
-  assert.doesNotMatch(bundle, /let [\w$]+="0\.6\.3",[\w$]+=globalThis/u)
-  assert.match(browserSmoke, /window\.LiaLLM\.version === "0\.6\.4"/u)
-  assert.match(readme, /^version:\s+0\.6\.4$/mu)
+  assert.equal(packageJson.version, "0.6.5")
+  assert.equal(packageLock.version, "0.6.5")
+  assert.equal(packageLock.packages?.[""]?.version, "0.6.5")
+  assert.match(entry, /const VERSION = "0\.6\.5"/u)
+  assert.match(bundle, /let [\w$]+="0\.6\.5",[\w$]+=globalThis/u)
+  assert.doesNotMatch(bundle, /let [\w$]+="0\.6\.4",[\w$]+=globalThis/u)
+  assert.match(browserSmoke, /window\.LiaLLM\.version === "0\.6\.5"/u)
+  assert.match(readme, /^version:\s+0\.6\.5$/mu)
   assert.match(readme, /^script:\s+\.\/dist\/index\.js$/mu)
   assert.doesNotMatch(
     readme,
@@ -11362,7 +12542,7 @@ test("LLMQuiz exposes a canonical wrapper and a compatible question alias", () =
   assert.match(readme, /\.showActivity\?\.\(activityId, runId,/u)
   assert.match(
     readme,
-    /\.showActivity\?\.\(activityId, runId, "selecting-model"\)/u,
+    /\.showActivity\?\.\(\s*activityId,\s*runId,\s*"selecting-model",\s*\{ onCancel: cancelEvaluation \}\s*\)/u,
   )
   assert.match(readme, /parseMacroOptions\(optionSource\)/u)
   assert.match(
@@ -11383,6 +12563,14 @@ test("LLMQuiz exposes a canonical wrapper and a compatible question alias", () =
   )
   assert.match(readme, /send\.handle\("stop",/u)
   assert.match(readme, /evaluationController\.abort\(\)/u)
+  assert.match(readme, /window\.__liaLlmActiveQuizRuns instanceof Map/u)
+  assert.match(readme, /activeQuizRuns\.get\(activityId\) !== supersedeEvaluation/u)
+  assert.match(readme, /previousQuizRun\(\)/u)
+  assert.match(
+    readme,
+    /activeCheckButton\.disabled = busy \|\| checkButtonInitialDisabled/u,
+  )
+  assert.match(readme, /checkButtonInitialAriaBusy === null/u)
   assert.match(readme, /signal: evaluationController\.signal/u)
   assert.match(readme, /maxThinkingTimeMs: options\.maxThinkingTimeMs/u)
   assert.match(readme, /maxThinkingTokens: options\.maxThinkingTokens/u)
@@ -11576,7 +12764,7 @@ test("LLMQuiz forwards its explicit question and operator", async () => {
   await run(
     {
       LiaLLM: {
-        version: "0.6.4",
+        version: "0.6.5",
         parseMacroOptions,
         parseCriteriaBlock,
         parseReferenceVariants,
@@ -11608,6 +12796,90 @@ test("LLMQuiz forwards its explicit question and operator", async () => {
   assert.deepEqual(sent, ["false"])
 })
 
+test("LLMQuiz replaces an active run instead of extending the Quality queue", async () => {
+  const run = createLLMQuizValidatorRunner()
+  const pending: Array<{
+    signal: AbortSignal
+    resolve(result: EvaluationResult): void
+  }> = []
+  const windowValue: {
+    LiaLLM: {
+      version: string
+      parseMacroOptions: typeof parseMacroOptions
+      parseCriteriaBlock: typeof parseCriteriaBlock
+      parseReferenceVariants: typeof parseReferenceVariants
+      evaluate(
+        request: EvaluationRequest,
+        options?: EvaluationOptions,
+      ): Promise<EvaluationResult>
+      feedbackForError(): null
+      showFeedback(): void
+      showActivity(): void
+      clearSolutionVariant(): void
+    }
+    __liaLlmActiveQuizRuns?: Map<string, () => void>
+  } = {
+    LiaLLM: {
+      version: "0.6.5",
+      parseMacroOptions,
+      parseCriteriaBlock,
+      parseReferenceVariants,
+      evaluate: async (
+        _request: EvaluationRequest,
+        options?: EvaluationOptions,
+      ) =>
+        new Promise<EvaluationResult>((resolve, reject) => {
+          const signal = options?.signal
+          assert.ok(signal)
+          signal.addEventListener(
+            "abort",
+            () => {
+              const error = new Error("Die Auswertung wurde beendet.")
+              error.name = "AbortError"
+              reject(error)
+            },
+            { once: true },
+          )
+          pending.push({ signal, resolve })
+        }),
+      feedbackForError: () => null,
+      showFeedback: () => undefined,
+      showActivity: () => undefined,
+      clearSolutionVariant: () => undefined,
+    },
+  }
+  const firstSent: unknown[] = []
+  const secondSent: unknown[] = []
+  const sendValue = (sent: unknown[]) => ({
+    handle: () => undefined,
+    lia: (value: unknown) => {
+      sent.push(value)
+    },
+  })
+  const inputs = [
+    "0.66;solution=0;assessmentengine=quality",
+    "Testfrage",
+    "Eine vollständige Referenzantwort.",
+    "Eine hinreichend lange Testantwort.",
+  ] as const
+
+  const first = run(windowValue, sendValue(firstSent), ...inputs)
+  await new Promise<void>((resolve) => setTimeout(resolve, 0))
+  assert.equal(pending.length, 1)
+
+  const second = run(windowValue, sendValue(secondSent), ...inputs)
+  await new Promise<void>((resolve) => setTimeout(resolve, 0))
+  assert.equal(pending.length, 2)
+  assert.equal(pending[0]?.signal.aborted, true)
+
+  pending[1]?.resolve(evaluation("passed", []))
+  await Promise.all([first, second])
+
+  assert.deepEqual(firstSent, ["LIA: stop"])
+  assert.deepEqual(secondSent, ["true"])
+  assert.equal(windowValue.__liaLlmActiveQuizRuns?.size, 0)
+})
+
 test("LLMQuiz rejects coverage without a criteria block before evaluation", async () => {
   const run = createLLMQuizValidatorRunner()
   const sent: Array<[unknown, unknown?, unknown?]> = []
@@ -11616,7 +12888,7 @@ test("LLMQuiz rejects coverage without a criteria block before evaluation", asyn
   await run(
     {
       LiaLLM: {
-        version: "0.6.4",
+        version: "0.6.5",
         parseMacroOptions,
         parseCriteriaBlock,
         parseReferenceVariants,
@@ -11662,7 +12934,7 @@ test("LLMQuiz preserves required criteria when coverage is omitted", async () =>
   await run(
     {
       LiaLLM: {
-        version: "0.6.4",
+        version: "0.6.5",
         parseMacroOptions,
         parseCriteriaBlock: () => criteriaBlock,
         parseReferenceVariants,
@@ -11715,7 +12987,7 @@ test("LLMQuiz shares cloned coverage criteria and thresholds with language analy
   await run(
     {
       LiaLLM: {
-        version: "0.6.4",
+        version: "0.6.5",
         parseMacroOptions,
         parseCriteriaBlock: () => criteriaBlock,
         parseReferenceVariants,

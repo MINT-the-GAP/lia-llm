@@ -22,6 +22,7 @@ import {
   createExactReferenceMatchResult,
   isFatalQualityEngineError,
   isQualityOutputError,
+  isQualityWorkerTimeoutError,
   isRecoverableQualityRequestError,
   QualityEvaluator,
 } from "./quality-evaluator.ts"
@@ -303,6 +304,12 @@ export class AutomaticEvaluator {
   private compactPreparationPromise: Promise<void> | null = null
   private qualityCacheInfoPromise: Promise<ModelCacheInfo> | null = null
   private qualityUpgradePromise: Promise<boolean> | null = null
+  private qualityUpgradeController: AbortController | null = null
+  private qualityUpgradeEpoch = 0
+  private readonly qualityUpgradeInterests = new Map<
+    Promise<boolean>,
+    Map<EvaluationRun, number>
+  >()
   private qualityEvaluationQueue: Promise<void> = Promise.resolve()
   private activeLanguageController: AbortController | null = null
   private compactUsers = 0
@@ -397,8 +404,12 @@ export class AutomaticEvaluator {
     engine: AssessmentEngine,
     status: RuntimeStatus,
     cache: ModelCacheInfo,
+    signal?: AbortSignal,
   ): Promise<boolean> {
     const controller = new AbortController()
+    const onAbort = (): void => controller.abort()
+    if (signal?.aborted) controller.abort()
+    else signal?.addEventListener("abort", onAbort, { once: true })
     this.consentControllers.add(controller)
     try {
       return await requestModelDownloadConsent(
@@ -411,6 +422,7 @@ export class AutomaticEvaluator {
         controller.signal,
       )
     } finally {
+      signal?.removeEventListener("abort", onAbort)
       this.consentControllers.delete(controller)
     }
   }
@@ -440,6 +452,7 @@ export class AutomaticEvaluator {
     engine: AssessmentEngine,
     status: RuntimeStatus,
     cache: ModelCacheInfo,
+    signal?: AbortSignal,
   ): Promise<LoadAuthorization> {
     const downloadCached = cache.downloadCached ?? cache.cached
     const network = captureNetworkSnapshot()
@@ -462,7 +475,7 @@ export class AutomaticEvaluator {
 
     const allowed =
       decision === "auto" ||
-      (await this.askForConsent(engine, status, cache))
+      (await this.askForConsent(engine, status, cache, signal))
     if (decision === "consent") {
       recordDebugPolicy(
         engine,
@@ -553,6 +566,79 @@ export class AutomaticEvaluator {
     }
   }
 
+  private resetQualityForRetry(generation: number): void {
+    if (generation !== this.generation) return
+    this.qualityReady = false
+    this.qualityDegraded = false
+    this.qualityCacheInfoPromise = null
+    emitStatus(this.compactEvaluator.getStatus())
+  }
+
+  private cancelOrphanedQualityUpgrade(upgrade: Promise<boolean>): void {
+    const interests = this.qualityUpgradeInterests.get(upgrade)
+    if (
+      this.qualityUpgradePromise !== upgrade ||
+      (interests?.size ?? 0) > 0
+    ) {
+      return
+    }
+    this.qualityUpgradeInterests.delete(upgrade)
+    this.qualityUpgradeEpoch += 1
+    this.qualityUpgradePromise = null
+    const controller = this.qualityUpgradeController
+    this.qualityUpgradeController = null
+    this.qualityCacheInfoPromise = null
+    this.qualityReady = false
+    this.qualityDegraded = false
+    controller?.abort()
+    this.qualityEvaluator.cancelPreload?.()
+  }
+
+  private retainQualityUpgrade(
+    run: EvaluationRun,
+    upgrade: Promise<boolean>,
+  ): () => void {
+    const interests =
+      this.qualityUpgradeInterests.get(upgrade) ??
+      new Map<EvaluationRun, number>()
+    interests.set(
+      run,
+      (interests.get(run) ?? 0) + 1,
+    )
+    this.qualityUpgradeInterests.set(upgrade, interests)
+    const signals = [...new Set(
+      [run.requestSignal, run.lifecycleSignal].filter(
+        (signal): signal is AbortSignal => Boolean(signal),
+      ),
+    )]
+    let released = false
+    const release = (canceled: boolean): void => {
+      if (released) return
+      released = true
+      for (const signal of signals) {
+        signal.removeEventListener("abort", onAbort)
+      }
+      const activeInterests = this.qualityUpgradeInterests.get(upgrade)
+      if (!activeInterests) return
+      const remaining = (activeInterests.get(run) ?? 1) - 1
+      if (remaining > 0) activeInterests.set(run, remaining)
+      else activeInterests.delete(run)
+      if (activeInterests.size === 0) {
+        this.qualityUpgradeInterests.delete(upgrade)
+      }
+      if (canceled) this.cancelOrphanedQualityUpgrade(upgrade)
+    }
+    const onAbort = (): void => release(true)
+    for (const signal of signals) {
+      if (signal.aborted) {
+        release(true)
+        break
+      }
+      signal.addEventListener("abort", onAbort, { once: true })
+    }
+    return () => release(false)
+  }
+
   private async waitForQualityUpgradeInForeground(
     upgrade: Promise<boolean>,
     cache: ModelCacheInfo | undefined,
@@ -571,7 +657,10 @@ export class AutomaticEvaluator {
   private async upgradeQuality(
     generation: number,
     knownCache?: ModelCacheInfo,
+    signal?: AbortSignal,
+    upgradeEpoch = this.qualityUpgradeEpoch,
   ): Promise<boolean> {
+    if (signal?.aborted) throw abortError()
     if (!supportsQualityRuntime()) {
       this.markQualityDegraded(generation)
       return false
@@ -579,18 +668,31 @@ export class AutomaticEvaluator {
 
     beginDebugLoad("quality")
     const cache = knownCache ?? (await this.getQualityCacheInfo())
+    if (signal?.aborted || upgradeEpoch !== this.qualityUpgradeEpoch) {
+      throw abortError()
+    }
     const authorization = await this.authorizeLoad(
       "quality",
       this.qualityEvaluator.getStatus(),
       cache,
+      signal,
     )
+    if (signal?.aborted || upgradeEpoch !== this.qualityUpgradeEpoch) {
+      throw abortError()
+    }
     if (!authorization.allowed || generation !== this.generation) {
       this.markQualityDegraded(generation)
       return false
     }
 
-    await this.qualityEvaluator.preload(cache, true)
-    if (generation !== this.generation) return false
+    await this.qualityEvaluator.preload(cache, true, signal)
+    if (
+      signal?.aborted ||
+      generation !== this.generation ||
+      upgradeEpoch !== this.qualityUpgradeEpoch
+    ) {
+      return false
+    }
 
     this.qualityReady = true
     this.qualityDegraded = false
@@ -606,10 +708,23 @@ export class AutomaticEvaluator {
     if (this.qualityUpgradePromise) return this.qualityUpgradePromise
 
     const generation = this.generation
-    const upgrade = this.upgradeQuality(generation, knownCache).catch((error: unknown) => {
-      if (generation === this.generation) {
+    const upgradeEpoch = ++this.qualityUpgradeEpoch
+    const controller = new AbortController()
+    this.qualityUpgradeController = controller
+    const upgrade = this.upgradeQuality(
+      generation,
+      knownCache,
+      controller.signal,
+      upgradeEpoch,
+    ).catch((error: unknown) => {
+      if (
+        generation === this.generation &&
+        upgradeEpoch === this.qualityUpgradeEpoch
+      ) {
         this.qualityCacheInfoPromise = null
-        if (isFatalQualityEngineError(error)) {
+        if (isQualityWorkerTimeoutError(error)) {
+          this.resetQualityForRetry(generation)
+        } else if (isFatalQualityEngineError(error)) {
           this.markQualityDegraded(generation)
         } else {
           this.qualityReady = false
@@ -621,8 +736,12 @@ export class AutomaticEvaluator {
     })
     let tracked: Promise<boolean>
     tracked = upgrade.finally(() => {
+      this.qualityUpgradeInterests.delete(tracked)
       if (this.qualityUpgradePromise === tracked) {
         this.qualityUpgradePromise = null
+        if (this.qualityUpgradeController === controller) {
+          this.qualityUpgradeController = null
+        }
       }
     })
     this.qualityUpgradePromise = tracked
@@ -740,6 +859,10 @@ export class AutomaticEvaluator {
           isQualityOutputError(error) ||
           isRecoverableQualityRequestError(error)
         ) return fallback()
+        if (isQualityWorkerTimeoutError(error)) {
+          this.resetQualityForRetry(generation)
+          return fallback()
+        }
         this.markQualityDegraded(generation)
         return fallback()
       } finally {
@@ -868,11 +991,21 @@ export class AutomaticEvaluator {
         engine: "quality",
         message: "Qualitätsprüfung wird vorbereitet …",
       })
-      const qualityAvailable = await this.waitForQualityUpgradeInForeground(
-        this.startQualityUpgrade(qualityCache),
-        qualityCache,
+      const qualityUpgrade = this.startQualityUpgrade(qualityCache)
+      const releaseQualityUpgrade = this.retainQualityUpgrade(
         run,
+        qualityUpgrade,
       )
+      let qualityAvailable: boolean
+      try {
+        qualityAvailable = await this.waitForQualityUpgradeInForeground(
+          qualityUpgrade,
+          qualityCache,
+          run,
+        )
+      } finally {
+        releaseQualityUpgrade()
+      }
       assertRunActive(run)
       if (qualityAvailable) {
         return this.evaluateQualityWithFallback(
@@ -882,28 +1015,43 @@ export class AutomaticEvaluator {
           compactResult,
         )
       }
+      if (!compactResult) {
+        compactResult = operatorSafeCompactResult(
+          request,
+          await this.evaluateCompact(request, evaluationOptions, run),
+        )
+      }
+      return qualityUnavailableSafeCompactResult(request, compactResult)
     }
 
     const qualityUpgrade = this.startQualityUpgrade(qualityCache)
-
-    if (!compactResult) {
-      compactResult = operatorSafeCompactResult(
-        request,
-        await this.evaluateCompact(request, evaluationOptions, run),
-      )
-      assertRunActive(run)
-    }
-
-    this.reportProgress(evaluationOptions, run, {
-      phase: "preparing-quality",
-      engine: "quality",
-      message: "Qualitätsprüfung wird vorbereitet …",
-    })
-    const qualityAvailable = await this.waitForQualityUpgradeInForeground(
-      qualityUpgrade,
-      qualityCache,
+    const releaseQualityUpgrade = this.retainQualityUpgrade(
       run,
+      qualityUpgrade,
     )
+    let qualityAvailable: boolean
+    try {
+      if (!compactResult) {
+        compactResult = operatorSafeCompactResult(
+          request,
+          await this.evaluateCompact(request, evaluationOptions, run),
+        )
+        assertRunActive(run)
+      }
+
+      this.reportProgress(evaluationOptions, run, {
+        phase: "preparing-quality",
+        engine: "quality",
+        message: "Qualitätsprüfung wird vorbereitet …",
+      })
+      qualityAvailable = await this.waitForQualityUpgradeInForeground(
+        qualityUpgrade,
+        qualityCache,
+        run,
+      )
+    } finally {
+      releaseQualityUpgrade()
+    }
     assertRunActive(run)
     if (!qualityAvailable || run.generation !== this.generation) {
       return qualityUnavailableSafeCompactResult(request, compactResult)
@@ -960,10 +1108,20 @@ export class AutomaticEvaluator {
             engine: "quality",
             message: "Sprachprüfung wird vorbereitet …",
           })
-          const available = await waitForRun(
-            this.startQualityUpgrade(cache),
+          const qualityUpgrade = this.startQualityUpgrade(cache)
+          const releaseQualityUpgrade = this.retainQualityUpgrade(
             run,
+            qualityUpgrade,
           )
+          let available: boolean
+          try {
+            available = await waitForRun(
+              qualityUpgrade,
+              run,
+            )
+          } finally {
+            releaseQualityUpgrade()
+          }
           if (!available) {
             return unavailableLanguageAnalysis(
               normalized.answer,
@@ -1021,7 +1179,9 @@ export class AutomaticEvaluator {
           )
         } catch (error) {
           if (isAbortError(error)) throw error
-          if (isFatalQualityEngineError(error)) {
+          if (isQualityWorkerTimeoutError(error)) {
+            this.resetQualityForRetry(generation)
+          } else if (isFatalQualityEngineError(error)) {
             this.markQualityDegraded(generation)
           }
           return unavailableLanguageAnalysis(
@@ -1089,6 +1249,10 @@ export class AutomaticEvaluator {
     this.cancelActiveLanguageEvaluation()
     this.lifecycleController.abort()
     this.lifecycleController = new AbortController()
+    this.qualityUpgradeEpoch += 1
+    this.qualityUpgradeController?.abort()
+    this.qualityUpgradeController = null
+    this.qualityUpgradeInterests.clear()
     for (const controller of this.consentControllers) controller.abort()
     this.consentControllers.clear()
     this.qualityReady = false

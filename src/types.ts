@@ -232,6 +232,8 @@ export interface ActivityDisplayOptions {
   thinkingTimeLimitMs?: number
   /** Starts a visual countdown for an active adaptive Thinking pass. */
   thinkingTimeRemainingMs?: number
+  /** Offers a visible way to cancel the currently displayed evaluation. */
+  onCancel?: () => void | Promise<void>
 }
 
 export interface EvaluationOptions {

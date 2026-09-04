@@ -6,6 +6,7 @@ import type {
 } from "@mlc-ai/web-llm"
 
 import * as webLlm from "./generated/webllm.js"
+import qualityWorkerSource from "./generated/webllm-worker-source.js"
 import {
   beginDebugLoad,
   instrumentDebugFetch,
@@ -46,7 +47,7 @@ import {
 } from "./german-spellcheck.ts"
 import { ResilientFetchSession } from "./resilient-fetch.ts"
 import {
-  isFatalQualityEngineError,
+  isFatalQualityEngineError as isKnownFatalQualityEngineError,
   qualityRuntimeErrorMessage as errorMessage,
 } from "./quality-runtime-errors.ts"
 import {
@@ -1404,7 +1405,82 @@ function now(): number {
   return typeof performance === "undefined" ? Date.now() : performance.now()
 }
 
-export { isFatalQualityEngineError } from "./quality-runtime-errors.ts"
+export const QUALITY_BASELINE_HARD_TIMEOUT_MS = 150_000
+export const QUALITY_WORKER_RELOAD_HARD_TIMEOUT_MS = 120_000
+export const QUALITY_WORKER_COMPLETION_ABORT_GRACE_MS = 10_000
+
+type QualityEngine = Pick<MLCEngine, "chat" | "reload" | "unload"> & {
+  interruptGenerate(): void | Promise<void>
+}
+
+export interface QualityWorkerLike {
+  onmessage: ((event: MessageEvent) => unknown) | null
+  postMessage(message: unknown): void
+  terminate(): void
+  addEventListener(
+    type: "error" | "messageerror",
+    listener: EventListener,
+  ): void
+  removeEventListener(
+    type: "error" | "messageerror",
+    listener: EventListener,
+  ): void
+}
+
+export interface QualityWorkerSupervisorOptions {
+  workerSource?: string
+  reloadTimeoutMs?: number
+  completionTimeoutMs?: number
+  completionAbortGraceMs?: number
+  createObjectUrl?(source: string): string
+  revokeObjectUrl?(url: string): void
+  createWorker?(url: string): QualityWorkerLike
+  createEngine?(
+    worker: QualityWorkerLike,
+    appConfig: AppConfig,
+    onProgress: (progress: { progress: number; text: string }) => void,
+  ): QualityEngine
+}
+
+export class QualityWorkerTimeoutError extends Error {
+  readonly operation: "reload" | "completion"
+  readonly timeoutMs: number
+
+  constructor(operation: "reload" | "completion", timeoutMs: number) {
+    super(
+      operation === "reload"
+        ? `Der Quality-Worker konnte das Modell nicht innerhalb von ${timeoutMs} ms laden.`
+        : `Der Quality-Worker konnte die Auswertung nicht innerhalb von ${timeoutMs} ms abschliessen.`,
+    )
+    this.name = "QualityWorkerTimeoutError"
+    this.operation = operation
+    this.timeoutMs = timeoutMs
+  }
+}
+
+export class QualityWorkerRuntimeError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "QualityWorkerRuntimeError"
+  }
+}
+
+export function isQualityWorkerTimeoutError(
+  error: unknown,
+): error is QualityWorkerTimeoutError {
+  return (
+    error instanceof QualityWorkerTimeoutError ||
+    (error instanceof Error && error.name === "QualityWorkerTimeoutError")
+  )
+}
+
+export function isFatalQualityEngineError(error: unknown): boolean {
+  return (
+    isQualityWorkerTimeoutError(error) ||
+    (error instanceof Error && error.name === "QualityWorkerRuntimeError") ||
+    isKnownFatalQualityEngineError(error)
+  )
+}
 
 export function isRecoverableQualityRequestError(error: unknown): boolean {
   const name = error instanceof Error ? error.name : ""
@@ -1422,6 +1498,519 @@ function abortError(): Error {
 
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError"
+}
+
+function isExpectedInterruptedCompletionError(error: unknown): boolean {
+  if (isAbortError(error)) return true
+  const name = error instanceof Error ? error.name : ""
+  const text = `${name}: ${errorMessage(error)}`
+  if (!/\b(?:abort(?:ed|ing)?|interrupt(?:ed|ing)?|cancel(?:led|ed|ing)?)\b/iu.test(text)) {
+    return false
+  }
+  return !/(?:device\s+(?:was\s+)?lost|device[-_ ]?lost|dxgi_error_device_|vk_error_device_lost|(?:object|tensor) has already been disposed|current object has already been disposed|cannot pass deleted object|buffer(?:\s+is)?\s+unmapped|unmapped\s+(?:gpu\s+)?buffer|buffer\s+is\s+not\s+mapped|model(?:not)?loadederror|model has not been loaded|out of (?:gpu )?memory|\boom\b|memory allocation|gpu[^\n]{0,80}(?:hang|lost)|check failed[^\n]{0,80}grammar)/iu.test(
+    text,
+  )
+}
+
+function waitForQualityAbort<T>(
+  promise: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (!signal) return promise
+  if (signal.aborted) return Promise.reject(abortError())
+  return new Promise<T>((resolve, reject) => {
+    let settled = false
+    const finish = (callback: () => void): void => {
+      if (settled) return
+      settled = true
+      signal.removeEventListener("abort", onAbort)
+      callback()
+    }
+    const onAbort = (): void => finish(() => reject(abortError()))
+    signal.addEventListener("abort", onAbort, { once: true })
+    promise.then(
+      (value) => finish(() => resolve(value)),
+      (error: unknown) => finish(() => reject(error)),
+    )
+  })
+}
+
+interface QualityWorkerHandle {
+  readonly epoch: number
+  readonly worker: QualityWorkerLike
+  readonly objectUrl: string
+  readonly engine: QualityEngine
+  readonly stopped: AbortController
+  readonly errorListener: EventListener
+  readonly messageErrorListener: EventListener
+  readonly onFailure?: (engine: QualityEngine, error: Error) => void
+  drainPromise?: Promise<void>
+}
+
+function qualityTimeoutMs(name: string, value: number): number {
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+    throw new Error(`${name} muss eine positive ganze Millisekundenzahl sein.`)
+  }
+  return value
+}
+
+function qualityWorkerEventError(
+  kind: "error" | "messageerror",
+  event: Event,
+): QualityWorkerRuntimeError {
+  const value = (event as Event & { message?: unknown }).message
+  const detail =
+    typeof value === "string" && value.trim() ? `: ${value.trim()}` : ""
+  return new QualityWorkerRuntimeError(
+    kind === "error"
+      ? `Der Quality-Worker ist abgestuerzt${detail}`
+      : `Der Quality-Worker hat eine unlesbare Nachricht geliefert${detail}`,
+  )
+}
+
+function defaultQualityWorkerObjectUrl(source: string): string {
+  if (
+    typeof Blob === "undefined" ||
+    typeof URL === "undefined" ||
+    typeof URL.createObjectURL !== "function"
+  ) {
+    throw new QualityWorkerRuntimeError(
+      "Dieser Browser kann keinen lokalen Quality-Worker erstellen.",
+    )
+  }
+  return URL.createObjectURL(
+    new Blob([source], { type: "text/javascript;charset=utf-8" }),
+  )
+}
+
+function defaultQualityWorker(url: string): QualityWorkerLike {
+  if (typeof Worker === "undefined") {
+    throw new QualityWorkerRuntimeError(
+      "Dieser Browser unterstuetzt keine Web Worker.",
+    )
+  }
+  return new Worker(url, { name: "lia-llm-quality" })
+}
+
+function defaultQualityWorkerEngine(
+  worker: QualityWorkerLike,
+  appConfig: AppConfig,
+  onProgress: (progress: { progress: number; text: string }) => void,
+): QualityEngine {
+  return new webLlm.WebWorkerMLCEngine(worker, {
+    appConfig,
+    initProgressCallback: onProgress,
+    logLevel: "WARN",
+  }) as unknown as QualityEngine
+}
+
+/**
+ * Owns the browser Worker separately from WebLLM's RPC client. WebLLM leaves
+ * pending RPC promises unresolved when a Worker is terminated, so every call
+ * is raced against our own lifecycle signal and hard deadline.
+ */
+export class QualityWorkerSupervisor {
+  private readonly workerSource: string
+  private readonly reloadTimeoutMs: number
+  private readonly completionTimeoutMs: number
+  private readonly completionAbortGraceMs: number
+  private readonly createObjectUrl: (source: string) => string
+  private readonly revokeObjectUrl: (url: string) => void
+  private readonly createWorker: (url: string) => QualityWorkerLike
+  private readonly createEngine: (
+    worker: QualityWorkerLike,
+    appConfig: AppConfig,
+    onProgress: (progress: { progress: number; text: string }) => void,
+  ) => QualityEngine
+  private readonly managedEngines = new WeakSet<object>()
+  private epoch = 0
+  private current: QualityWorkerHandle | null = null
+
+  constructor(options: QualityWorkerSupervisorOptions = {}) {
+    this.workerSource = options.workerSource ?? qualityWorkerSource
+    this.reloadTimeoutMs = qualityTimeoutMs(
+      "reloadTimeoutMs",
+      options.reloadTimeoutMs ?? QUALITY_WORKER_RELOAD_HARD_TIMEOUT_MS,
+    )
+    this.completionTimeoutMs = qualityTimeoutMs(
+      "completionTimeoutMs",
+      options.completionTimeoutMs ?? QUALITY_BASELINE_HARD_TIMEOUT_MS,
+    )
+    this.completionAbortGraceMs = qualityTimeoutMs(
+      "completionAbortGraceMs",
+      options.completionAbortGraceMs ??
+        QUALITY_WORKER_COMPLETION_ABORT_GRACE_MS,
+    )
+    this.createObjectUrl =
+      options.createObjectUrl ?? defaultQualityWorkerObjectUrl
+    this.revokeObjectUrl =
+      options.revokeObjectUrl ??
+      ((url) => {
+        if (typeof URL !== "undefined") URL.revokeObjectURL(url)
+      })
+    this.createWorker = options.createWorker ?? defaultQualityWorker
+    this.createEngine = options.createEngine ?? defaultQualityWorkerEngine
+  }
+
+  manages(engine: QualityEngine): boolean {
+    return this.managedEngines.has(engine)
+  }
+
+  owns(engine: QualityEngine): boolean {
+    return this.current?.engine === engine
+  }
+
+  private terminateHandle(
+    handle: QualityWorkerHandle,
+    error: Error,
+    notifyFailure: boolean,
+  ): void {
+    if (handle.stopped.signal.aborted) return
+    if (this.current === handle) this.current = null
+    handle.stopped.abort(error)
+    handle.worker.removeEventListener("error", handle.errorListener)
+    handle.worker.removeEventListener(
+      "messageerror",
+      handle.messageErrorListener,
+    )
+    try {
+      handle.worker.terminate()
+    } catch {
+      // The lifecycle signal already released every caller.
+    }
+    try {
+      this.revokeObjectUrl(handle.objectUrl)
+    } catch {
+      // Revocation is best effort; the Worker itself has already stopped.
+    }
+    if (notifyFailure && handle.onFailure) {
+      try {
+        handle.onFailure(handle.engine, error)
+      } catch {
+        // A status callback must not keep the Worker alive.
+      }
+    }
+  }
+
+  private interruptAndDrainCompletion<T>(
+    handle: QualityWorkerHandle,
+    pending: Promise<T>,
+  ): void {
+    if (
+      this.current !== handle ||
+      handle.stopped.signal.aborted ||
+      handle.drainPromise
+    ) {
+      return
+    }
+
+    let completionSettled = false
+    const completion = pending.then(
+      () => {
+        completionSettled = true
+      },
+      (error: unknown) => {
+        completionSettled = true
+        if (
+          this.current === handle &&
+          !handle.stopped.signal.aborted &&
+          !isExpectedInterruptedCompletionError(error) &&
+          isKnownFatalQualityEngineError(error)
+        ) {
+          this.terminateHandle(
+            handle,
+            error instanceof Error
+              ? error
+              : new QualityWorkerRuntimeError(errorMessage(error)),
+            true,
+          )
+        }
+      },
+    )
+    const hardStop = (error: Error): void => {
+      if (
+        completionSettled ||
+        this.current !== handle ||
+        handle.stopped.signal.aborted
+      ) {
+        return
+      }
+      this.terminateHandle(handle, error, true)
+    }
+
+    try {
+      const interrupt = handle.engine.interruptGenerate()
+      void Promise.resolve(interrupt).catch(() => undefined)
+    } catch {
+      // The completion settlement and grace deadline remain authoritative.
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let onStopped: (() => void) | undefined
+    const stopped = new Promise<void>((resolve) => {
+      if (handle.stopped.signal.aborted) {
+        resolve()
+        return
+      }
+      onStopped = () => resolve()
+      handle.stopped.signal.addEventListener("abort", onStopped, {
+        once: true,
+      })
+    })
+    const graceExpired = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        hardStop(
+          new QualityWorkerTimeoutError(
+            "completion",
+            this.completionAbortGraceMs,
+          ),
+        )
+        resolve()
+      }, this.completionAbortGraceMs)
+    })
+    let tracked!: Promise<void>
+    tracked = Promise.race([completion, stopped, graceExpired]).finally(() => {
+      if (timer !== undefined) clearTimeout(timer)
+      if (onStopped) {
+        handle.stopped.signal.removeEventListener("abort", onStopped)
+      }
+      if (handle.drainPromise === tracked) handle.drainPromise = undefined
+    })
+    handle.drainPromise = tracked
+    void tracked
+  }
+
+  private async bounded<T>(
+    handle: QualityWorkerHandle,
+    operation: () => Promise<T>,
+    timeoutMs: number,
+    operationName: "reload" | "completion",
+    signal?: AbortSignal,
+    cooperativeTimeout = false,
+  ): Promise<T> {
+    if (signal?.aborted) {
+      const error = abortError()
+      if (operationName === "reload") {
+        this.terminateHandle(handle, error, false)
+      }
+      throw error
+    }
+    if (this.current !== handle || handle.stopped.signal.aborted) {
+      throw new QualityWorkerRuntimeError(
+        "Der Quality-Worker ist nicht mehr verfuegbar.",
+      )
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let onAbort: (() => void) | undefined
+    let rejectAbort: ((error: Error) => void) | undefined
+    let rejectTimeout: ((error: Error) => void) | undefined
+    let onStopped: (() => void) | undefined
+    const stopped = new Promise<never>((_resolve, reject) => {
+      onStopped = () => {
+        const reason = handle.stopped.signal.reason
+        reject(
+          reason instanceof Error
+            ? reason
+            : new QualityWorkerRuntimeError(errorMessage(reason)),
+        )
+      }
+      handle.stopped.signal.addEventListener("abort", onStopped, {
+        once: true,
+      })
+    })
+
+    const pending = Promise.resolve().then(operation)
+    // A terminated WebLLM RPC can stay unresolved forever. If it does settle
+    // after our race, keep that late rejection from becoming unhandled.
+    void pending.catch(() => undefined)
+    const aborted = new Promise<never>((_resolve, reject) => {
+      rejectAbort = reject
+    })
+    const timedOut = new Promise<never>((_resolve, reject) => {
+      rejectTimeout = reject
+    })
+    if (signal) {
+      onAbort = () => {
+        const error = abortError()
+        rejectAbort?.(error)
+        if (operationName === "completion") {
+          this.interruptAndDrainCompletion(handle, pending)
+        } else {
+          this.terminateHandle(handle, error, false)
+        }
+      }
+      signal.addEventListener("abort", onAbort, { once: true })
+    }
+    timer = setTimeout(() => {
+      const error = new QualityWorkerTimeoutError(operationName, timeoutMs)
+      if (operationName === "completion" && cooperativeTimeout) {
+        rejectTimeout?.(error)
+        this.interruptAndDrainCompletion(handle, pending)
+      } else {
+        this.terminateHandle(handle, error, false)
+      }
+    }, timeoutMs)
+
+    try {
+      return await Promise.race([pending, stopped, aborted, timedOut])
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+      if (onAbort) signal?.removeEventListener("abort", onAbort)
+      if (onStopped) {
+        handle.stopped.signal.removeEventListener("abort", onStopped)
+      }
+    }
+  }
+
+  async start(
+    appConfig: AppConfig,
+    modelId: string,
+    onProgress: (progress: { progress: number; text: string }) => void,
+    onFailure?: (engine: QualityEngine, error: Error) => void,
+    signal?: AbortSignal,
+  ): Promise<QualityEngine> {
+    if (signal?.aborted) throw abortError()
+    this.stop(
+      new QualityWorkerRuntimeError(
+        "Der vorherige Quality-Worker wurde ersetzt.",
+      ),
+    )
+    if (!this.workerSource.trim()) {
+      throw new QualityWorkerRuntimeError(
+        "Der lokale Quality-Worker ist nicht im Bundle enthalten.",
+      )
+    }
+
+    const objectUrl = this.createObjectUrl(this.workerSource)
+    let worker: QualityWorkerLike | null = null
+    let handle: QualityWorkerHandle | null = null
+    try {
+      worker = this.createWorker(objectUrl)
+      const epoch = ++this.epoch
+      let ownedHandle!: QualityWorkerHandle
+      const engine = this.createEngine(worker, appConfig, (progress) => {
+        if (
+          this.current === ownedHandle &&
+          ownedHandle.epoch === epoch &&
+          !ownedHandle.stopped.signal.aborted
+        ) {
+          onProgress(progress)
+        }
+      })
+      const errorListener: EventListener = (event) => {
+        this.terminateHandle(
+          ownedHandle,
+          qualityWorkerEventError("error", event),
+          true,
+        )
+      }
+      const messageErrorListener: EventListener = (event) => {
+        this.terminateHandle(
+          ownedHandle,
+          qualityWorkerEventError("messageerror", event),
+          true,
+        )
+      }
+      ownedHandle = {
+        epoch,
+        worker,
+        objectUrl,
+        engine,
+        stopped: new AbortController(),
+        errorListener,
+        messageErrorListener,
+        onFailure,
+      }
+      handle = ownedHandle
+      this.current = ownedHandle
+      this.managedEngines.add(engine)
+      worker.addEventListener("error", errorListener)
+      worker.addEventListener("messageerror", messageErrorListener)
+
+      await this.bounded(
+        ownedHandle,
+        () => engine.reload(modelId),
+        this.reloadTimeoutMs,
+        "reload",
+        signal,
+      )
+      return engine
+    } catch (error) {
+      if (handle) {
+        this.terminateHandle(
+          handle,
+          error instanceof Error
+            ? error
+            : new QualityWorkerRuntimeError(errorMessage(error)),
+          false,
+        )
+      } else {
+        try {
+          worker?.terminate()
+        } catch {
+          // Object URL cleanup below is still required.
+        }
+        try {
+          this.revokeObjectUrl(objectUrl)
+        } catch {
+          // Best effort after a construction failure.
+        }
+      }
+      throw error
+    }
+  }
+
+  async run<T>(
+    engine: QualityEngine,
+    operation: () => Promise<T>,
+    signal?: AbortSignal,
+    timeoutMs?: number,
+  ): Promise<T> {
+    const handle = this.current
+    if (!handle || handle.engine !== engine) {
+      throw new QualityWorkerRuntimeError(
+        "Der Quality-Worker ist nicht mehr verfuegbar.",
+      )
+    }
+    if (handle.drainPromise) {
+      await waitForQualityAbort(handle.drainPromise, signal)
+      if (this.current !== handle || handle.stopped.signal.aborted) {
+        const reason = handle.stopped.signal.reason
+        throw reason instanceof Error
+          ? reason
+          : new QualityWorkerRuntimeError(
+              "Der Quality-Worker ist nach dem Abbruch nicht mehr verfuegbar.",
+            )
+      }
+    }
+    const deadline = qualityTimeoutMs(
+      "completionTimeoutMs",
+      timeoutMs === undefined
+        ? this.completionTimeoutMs
+        : Math.max(1, Math.ceil(timeoutMs)),
+    )
+    return this.bounded(
+      handle,
+      operation,
+      deadline,
+      "completion",
+      signal,
+      timeoutMs !== undefined,
+    )
+  }
+
+  stopEngine(engine: QualityEngine, error: Error = abortError()): void {
+    const handle = this.current
+    if (handle?.engine === engine) {
+      this.terminateHandle(handle, error, false)
+    }
+  }
+
+  stop(error: Error = abortError()): void {
+    const handle = this.current
+    if (handle) this.terminateHandle(handle, error, false)
+  }
 }
 
 interface ThinkingBudget {
@@ -3125,12 +3714,20 @@ export class QualityEvaluator {
   private phase: RuntimeStatus["phase"] = "idle"
   private loadSource: ModelLoadSource | undefined
   private lastError: string | undefined
-  private engine: MLCEngine | null = null
-  private loadingEngine: MLCEngine | null = null
+  private engine: QualityEngine | null = null
+  private loadingEngine: QualityEngine | null = null
   private fetchSession: ResilientFetchSession | null = null
-  private loadPromise: Promise<MLCEngine> | null = null
+  private loadPromise: Promise<QualityEngine> | null = null
+  private loadAttemptGeneration = 0
+  private loadCancellationPromise: Promise<void> | null = null
   private engineCleanupPromise: Promise<void> | null = null
   private inferenceQueue: Promise<void> = Promise.resolve()
+  private sessionFatalError: Error | null = null
+  private readonly workerSupervisor: QualityWorkerSupervisor
+
+  constructor(workerSupervisor = new QualityWorkerSupervisor()) {
+    this.workerSupervisor = workerSupervisor
+  }
 
   getStatus(): RuntimeStatus {
     return {
@@ -3151,7 +3748,35 @@ export class QualityEvaluator {
     emit("lia-llm:status", this.getStatus())
   }
 
+  private rememberSessionFatalError(error: unknown): void {
+    if (
+      this.sessionFatalError === null &&
+      isFatalQualityEngineError(error) &&
+      !isQualityWorkerTimeoutError(error)
+    ) {
+      this.sessionFatalError =
+        error instanceof Error
+          ? error
+          : new QualityWorkerRuntimeError(errorMessage(error))
+    }
+  }
+
+  private handleWorkerFailure(engine: QualityEngine, error: Error): void {
+    if (this.engine !== engine && this.loadingEngine !== engine) return
+    this.rememberSessionFatalError(error)
+    if (this.engine === engine) this.engine = null
+    if (this.loadingEngine === engine) this.loadingEngine = null
+    this.loadedModel = null
+    this.loadPromise = null
+    recordDebugFailure("quality", { error }, "worker")
+    this.setPhase(
+      isAbortError(error) ? "idle" : "error",
+      isAbortError(error) ? undefined : errorMessage(error),
+    )
+  }
+
   private failEngine(error: unknown): void {
+    this.rememberSessionFatalError(error)
     const engine = this.engine
     this.engine = null
     this.loadedModel = null
@@ -3162,10 +3787,21 @@ export class QualityEvaluator {
       this.setPhase("error", errorMessage(error))
     }
     if (engine) {
+      if (this.workerSupervisor.manages(engine)) {
+        this.workerSupervisor.stopEngine(
+          engine,
+          error instanceof Error
+            ? error
+            : new QualityWorkerRuntimeError(errorMessage(error)),
+        )
+        return
+      }
       const previousCleanup = this.engineCleanupPromise
       const cleanup = (previousCleanup ?? Promise.resolve())
         .catch(() => undefined)
-        .then(() => engine.unload())
+        .then(() =>
+          typeof engine.unload === "function" ? engine.unload() : undefined
+        )
         .catch(() => undefined)
       let tracked!: Promise<void>
       tracked = cleanup.finally(() => {
@@ -3177,7 +3813,11 @@ export class QualityEvaluator {
     }
   }
 
-  private async createEngine(networkAuthorized: boolean): Promise<MLCEngine> {
+  private async createEngine(
+    networkAuthorized: boolean,
+    signal?: AbortSignal,
+  ): Promise<QualityEngine> {
+    if (signal?.aborted) throw abortError()
     if (typeof navigator === "undefined" || !navigator.gpu) {
       throw new Error(
         "Das stärkere Qualitätsmodell benötigt WebGPU; die automatische Auswertung bleibt auf dem Kompaktmodell.",
@@ -3212,14 +3852,12 @@ export class QualityEvaluator {
       onFailure: (failure) => recordDebugFailure("quality", failure),
     })
     this.fetchSession = session
+    const onAbort = (): void => session.abort("Die Auswertung wurde beendet.")
+    signal?.addEventListener("abort", onAbort, { once: true })
 
-    const fetchGlobal = globalThis as typeof globalThis & {
-      __liaLlmArtifactFetch?: typeof fetch
-    }
-    const previousArtifactFetch = fetchGlobal.__liaLlmArtifactFetch
     const model = this.model
     const appConfig = createQualityAppConfig(webLlm.prebuiltAppConfig, model)
-    let engine: MLCEngine | null = null
+    let engine: QualityEngine | null = null
     let stage = "artifact-prefetch"
 
     try {
@@ -3228,10 +3866,10 @@ export class QualityEvaluator {
       await prefetchQualityArtifacts(appConfig, session, downloadProgress)
 
       stage = "engine-reload"
-      fetchGlobal.__liaLlmArtifactFetch = session.fetch
-      engine = new webLlm.MLCEngine({
+      engine = await this.workerSupervisor.start(
         appConfig,
-        initProgressCallback: (report) => {
+        model.id,
+        (report) => {
           const rawProgress = Number.isFinite(report.progress)
             ? report.progress
             : undefined
@@ -3247,29 +3885,62 @@ export class QualityEvaluator {
             message: report.text,
           })
         },
-        logLevel: "WARN",
-      })
+        (failedEngine, error) =>
+          this.handleWorkerFailure(failedEngine, error),
+        signal,
+      )
       this.loadingEngine = engine
-      await engine.reload(model.id)
       this.loadedModel = model
       return engine
     } catch (error) {
       recordDebugFailure("quality", { error }, stage)
-      if (engine) await engine.unload().catch(() => undefined)
+      if (engine && !this.workerSupervisor.manages(engine)) {
+        await engine.unload().catch(() => undefined)
+      }
       throw error
     } finally {
+      signal?.removeEventListener("abort", onAbort)
       if (engine && this.loadingEngine === engine) this.loadingEngine = null
       if (this.fetchSession === session) this.fetchSession = null
-      if (fetchGlobal.__liaLlmArtifactFetch === session.fetch) {
-        fetchGlobal.__liaLlmArtifactFetch = previousArtifactFetch
-      }
     }
+  }
+
+  cancelPreload(): void {
+    const canceledLoad = this.loadPromise
+    const previousCancellation = this.loadCancellationPromise
+    this.loadAttemptGeneration += 1
+    this.workerSupervisor.stop(abortError())
+    this.fetchSession?.abort("Die Auswertung wurde beendet.")
+    this.fetchSession = null
+    this.engine = null
+    this.loadingEngine = null
+    this.loadedModel = null
+    this.loadPromise = null
+
+    const pending: Promise<unknown>[] = []
+    if (previousCancellation) pending.push(previousCancellation)
+    if (canceledLoad) pending.push(canceledLoad)
+    if (pending.length > 0) {
+      let tracked!: Promise<void>
+      tracked = Promise.allSettled(pending)
+        .then(() => undefined)
+        .finally(() => {
+          if (this.loadCancellationPromise === tracked) {
+            this.loadCancellationPromise = null
+          }
+        })
+      this.loadCancellationPromise = tracked
+    }
+    this.setPhase("idle")
   }
 
   async preload(
     cacheInfo?: ModelCacheInfo,
     diagnosticRunStarted = false,
+    signal?: AbortSignal,
   ): Promise<RuntimeStatus> {
+    if (signal?.aborted) throw abortError()
+    if (this.sessionFatalError) throw this.sessionFatalError
     const suppliedSelection = cacheInfo?.qualitySelection
     if (
       suppliedSelection &&
@@ -3284,10 +3955,20 @@ export class QualityEvaluator {
     if (this.engine) return this.getStatus()
     if (!this.loadPromise) {
       const preloadGeneration = this.modelSelectionGeneration
+      const loadAttemptGeneration = ++this.loadAttemptGeneration
       if (!diagnosticRunStarted) beginDebugLoad("quality")
-      this.loadPromise = (async () => {
+      let tracked!: Promise<QualityEngine>
+      tracked = (async () => {
+        const cancellation = this.loadCancellationPromise
+        if (cancellation) {
+          await waitForQualityAbort(cancellation, signal)
+        }
         if (this.engineCleanupPromise) await this.engineCleanupPromise
-        if (preloadGeneration !== this.modelSelectionGeneration) {
+        if (
+          signal?.aborted ||
+          preloadGeneration !== this.modelSelectionGeneration ||
+          loadAttemptGeneration !== this.loadAttemptGeneration
+        ) {
           throw abortError()
         }
         const cache = suppliedSelection
@@ -3306,7 +3987,9 @@ export class QualityEvaluator {
         }
         const assertPreloadCurrent = (): void => {
           if (
+            signal?.aborted ||
             preloadGeneration !== this.modelSelectionGeneration ||
+            loadAttemptGeneration !== this.loadAttemptGeneration ||
             selection !== this.modelSelection
           ) {
             throw abortError()
@@ -3377,22 +4060,48 @@ export class QualityEvaluator {
         }
         this.loadSource = cache.cached ? "cache" : "network"
         this.setPhase("loading")
-        return this.createEngine(!cache.cached)
+        return this.createEngine(!cache.cached, signal)
       })()
         .then((engine) => {
+          if (
+            signal?.aborted ||
+            loadAttemptGeneration !== this.loadAttemptGeneration ||
+            preloadGeneration !== this.modelSelectionGeneration ||
+            this.workerSupervisor.manages(engine) &&
+            !this.workerSupervisor.owns(engine)
+          ) {
+            if (this.workerSupervisor.manages(engine)) {
+              this.workerSupervisor.stopEngine(engine, abortError())
+            }
+            if (
+              signal?.aborted ||
+              loadAttemptGeneration !== this.loadAttemptGeneration ||
+              preloadGeneration !== this.modelSelectionGeneration
+            ) {
+              throw abortError()
+            }
+            throw new QualityWorkerRuntimeError(
+              "Der Quality-Worker wurde waehrend des Ladens beendet.",
+            )
+          }
           this.engine = engine
           this.setPhase("ready")
           return engine
         })
         .catch((error: unknown) => {
-          const message = errorMessage(error)
-          this.loadPromise = null
-          this.setPhase("error", message)
+          if (this.loadPromise === tracked) {
+            this.loadPromise = null
+            this.setPhase(
+              isAbortError(error) ? "idle" : "error",
+              isAbortError(error) ? undefined : errorMessage(error),
+            )
+          }
           throw error
         })
+      this.loadPromise = tracked
     }
 
-    await this.loadPromise
+    await waitForQualityAbort(this.loadPromise, signal)
     return this.getStatus()
   }
 
@@ -3406,19 +4115,53 @@ export class QualityEvaluator {
   }
 
   private async runCompletion<T>(
-    engine: MLCEngine,
+    engine: QualityEngine,
     create: () => Promise<T>,
     signal?: AbortSignal,
     timeoutMs?: number,
   ): Promise<{ value?: T; timedOut: boolean }> {
     if (signal?.aborted) throw abortError()
 
+    if (this.workerSupervisor.manages(engine)) {
+      try {
+        const value = await this.workerSupervisor.run(
+          engine,
+          create,
+          signal,
+          timeoutMs,
+        )
+        return { value, timedOut: false }
+      } catch (error) {
+        if (!this.workerSupervisor.owns(engine)) {
+          if (this.engine === engine) this.engine = null
+          if (this.loadingEngine === engine) this.loadingEngine = null
+          this.loadedModel = null
+          this.loadPromise = null
+        }
+        if (isQualityWorkerTimeoutError(error) && timeoutMs !== undefined) {
+          this.setPhase(
+            this.workerSupervisor.owns(engine) ? "ready" : "idle",
+          )
+          return { timedOut: true }
+        }
+        if (isAbortError(error)) {
+          this.setPhase(
+            this.workerSupervisor.owns(engine) ? "ready" : "idle",
+          )
+          throw error
+        }
+        throw error
+      }
+    }
+
     let timedOut = false
     let completionActive = true
     let interruptPromise: Promise<void> | null = null
     const interrupt = (): void => {
       if (!completionActive) return
-      interruptPromise ??= engine.interruptGenerate().catch(() => undefined)
+      interruptPromise ??= Promise.resolve(engine.interruptGenerate()).catch(
+        () => undefined,
+      )
     }
     const onAbort = (): void => interrupt()
     signal?.addEventListener('abort', onAbort, { once: true })
@@ -3957,7 +4700,7 @@ export class QualityEvaluator {
   }
 
   private async chooseOrthographyOption(
-    engine: MLCEngine,
+    engine: QualityEngine,
     answer: string,
     question: string,
     reference: string,
@@ -4087,7 +4830,7 @@ export class QualityEvaluator {
   }
 
   private async hybridOrthographyEdits(
-    engine: MLCEngine,
+    engine: QualityEngine,
     question: string,
     answer: string,
     reference: string,
@@ -4171,7 +4914,7 @@ export class QualityEvaluator {
   }
 
   private async correctGrammar(
-    engine: MLCEngine,
+    engine: QualityEngine,
     question: string,
     answer: string,
     reference: string,
@@ -4438,7 +5181,7 @@ export class QualityEvaluator {
   }
 
   private async correctOrthography(
-    engine: MLCEngine,
+    engine: QualityEngine,
     question: string,
     answer: string,
     reference: string,
@@ -4838,7 +5581,7 @@ export class QualityEvaluator {
     if (!languageAnalysis) return undefined
 
     return this.enqueue(async () => {
-      await this.preload()
+      await this.preload(undefined, false, options?.signal)
       try {
         return await this.analyzeLanguage(
           normalized.question,
@@ -4879,7 +5622,7 @@ export class QualityEvaluator {
     const evaluation = this.enqueue<EvaluationResult>(async () => {
       const started = now()
       if (options?.signal?.aborted) throw abortError()
-      await this.preload()
+      await this.preload(undefined, false, options?.signal)
 
       const criteria: CriterionResult[] = []
       const thinkingBudget: ThinkingBudget = {
@@ -5164,14 +5907,21 @@ export class QualityEvaluator {
     this.modelSelectionGeneration += 1
     this.modelSelection = null
     this.modelSelectionPromise = null
+    // This must happen before waiting for either the inference queue or a
+    // WebLLM RPC. terminate() is the only reliable way to release a poisoned
+    // Worker queue.
+    this.workerSupervisor.stop(abortError())
     this.fetchSession?.abort()
+    const loadCancellation = this.loadCancellationPromise
     const loadingEngine = this.loadingEngine
-    const loadingUnload = loadingEngine
+    const loadingUnload =
+      loadingEngine && !this.workerSupervisor.manages(loadingEngine)
       ? loadingEngine.unload().catch(() => undefined)
       : undefined
 
     return this.enqueue(async () => {
       try {
+        if (loadCancellation) await loadCancellation
         if (this.engineCleanupPromise) await this.engineCleanupPromise
         if (loadingUnload) await loadingUnload
         if (this.loadPromise) {
@@ -5187,7 +5937,13 @@ export class QualityEvaluator {
         this.loadedModel = null
         this.loadingEngine = null
         this.loadPromise = null
-        if (engine) await engine.unload().catch(() => undefined)
+        if (engine) {
+          if (this.workerSupervisor.manages(engine)) {
+            this.workerSupervisor.stopEngine(engine, abortError())
+          } else {
+            await engine.unload().catch(() => undefined)
+          }
+        }
 
         if (typeof caches === "undefined") return 0
 
@@ -5214,6 +5970,7 @@ export class QualityEvaluator {
         this.model = SMALL_QUALITY_MODEL
         this.modelSelection = null
         this.modelSelectionPromise = null
+        this.sessionFatalError = null
         this.loadSource = undefined
         this.setPhase("idle")
       }
