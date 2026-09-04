@@ -11,6 +11,10 @@ const calibrationPage =
   process.argv[2] ??
   process.env.LIA_LLM_CALIBRATION_PAGE ??
   "test/browser-holistic-calibration.html"
+const smallQualityCalibration =
+  new URL(calibrationPage, "http://127.0.0.1").searchParams.get(
+    "qualityTier",
+  ) === "small"
 const executionMode = process.argv[3]
 const captureBrowserDiagnostics =
   process.env.LIA_LLM_CAPTURE_BROWSER_DIAGNOSTICS === "1"
@@ -21,7 +25,12 @@ const useWebGpu =
       ? true
       : process.env.LIA_LLM_WEBGPU !== "0"
 const configuredPort = process.env.LIA_LLM_CALIBRATION_PORT?.trim() ?? ""
-const calibrationPort = configuredPort === "" ? 0 : Number(configuredPort)
+const calibrationPort =
+  configuredPort === ""
+    ? smallQualityCalibration
+      ? 43_117
+      : 0
+    : Number(configuredPort)
 if (
   configuredPort !== "" &&
   (!/^\d+$/u.test(configuredPort) ||
@@ -102,7 +111,9 @@ const profilePath =
   configuredProfilePath ||
   join(
     tmpdir(),
-    `lia-llm-${profileKey}-${useWebGpu ? "webgpu-profile-20260721-v1" : "browser-profile-20260720-v3"}`,
+    smallQualityCalibration
+      ? `lia-llm-${profileKey}-webgpu-small-profile-20260904-v1`
+      : `lia-llm-${profileKey}-${useWebGpu ? "webgpu-profile-20260721-v1" : "browser-profile-20260720-v3"}`,
   )
 let pageUrl = ""
 
@@ -342,7 +353,7 @@ try {
         })),
       }
       if (
-        /disposed|device\s+(?:was\s+)?lost|DXGI|GrammarMatcher|QualityOutputError|validiertes JSON|finish_reason/iu.test(
+        /disposed|device\s+(?:was\s+)?lost|DXGI|buffer unmapped|unmapped (?:gpu )?buffer|buffer is not mapped|GrammarMatcher|QualityOutputError|validiertes JSON|finish_reason/iu.test(
           pausedDiagnostic.data?.description ?? "",
         )
       ) {

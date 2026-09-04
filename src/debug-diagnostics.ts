@@ -252,12 +252,36 @@ function canonicalErrorSignature(
     }
   }
   if (
-    /integrity|sha-?256|hash mismatch|corrupt|kein gueltiges|kein gültiges|ungueltiges[^.\n]{0,30}Artefakt|ungültiges[^.\n]{0,30}Artefakt/iu
+    /integrity|sha-?256|hash mismatch|corrupt|(?:kein|un)gueltiges[^.\n]{0,30}Artefakt|(?:kein|un)gültiges[^.\n]{0,30}Artefakt/iu
       .test(haystack)
   ) {
     return {
       name: "DataError",
       message: "Die Integritaetspruefung des Artefakts ist fehlgeschlagen (integrity).",
+    }
+  }
+  if (
+    /structured-output-grammar|GrammarMatcher|XGrammar|check failed[^.\n]{0,100}grammar|grammar[^.\n]{0,100}check failed/iu
+      .test(haystack)
+  ) {
+    return {
+      name: "OperationError",
+      message: "Die strukturierte Modellausgabe scheiterte in der Laufzeit (structured-output-grammar).",
+    }
+  }
+  if (/runtime-aborted|RuntimeError[^.\n]{0,80}Aborted(?:\(\))?/iu.test(haystack)) {
+    return {
+      name: "OperationError",
+      message: "Die lokale Modelllaufzeit wurde abgebrochen (runtime-aborted).",
+    }
+  }
+  if (
+    /Qualitätsmodell|QualityOutputError|Quality assessment output|JSON-Ergebnis|Entscheidungsausgabe/iu
+      .test(haystack)
+  ) {
+    return {
+      name: "DataError",
+      message: "Quality assessment output validation failed (invalid-output).",
     }
   }
   const dxgi = haystack.match(
@@ -273,6 +297,12 @@ function canonicalErrorSignature(
     return {
       name: "OperationError",
       message: "WebGPU device lost (VK_ERROR_DEVICE_LOST).",
+    }
+  }
+  if (/buffer(?:\s+is)?\s+unmapped|unmapped\s+(?:gpu\s+)?buffer|buffer\s+is\s+not\s+mapped/iu.test(haystack)) {
+    return {
+      name: "OperationError",
+      message: "Ein WebGPU-Puffer war beim Zugriff nicht mehr gemappt (buffer unmapped).",
     }
   }
   if (/object has already been disposed|tensor has already been disposed|cannot pass deleted object/iu.test(haystack)) {
@@ -1271,7 +1301,23 @@ function failureFinding(
       "Content-Encoding, Content-Length und Byte-Range im Proxyprotokoll vergleichen.",
     )
   }
-  if (/integrity|sha-?256|hash|kein gueltiges|ungueltiges.*Artefakt/iu.test(haystack)) {
+  if (
+    event.stage === "assessment-output" &&
+    /Qualitätsmodell|QualityOutputError|Quality assessment output|JSON-Ergebnis|Entscheidungsausgabe/iu
+      .test(haystack)
+  ) {
+    return errorFinding(
+      "quality-output-invalid",
+      "Das Qualitätsmodell lieferte keine gültige Entscheidungsausgabe.",
+      "Die lokale Modellausgabe entsprach nicht dem erwarteten JSON-Vertrag; Modell- und Runtime-Artefakte können dabei trotzdem intakt sein.",
+      evidence,
+      "Die Aufgabe erneut prüfen. Tritt die Meldung wieder auf, die vollständige DebugNotiz weitergeben.",
+    )
+  }
+  if (
+    /integrity|sha-?256|hash|(?:kein|un)gueltiges[^.\n]{0,30}Artefakt|(?:kein|un)gültiges[^.\n]{0,30}Artefakt/iu
+      .test(haystack)
+  ) {
     return errorFinding(
       "integrity-failed",
       "Die Datei bestand die Integrit\u00e4tspr\u00fcfung nicht.",
@@ -1290,7 +1336,20 @@ function failureFinding(
     )
   }
   if (
-    /WebGPU|device lost|DXGI_ERROR_DEVICE_|VK_ERROR_DEVICE_LOST|object disposed|out of memory/iu
+    event.engine === "quality" &&
+    /structured-output-grammar|runtime-aborted|GrammarMatcher|XGrammar|check failed[^.\n]{0,100}grammar|RuntimeError[^.\n]{0,80}Aborted/iu
+      .test(haystack)
+  ) {
+    return errorFinding(
+      "quality-runtime-failed",
+      "Die lokale Quality-Laufzeit konnte die strukturierte Ausgabe nicht abschließen.",
+      "Die Modelllaufzeit oder ihre JSON-Grammatik wurde während der Bewertung abgebrochen; die Modellartefakte können dabei trotzdem intakt sein.",
+      evidence,
+      "Die Aufgabe erneut prüfen. Tritt die Meldung wieder auf, die vollständige DebugNotiz weitergeben.",
+    )
+  }
+  if (
+    /WebGPU|device lost|DXGI_ERROR_DEVICE_|VK_ERROR_DEVICE_LOST|object disposed|buffer unmapped|unmapped (?:gpu )?buffer|buffer is not mapped|out of memory/iu
       .test(haystack)
   ) {
     return errorFinding(
@@ -1402,7 +1461,19 @@ function runtimeFailureFinding(runtime: RuntimeStatus | null): DebugFinding | nu
     )
   }
   if (
-    /WebGPU|GPU|requestAdapter|requestDevice|device lost|VK_ERROR|DXGI_ERROR_DEVICE_|adapter|object has already been disposed|cannot pass deleted object|out of (?:gpu )?memory/iu
+    runtime.assessmentEngine === "quality" &&
+    /structured-output-grammar|runtime-aborted/iu.test(message)
+  ) {
+    return errorFinding(
+      "quality-runtime-failed",
+      "Die lokale Quality-Laufzeit konnte die strukturierte Ausgabe nicht abschließen.",
+      "Die Modelllaufzeit oder ihre JSON-Grammatik wurde während der Bewertung abgebrochen; die Modellartefakte können dabei trotzdem intakt sein.",
+      evidence,
+      "Die Aufgabe erneut prüfen. Tritt die Meldung wieder auf, die vollständige DebugNotiz weitergeben.",
+    )
+  }
+  if (
+    /WebGPU|GPU|requestAdapter|requestDevice|device lost|VK_ERROR|DXGI_ERROR_DEVICE_|adapter|object has already been disposed|cannot pass deleted object|buffer unmapped|unmapped (?:gpu )?buffer|buffer is not mapped|out of (?:gpu )?memory/iu
       .test(message)
   ) {
     return errorFinding(

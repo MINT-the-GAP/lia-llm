@@ -46,6 +46,7 @@ export type LearnerFeedbackCode =
   | "operator-not-met"
   | "operator-check-unavailable"
   | "quality-check-unavailable"
+  | "runtime-error"
   | "language-analysis"
   | "language-analysis-unavailable"
 

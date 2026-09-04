@@ -4,6 +4,33 @@
 <script src="../dist/index.js"></script>
 <pre id="output">starting</pre>
 <script>
+const requestedQualityTier =
+  new URL(location.href).searchParams.get("qualityTier")
+const requestedQualityModelId =
+  requestedQualityTier === "small"
+    ? "Qwen3-1.7B-q4f16_1-MLC"
+    : null
+
+// Test-only quota cap: WebLLM caches are origin-bound, and a generous host
+// quota otherwise upgrades a warm 1.7B cache to the uncached 4B tier. The cap
+// keeps the long criteria calibration reproducibly on the requested small tier.
+if (requestedQualityTier === "small") {
+  const storage = navigator.storage
+  if (!storage || typeof storage.estimate !== "function") {
+    throw new Error("Der Small-Tier-Test benötigt navigator.storage.estimate().")
+  }
+  const estimateStorage = storage.estimate.bind(storage)
+  Object.defineProperty(storage, "estimate", {
+    configurable: true,
+    value: async () => ({
+      ...(await estimateStorage()),
+      usage: 0,
+      quota: 1_600_000_000,
+      usageDetails: {}
+    })
+  })
+}
+
 const question =
   "Beschreibe das Bild so, dass jemand ohne das Bild es sich gut vorstellen kann. Gib zuerst einen Überblick. Beschreibe dann passende Details im Vordergrund, in der Mitte und im Hintergrund. Nenne wichtige Farben und erkläre, wie das Bild auf dich wirkt. Nutze die Gegenwart und erfinde keine Geschichte."
 const reference =
@@ -97,6 +124,9 @@ window.__liaCalibrationExpected = cases.length
           criterion.status === "contradicted"
       )
       const qualityUsed = result.model.task === "generative-assessment"
+      const requestedQualityModelUsed =
+        requestedQualityModelId === null ||
+        result.model.id === requestedQualityModelId
       const feedback = window.LiaLLM.formatResult(result, "de-DE")
       window.__liaCalibration.push({
         id: item.id,
@@ -119,7 +149,8 @@ window.__liaCalibrationExpected = cases.length
           met >= item.minimumMet &&
           contradicted === item.expectedContradiction &&
           (!item.expectedContradiction || skyContradicted) &&
-          qualityUsed,
+          qualityUsed &&
+          requestedQualityModelUsed,
         compactFeedbackHasCriteria:
           /Gesamtantwort|Bestätigung:|Sicher bestätigte Abdeckung/.test(feedback)
       })

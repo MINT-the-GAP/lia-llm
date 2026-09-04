@@ -1,10 +1,11 @@
 # Browser- und Schulnetz-Härtetest
 
-Stand dieser Evidenz: 20. August 2026. Dieses Dokument beschreibt den
+Stand dieser Evidenz: 4. September 2026. Dieses Dokument beschreibt den
 reproduzierbaren Freigabetest für Download, Cache, Browserneustart, echte
-Offline-Inferenz und Cache-Löschung. Die derzeitigen PASS-Nachweise gelten nur
-für das kompakte mDeBERTa-Modell mit ONNX Runtime/WASM. Das Quality-Modell wird
-weiter unten bewusst getrennt behandelt.
+Offline-Inferenz und Cache-Löschung. Die vollständigen PASS-Nachweise dieses
+Ablaufs gelten nur für das kompakte mDeBERTa-Modell mit ONNX Runtime/WASM.
+Gezielte Laufzeit- und Kriteriennachweise für das Quality-Modell werden weiter
+unten bewusst getrennt behandelt.
 
 Ein PASS auf einem Browser ist keine pauschale Freigabe für andere
 Betriebssysteme, Browsermarken, Geräte oder Einbettungskontexte. Insbesondere ist
@@ -423,12 +424,34 @@ der tatsächlich eingesetzten Schulhardware.
 
 Auf dem tatsächlich getesteten lokalen Host liefen Microsoft Edge 151 und eine NVIDIA GeForce
 RTX 2070 SUPER (Turing, 8 GB VRAM; gemeldetes maximales WebGPU-Pufferlimit ca. 2 GiB).
-Die getestete Qwen3-1.7B-Stufe reproduzierte in vier von vier warmen Minimalläufen dieselbe
-Fehlerkette:
-`DXGI_ERROR_DEVICE_HUNG` → verlorenes WebGPU-Gerät → `Object has already been disposed`.
-Modellcache und Plattenspeicher waren dabei vollständig beziehungsweise ausreichend. Der
-`disposed`-Fehler ist somit ein Folgefehler des verlorenen GPU-Geräts und kein Beleg für ein
-Quota- oder Downloadproblem.
+Die Ergebnisse vor und nach der 0.6.3-Kompatibilitätskorrektur sind getrennt zu lesen:
+
+| Stand | Prüfumfang | Ergebnis |
+| --- | --- | --- |
+| unveränderte WebLLM-0.2.84-Laufzeit | vier warme 1.7B-Minimalläufe | 0/4; jeweils `DXGI_ERROR_DEVICE_HUNG` → verlorenes WebGPU-Gerät → `Object has already been disposed` |
+| 0.6.3, gepatchte Laufzeit | ein Cold- und zwei Warm-Direktläufe | 3/3 technisch erfolgreich |
+| 0.6.3, Command-Buffer-Cap ohne Ausgabeschema | Diagnoselauf über mehr als acht Minuten | GPU blieb stabil; die Ausgaben waren jedoch kein gültiges JSON und deshalb kein fachlicher PASS |
+| 0.6.3, Cap und JSON-Schema vor dem Einzelkriterienzusatz | 16/16 Einzelentscheidungen in rund 139 Sekunden | technisch vollständig; die Reproduktion erreichte aber nur 4/8, und die Gegenbehauptung wurde wegen falsch interpretierter `confidence=0` nicht bestätigt |
+| finaler 0.6.3-Stand | exakter `5_09`-Kriterienlauf | 2/2 Fälle in rund 139 Sekunden; Reproduktion 8/8, Gegenbehauptung mit vier Widersprüchen abgewiesen; 16/16 ohne GPU-, Grammar- oder Parserfehler |
+
+Version 0.6.3 hält unveränderliche Shape-Tuples bis zum Engine-Abbau gültig, synchronisiert
+ausstehende GPU-Readbacks auch über spätere Queue-Arbeit hinweg und begrenzt jeden Command-Buffer
+auf 32 Compute-Pässe. Die Build-Vorbereitung wendet diese Korrekturen nur an, wenn jede erwartete
+Stelle der gepinnten WebLLM-Quelle exakt einmal gefunden wird; ein WebLLM-Update erfordert daher
+eine erneute Prüfung statt eines stillen Weiterbaus. Hintergrund und Referenzpunkte sind
+[WebLLM #844](https://github.com/mlc-ai/web-llm/issues/844),
+[Apache TVM #20059](https://github.com/apache/tvm/pull/20059) und
+[Apache TVM #18871](https://github.com/apache/tvm/pull/18871).
+
+`Buffer unmapped`, `Buffer is not mapped` und entsprechende Varianten gelten als fatale
+WebGPU-Laufzeitfehler. Die beschädigte Engine wird für die laufende Sitzung verworfen; Lernende
+erhalten keine rohe Runtime-Meldung. Je nach Rückfallpfad erscheint stattdessen die neutrale
+Nichtverfügbarkeitsmeldung oder bei einem direkt gemeldeten Laufzeitfehler der Hinweis auf Seiten-
+beziehungsweise Browserneustart. Die DebugNotiz ordnet den Fehler weiterhin als
+WebGPU-Laufzeitfehler ein. Cache- und Speicherplatzdiagnosen bleiben davon getrennt. Modellcache
+und Plattenspeicher waren in den Ausgangsläufen vollständig beziehungsweise ausreichend; der
+`disposed`-Fehler war dort ein Folgefehler des verlorenen GPU-Geräts und kein Beleg für ein Quota-
+oder Downloadproblem.
 
 Die zwischenzeitlich geprüfte Variante Qwen3-0.6B blieb auf demselben Host im beobachteten Cold-
 und Warm-Lauf ohne Geräteverlust.
@@ -443,8 +466,9 @@ abweisen, ersetzt aber keine ausreichende semantische Modellleistung.
 
 Der reproduzierbare Inhalts-Stresstest wird nach einem aktuellen Build mit
 `npm run test:browser-adversarial` ausgeführt. Ein technisch erfolgreicher Lauf beweist nur die
-dort geprüften Fälle. Für die getestete 1.7B-Stufe liegt wegen des reproduzierten
-Geräteverlusts auf dem lokalen Testhost noch kein erfolgreicher Browser-Stresstest vor.
+dort geprüften Fälle. Er wurde mit dem finalen 0.6.3-Stand noch nicht erneut vollständig belegt.
+Der erfolgreiche Kriterienlauf unten ersetzt diesen 12-Fälle-Test nicht; umgekehrt widerlegt der
+frühere Geräteverlust nicht mehr die technische Lauffähigkeit des final gepatchten 1.7B-Stands.
 
 Die gezielte Kalibrierung für atomare Kriterien mit `coverage` wird separat mit
 `npm run test:browser-quality-criteria` ausgeführt. Sie prüft den dokumentierten
@@ -456,6 +480,27 @@ danach die Auswertung. Der Befehl gehört bewusst nicht zu `npm test` oder `npm 
 WebGPU und gegebenenfalls einen Download von etwa 984 MB beziehungsweise 2,28 GB benötigt. Auch ein
 bestandener semantischer Kalibrierungsfall ersetzt nicht den folgenden
 Cold→Neustart→Offline-Inferenz→Clear-Freigabeablauf.
+
+Der finale 0.6.3-Lauf des exakten `5_09`-Falls bestand beide Fälle in rund 139 Sekunden. Die
+Reproduktion erreichte 8 von 8 erfüllten Kriterien bei geforderten mindestens 6. Die ausdrückliche
+Gegenbehauptung wurde abgewiesen und erzeugte vier bestätigte Widersprüche. Alle 16 Quality-Aufrufe
+endeten ohne GPU-, Grammar- oder Parserfehler.
+
+Der normale npm-Kurzbefehl verwendet die produktive automatische Stufenwahl und kann bei großer
+Origin-Quote Qwen3-4B auswählen. Für eine gezielte Qwen3-1.7B-Wiederholung besitzt nur die
+Test-Fixture den Queryparameter `qualityTier=small`. Da WebLLM-Caches an die vollständige Origin
+einschließlich Port gebunden sind, muss für vergleichbare Cold-/Warm-Läufe derselbe freie Port
+verwendet werden:
+
+``` powershell
+npm run build
+$env:LIA_LLM_CALIBRATION_PORT = "52684"
+$env:LIA_LLM_CAPTURE_BROWSER_DIAGNOSTICS = "1"
+npm run test:browser-quality-criteria-small
+```
+
+Ein zweiter Aufruf mit demselben Browserprofil und Port ist der Warm-Lauf. Der Queryparameter
+verändert ausschließlich die Test-Fixture und ist keine Produktionsoption.
 
 Eine Quality-Freigabe braucht pro Browser/OS-Paar weiterhin denselben
 Cold→Neustart→Offline-Inferenz→Clear-Ablauf und muss nachweisen, dass wirklich Qwen statt des

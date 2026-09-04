@@ -4,6 +4,7 @@ import type {
   LearnerFeedback,
   OperatorRubric,
 } from "./types.ts"
+import { isFatalQualityEngineError } from "./quality-runtime-errors.ts"
 
 export type EvaluationInputErrorCode = "answer-too-short"
 
@@ -78,8 +79,8 @@ function contentFeedbackForResult(
     return {
       code: "quality-check-unavailable",
       message: german
-        ? "Die ausdrücklich angeforderte Qualitätsprüfung war gerade nicht verfügbar. Das Kompaktmodell konnte die Einzelkriterien nicht zuverlässig abschließend bewerten. Versuche die Prüfung erneut, sobald die Qualitätsprüfung verfügbar ist."
-        : "The explicitly requested quality assessment was unavailable. The compact model could not reliably reach a final judgement on the individual criteria. Try again when quality assessment is available.",
+        ? "Die ausdrücklich angeforderte Qualitätsprüfung war gerade nicht verfügbar. Das Kompaktmodell konnte die Einzelkriterien nicht zuverlässig abschließend bewerten. Versuche die Prüfung später erneut."
+        : "The explicitly requested quality assessment was unavailable. The compact model could not reliably reach a final judgement on the individual criteria. Try the assessment again later.",
     }
   }
 
@@ -106,9 +107,12 @@ function contentFeedbackForResult(
 
   if (
     diagnostic?.code === "off-topic" ||
-    result.criteria.some(
-      (criterion) => criterion.judgeDecision === "fail_off_topic",
-    )
+    (result.status !== "passed" &&
+      result.criteria.some(
+        (criterion) =>
+          criterion.judgeDecision === "fail_off_topic" &&
+          criterion.status === "missed",
+      ))
   ) {
     return {
       code: "off-topic",
@@ -237,6 +241,15 @@ export function feedbackForError(
   error: unknown,
   locale = "de-DE",
 ): LearnerFeedback | null {
+  if (isFatalQualityEngineError(error)) {
+    return {
+      code: "runtime-error",
+      message: isGerman(locale)
+        ? "Die lokale Modellprüfung wurde wegen eines technischen Laufzeitfehlers beendet. Lade die Seite neu und versuche es erneut. Tritt der Fehler wieder auf, starte den Browser neu."
+        : "The local model assessment stopped because of a technical runtime error. Reload the page and try again. If the error recurs, restart the browser.",
+    }
+  }
+
   if (!(error instanceof EvaluationInputError)) return null
 
   if (error.code === "answer-too-short") {

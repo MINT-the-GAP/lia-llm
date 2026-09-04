@@ -46,6 +46,10 @@ import {
 } from "./german-spellcheck.ts"
 import { ResilientFetchSession } from "./resilient-fetch.ts"
 import {
+  isFatalQualityEngineError,
+  qualityRuntimeErrorMessage as errorMessage,
+} from "./quality-runtime-errors.ts"
+import {
   aggregateCriteria,
   normalizeRequest,
   normalizeText,
@@ -154,6 +158,25 @@ export const QUALITY_POST_DATA_INSTRUCTION =
   "operator_criterion_id ist eine Zeichenkette und meistens leer. selected_reference_index ist der " +
   "nullbasierte ganzzahlige Index des passendsten Eintrags aus erwartungshorizonte. Antworte sofort ohne Erkl\u00e4rung " +
   "und ohne Markdown; das erste Zeichen ist { und das letzte Zeichen ist }."
+
+export const QUALITY_CRITERIA_DECISION_INSTRUCTION =
+  "Vertrauenswürdige Zusatzregel nur für bewertungsmodus=einzelkriterium: " +
+  "Triff genau einen atomaren Entscheid über die aktuelle musterloesung. Suche ihre Belege in der " +
+  "gesamten lernendenantwort und führe passende Belege aus mehreren Sätzen zusammen. musterloesung " +
+  "und gleichwertige_musterloesungen sind ODER-Formulierungen; eine davon genügt. Lies Quantoren " +
+  "wörtlich: Bei ‚mindestens ein X, etwa A oder B‘ genügt ein passendes Beispiel; ‚etwa‘ allein " +
+  "ändert keine verlangte Anzahl. Bestimme " +
+  "unter Beachtung von Verneinungen und finalen Selbstkorrekturen: Eine explizit logisch unvereinbare " +
+  "Behauptung ergibt fail_contradiction; ein hinreichender Beleg oder eine erfüllte Form- oder " +
+  "Abwesenheitsbedingung ergibt pass; bloßes Fehlen ergibt fail_incomplete, niemals " +
+  "fail_contradiction. frage und operatorprofil erzeugen nur dann Anforderungen, wenn die aktuelle " +
+  "musterloesung ausdrücklich darauf verweist. Die Regeln für erwartungshorizonte und " +
+  "selected_reference_index bleiben unverändert. confidence ist die Sicherheit, dass genau die " +
+  "gewählte decision stimmt. Verwende bei einem eindeutigen pass oder fail 0.8 bis 1; verwende niemals " +
+  "0 nur weil die Lernendenantwort falsch ist. Beispiele: Das Kriterium ‚Nennt mindestens ein " +
+  "Verkehrsmittel, etwa Bus oder Zug‘ mit der Antwort ‚Ein Zug‘ ergibt pass mit confidence 0.9. " +
+  "‚Die Lampe ist blau‘ mit ‚Die Lampe ist nicht blau, sondern rot‘ ergibt fail_contradiction mit " +
+  "confidence 0.9."
 
 const QUALITY_BASELINE_MAX_TOKENS = 256
 const QUALITY_DATA_START = "BEGIN_UNTRUSTED_ASSESSMENT_DATA_JSON"
@@ -318,16 +341,20 @@ export function hasAssessmentManipulationAttempt(input: {
   return ASSESSMENT_OUTPUT_OVERRIDE_PATTERNS.some((pattern) => pattern.test(answer))
 }
 
-function qualityPromptMessages(payload: string): Array<{
+function qualityPromptMessages(payload: string, mode: EvaluationMode): Array<{
   role: "system" | "user"
   content: string
 }> {
+  const criteriaInstruction = mode === "criteria"
+    ? `${QUALITY_CRITERIA_DECISION_INSTRUCTION}\n\n`
+    : ""
   return [
     { role: "system", content: QUALITY_SYSTEM_PROMPT },
     {
       role: "user",
       content:
         `${QUALITY_DATA_START}\n${payload}\n${QUALITY_DATA_END}\n\n` +
+        criteriaInstruction +
         QUALITY_POST_DATA_INSTRUCTION,
     },
   ]
@@ -1251,18 +1278,7 @@ function now(): number {
   return typeof performance === "undefined" ? Date.now() : performance.now()
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
-}
-
-export function isFatalQualityEngineError(error: unknown): boolean {
-  const name = error instanceof Error ? error.name : ""
-  const message = errorMessage(error)
-  const text = `${name}: ${message}`
-  return /(?:device\s+(?:was\s+)?lost|device[-_ ]?lost|dxgi_error_device_(?:hung|removed|reset)|vk_error_device_lost|(?:object|tensor) has already been disposed|current object has already been disposed|cannot pass deleted object|model(?:not)?loadederror|model has not been loaded|out of (?:gpu )?memory|\boom\b|memory allocation|gpu[^\n]{0,80}(?:hang|lost)|runtimeerror[^\n]{0,40}aborted|check failed[^\n]{0,80}grammar)/iu.test(
-    text,
-  )
-}
+export { isFatalQualityEngineError } from "./quality-runtime-errors.ts"
 
 export function isRecoverableQualityRequestError(error: unknown): boolean {
   const name = error instanceof Error ? error.name : ""
@@ -1780,23 +1796,15 @@ export function validateOperatorJudgeOutput(
 export function classifyQualityDecision(
   output: QualityJudgeOutput,
   criterion: Criterion,
-  uncertaintyMargin: number,
+  _uncertaintyMargin: number,
 ): CriterionStatus {
-  const positiveNear = output.confidence >= Math.max(0, criterion.threshold - uncertaintyMargin)
-  const negativeNear =
-    output.confidence >=
-    Math.max(0, criterion.contradictionThreshold - uncertaintyMargin)
-
   if (output.decision === "pass") {
-    if (output.confidence >= criterion.threshold) return "met"
-    return positiveNear ? "uncertain" : "missed"
+    return output.confidence >= criterion.threshold ? "met" : "uncertain"
   }
   if (output.decision === "fail_contradiction") {
     return output.confidence >= criterion.contradictionThreshold
       ? "contradicted"
-      : negativeNear
-        ? "uncertain"
-        : "missed"
+      : "uncertain"
   }
   if (output.decision === "uncertain") return "uncertain"
   return output.confidence >= criterion.threshold ? "missed" : "uncertain"
@@ -1869,7 +1877,14 @@ function criterionResult(
     supportEvidence: evidence,
     contradictionEvidence: evidence,
     evidenceKind:
-      output.decision === "fail_contradiction"
+      status === "contradicted" ||
+      (status === "uncertain" &&
+        output.decision === "fail_contradiction" &&
+        output.confidence >=
+          Math.max(
+            0,
+            criterion.contradictionThreshold - uncertaintyMargin,
+          ))
         ? "contradiction"
         : "entailment",
     similarity: scores.entailment,
@@ -1907,13 +1922,20 @@ export function qualityDiagnosticForCriteria(
 ): EvaluationDiagnostic | undefined {
   for (const code of QUALITY_DIAGNOSTIC_PRIORITY) {
     if (assessmentPassed && code !== "too-colloquial") continue
-    const matching = criteria.filter(
-      (criterion) =>
-        (criterion.judgeFeedbackCode === "operator-not-met" &&
-        criterion.status === "uncertain"
+    const matching = criteria.filter((criterion) => {
+      const feedbackCode = criterion.judgeFeedbackCode
+      const diagnosticCode =
+        criterion.status === "uncertain" &&
+        feedbackCode !== undefined &&
+        feedbackCode !== "none" &&
+        feedbackCode !== "too-colloquial"
           ? "unclear"
-          : criterion.judgeFeedbackCode) === code,
-    )
+          : feedbackCode === "content-error" &&
+              criterion.status !== "contradicted"
+            ? undefined
+            : feedbackCode
+      return diagnosticCode === code
+    })
     if (matching.length === 0) continue
     const confidence = Math.max(
       ...matching.map((criterion) => criterion.judgeConfidence ?? 0),
@@ -3145,6 +3167,7 @@ export class QualityEvaluator {
 
   private async refineWithThinking(
     payload: string,
+    mode: EvaluationMode,
     operator: OperatorRubric | undefined,
     referenceVariantCount: number,
     budget: ThinkingBudget,
@@ -3167,7 +3190,7 @@ export class QualityEvaluator {
       const result = await this.runCompletion(
         engine,
         () => engine.chat.completions.create({
-          messages: qualityPromptMessages(payload),
+          messages: qualityPromptMessages(payload, mode),
           stream: false,
           temperature: 0.6,
           top_p: 0.95,
@@ -3266,12 +3289,16 @@ export class QualityEvaluator {
       lernendenantwort: answer,
     })
     const createCompletion = () => engine.chat.completions.create({
-      messages: qualityPromptMessages(payload),
+      messages: qualityPromptMessages(payload, mode),
       stream: false,
       temperature: 0,
       top_p: 1,
       seed: 17,
       max_tokens: QUALITY_BASELINE_MAX_TOKENS,
+      response_format: {
+        type: "json_object",
+        schema: JSON.stringify(QUALITY_RESPONSE_SCHEMA),
+      },
       extra_body: {
         enable_thinking: false,
       },
@@ -3332,6 +3359,7 @@ export class QualityEvaluator {
         ) {
           const refined = await this.refineWithThinking(
             payload,
+            mode,
             operator,
             referenceVariants.length,
             thinkingBudget,
@@ -3348,6 +3376,7 @@ export class QualityEvaluator {
           repairAttempted = true
           const repaired = await this.refineWithThinking(
             payload,
+            mode,
             operator,
             referenceVariants.length,
             thinkingBudget,

@@ -139,7 +139,9 @@ import {
   QualityEvaluator,
   referenceAnchoredSpelling,
   qualityDiagnosticForCriteria,
+  QUALITY_CRITERIA_DECISION_INSTRUCTION,
   QUALITY_POST_DATA_INSTRUCTION,
+  QUALITY_RESPONSE_SCHEMA,
   QUALITY_SYSTEM_PROMPT,
   validateSelectedReferenceIndex,
   validateOperatorJudgeOutput,
@@ -734,6 +736,36 @@ test("debug diagnostics classify network, proxy, size, and integrity failures", 
       item.code,
     )
   }
+
+  const qualityOutputCodes = debugFindingCodes([
+    debugEvent({
+      kind: "failure",
+      engine: "quality",
+      stage: "assessment-output",
+      errorName: "QualityOutputError",
+      message: "Das Qualitätsmodell hat kein gültiges JSON-Ergebnis geliefert.",
+    }),
+  ])
+  assert.equal(qualityOutputCodes.includes("quality-output-invalid"), true)
+  assert.equal(qualityOutputCodes.includes("integrity-failed"), false)
+
+  const qualityRuntimeCodes = debugFindingCodes([
+    debugEvent({
+      kind: "failure",
+      engine: "quality",
+      stage: "assessment",
+      errorName: "RuntimeError",
+      message: "Check failed in GrammarMatcher",
+    }),
+    debugEvent({
+      kind: "failure",
+      engine: "quality",
+      stage: "assessment",
+      errorName: "RuntimeError",
+      message: "RuntimeError: Aborted()",
+    }, 2),
+  ])
+  assert.equal(qualityRuntimeCodes.includes("quality-runtime-failed"), true)
 })
 
 test("debug diagnostics classify runtime startup failures without hiding a network cause", () => {
@@ -762,6 +794,14 @@ test("debug diagnostics classify runtime startup failures without hiding a netwo
         "WebGPU requestAdapter failed before requestDevice.",
         "quality",
       ),
+    },
+    {
+      code: "webgpu-runtime-failed",
+      status: runtime("Buffer unmapped", "quality"),
+    },
+    {
+      code: "quality-runtime-failed",
+      status: runtime("Check failed in GrammarMatcher", "quality"),
     },
     {
       code: "runtime-csp-blocked",
@@ -2358,6 +2398,23 @@ test("normalizeRequest reports a structured too-short answer before inference", 
       "Sprachstatistik: Wörter insgesamt: 1 · die angeforderte Fehlerzählung ist derzeit nicht verfügbar.",
   })
   assert.equal(feedbackForError(new Error("Technischer Fehler")), null)
+
+  const webGpuFeedback = feedbackForError(
+    new Error("Buffer unmapped"),
+    "de-DE",
+  )
+  assert.equal(webGpuFeedback?.code, "runtime-error")
+  assert.match(webGpuFeedback?.message ?? "", /Lade die Seite neu/u)
+  assert.doesNotMatch(webGpuFeedback?.message ?? "", /Buffer unmapped/u)
+  assert.doesNotMatch(webGpuFeedback?.message ?? "", /WebGPU/u)
+
+  const grammarRuntimeFeedback = feedbackForError(
+    new Error("Check failed in GrammarMatcher"),
+    "de-DE",
+  )
+  assert.equal(grammarRuntimeFeedback?.code, "runtime-error")
+  assert.match(grammarRuntimeFeedback?.message ?? "", /Laufzeitfehler/u)
+  assert.doesNotMatch(grammarRuntimeFeedback?.message ?? "", /WebGPU/u)
 })
 
 test("operator profile sets its own minimum length and feedback", () => {
@@ -3949,6 +4006,85 @@ test("QualityEvaluator keeps omission, formal, absence, and contradiction semant
   )
 })
 
+test("QualityEvaluator keeps low-confidence contradiction metadata consistent", async () => {
+  const confidences = new Map([
+    ["Widerspruch mit Konfidenz null.", 0],
+    ["Widerspruch nahe der Schwelle.", 0.6],
+    ["Sicherer Widerspruch.", 0.9],
+  ])
+  const engine = {
+    interruptGenerate: async () => undefined,
+    chat: {
+      completions: {
+        create: async (request: Record<string, unknown>) => {
+          const payload = assessmentPayloadFromRequest(request)
+          const confidence = confidences.get(String(payload.musterloesung))
+          assert.notEqual(confidence, undefined)
+          return {
+            choices: [{
+              finish_reason: "stop",
+              message: {
+                content: JSON.stringify({
+                  decision: "fail_contradiction",
+                  confidence,
+                  feedback_code: "content-error",
+                  operator_criterion_id: "",
+                }),
+              },
+            }],
+          }
+        },
+      },
+    },
+  }
+  const evaluator = new QualityEvaluator()
+  ;(evaluator as unknown as { engine: typeof engine | null }).engine = engine
+  const assessed = await evaluator.evaluate(
+    {
+      question: "Prüfe die Aussagen.",
+      answer: "Die vorgegebenen Aussagen treffen nicht zu.",
+      reference: "Referenz.",
+      criteria: [...confidences.keys()].map((text, index) => ({
+        id: `criterion-${String(index + 1)}`,
+        text,
+        required: false,
+      })),
+      criterionThreshold: 0.55,
+      contradictionThreshold: 0.65,
+      uncertaintyMargin: 0.1,
+    },
+    { maxThinkingTimeMs: 0 },
+  )
+
+  assert.deepEqual(
+    assessed.criteria.map((criterion) => criterion.status),
+    ["uncertain", "uncertain", "contradicted"],
+  )
+  assert.deepEqual(
+    assessed.criteria.map((criterion) => criterion.evidenceKind),
+    ["entailment", "contradiction", "contradiction"],
+  )
+  assert.equal(assessed.criteria[0]?.contradiction, 0)
+  assert.deepEqual(
+    qualityDiagnosticForCriteria([assessed.criteria[0]!]),
+    {
+      code: "unclear",
+      confidence: 0,
+      source: "quality",
+      severity: "blocking",
+    },
+  )
+  assert.deepEqual(
+    qualityDiagnosticForCriteria([assessed.criteria[1]!]),
+    {
+      code: "unclear",
+      confidence: 0.6,
+      source: "quality",
+      severity: "blocking",
+    },
+  )
+})
+
 test("QualityEvaluator preserves criteria mode in thinking refinement", async () => {
   const requests: Array<Record<string, unknown>> = []
   const outputs = [
@@ -4021,6 +4157,10 @@ test("QualityEvaluator preserves criteria mode in thinking refinement", async ()
   assert.equal(baselineMessages?.[0]?.content, QUALITY_SYSTEM_PROMPT)
   assert.equal(thinkingMessages?.[0]?.content, QUALITY_SYSTEM_PROMPT)
   assert.equal(thinkingMessages?.[1]?.content, baselineMessages?.[1]?.content)
+  assert.match(
+    baselineMessages?.[1]?.content ?? "",
+    new RegExp(QUALITY_CRITERIA_DECISION_INSTRUCTION.slice(0, 48), "u"),
+  )
   assert.deepEqual(requests[0]?.extra_body, { enable_thinking: false })
   assert.deepEqual(requests[1]?.extra_body, { enable_thinking: true })
   assert.equal(assessed.passed, true)
@@ -4213,6 +4353,9 @@ test('quality error guards separate fatal runtime failures from request-local co
     'The current Object has already been disposed',
     'Tensor has already been disposed',
     'DXGI_ERROR_DEVICE_HUNG',
+    'Buffer unmapped',
+    'unmapped GPU buffer',
+    'Buffer is not mapped',
   ]) {
     assert.equal(isFatalQualityEngineError(new Error(message)), true, message)
   }
@@ -4236,7 +4379,7 @@ test('quality error guards separate fatal runtime failures from request-local co
   assert.equal(isRecoverableQualityRequestError(new Error('temporary fetch failure')), false)
 })
 
-test('QualityEvaluator treats a disposed tensor during thinking as fatal', async () => {
+test('QualityEvaluator treats an unmapped buffer during thinking as fatal', async () => {
   let calls = 0
   let unloadCalls = 0
   const engine = {
@@ -4256,7 +4399,7 @@ test('QualityEvaluator treats a disposed tensor during thinking as fatal', async
           }],
         }
       }
-      throw new Error('Tensor has already been disposed')
+      throw new Error('Buffer unmapped')
     } } },
   }
   const evaluator = new QualityEvaluator()
@@ -4274,13 +4417,13 @@ test('QualityEvaluator treats a disposed tensor during thinking as fatal', async
       },
       { maxThinkingTimeMs: 5_000, maxThinkingTokens: 512 },
     ),
-    /Tensor has already been disposed/u,
+    /Buffer unmapped/u,
   )
 
   assert.equal(calls, 2)
   assert.equal(unloadCalls, 1)
   assert.equal(evaluator.getStatus().phase, 'error')
-  assert.match(evaluator.getStatus().error ?? '', /Tensor has already been disposed/u)
+  assert.match(evaluator.getStatus().error ?? '', /Buffer unmapped/u)
   assert.equal(
     (evaluator as unknown as { engine: unknown }).engine,
     null,
@@ -4421,7 +4564,10 @@ test('QualityEvaluator adaptively refines long answers with bounded thinking', a
   assert.equal(requests.length, 2)
   assert.deepEqual(requests[0]?.extra_body, { enable_thinking: false })
   assert.equal(requests[0]?.max_tokens, 256)
-  assert.equal(requests[0]?.response_format, undefined)
+  assert.deepEqual(requests[0]?.response_format, {
+    type: 'json_object',
+    schema: JSON.stringify(QUALITY_RESPONSE_SCHEMA),
+  })
   const baselineMessages = requests[0]?.messages as
     | Array<{ role: string; content: string }>
     | undefined
@@ -6167,6 +6313,16 @@ test("quality prompt requires contextual synonym and negation handling", () => {
   assert.match(QUALITY_SYSTEM_PROMPT, /too-colloquial/u)
   assert.match(QUALITY_POST_DATA_INSTRUCTION, /nicht vertrauenswürdige Bewertungsdaten/u)
   assert.match(QUALITY_POST_DATA_INSTRUCTION, /JSON-Schema/u)
+  assert.match(QUALITY_CRITERIA_DECISION_INSTRUCTION, /gesamten lernendenantwort/u)
+  assert.match(QUALITY_CRITERIA_DECISION_INSTRUCTION, /ODER-Formulierungen/u)
+  assert.match(QUALITY_CRITERIA_DECISION_INSTRUCTION, /mindestens ein/u)
+  assert.match(
+    QUALITY_CRITERIA_DECISION_INSTRUCTION,
+    /‚etwa‘ allein ändert keine verlangte Anzahl/u,
+  )
+  assert.match(QUALITY_CRITERIA_DECISION_INSTRUCTION, /bloßes Fehlen ergibt fail_incomplete/u)
+  assert.match(QUALITY_CRITERIA_DECISION_INSTRUCTION, /confidence ist die Sicherheit/u)
+  assert.match(QUALITY_CRITERIA_DECISION_INSTRUCTION, /niemals 0/u)
 })
 
 function evidence(
@@ -6484,6 +6640,25 @@ test("quality diagnostics use a stable priority and keep style advisory", () => 
     severity: "advisory",
   })
   assert.equal(qualityDiagnosticForCriteria([unclear], true), undefined)
+
+  const lowConfidenceOffTopic = result("topic-uncertain", "uncertain")
+  lowConfidenceOffTopic.judgeFeedbackCode = "off-topic"
+  lowConfidenceOffTopic.judgeConfidence = 0.2
+  const lowConfidenceTooShort = result("short-uncertain", "uncertain")
+  lowConfidenceTooShort.judgeFeedbackCode = "answer-too-short"
+  lowConfidenceTooShort.judgeConfidence = 0.3
+  assert.deepEqual(
+    qualityDiagnosticForCriteria([
+      lowConfidenceOffTopic,
+      lowConfidenceTooShort,
+    ]),
+    {
+      code: "unclear",
+      confidence: 0.3,
+      source: "quality",
+      severity: "blocking",
+    },
+  )
 })
 
 test("the compact WASM runtime enables the ONNX worker proxy", () => {
@@ -6750,6 +6925,34 @@ test("prepared WebLLM clears an interrupted non-streaming request", () => {
   assert.match(
     generated,
     /finally \{\s*this\.interruptSignal = false;\s*yield lock\.release\(\);\s*\}/u,
+  )
+  assert.match(
+    generated,
+    /this\.shapeCache = new LRUCache\(Number\.POSITIVE_INFINITY\);/u,
+  )
+  assert.doesNotMatch(
+    generated,
+    /this\.shapeCache = new LRUCache\(shapeCacheSize, \(_key, value\) => value\.dispose\(\)\);/u,
+  )
+  assert.match(
+    generated,
+    /compute\.end\(\);\s*if \(this\.pendingDispatchCount >= 32\) \{\s*this\.flushCommands\(\);\s*\}\s*\/\/ In debug mode, flush remaining work/u,
+  )
+  assert.match(
+    generated,
+    /const pendingReadIsQueueTail = this\.pendingGPUToCPUCopyIsQueueTail;/u,
+  )
+  assert.match(
+    generated,
+    /yield Promise\.all\(\[pendingRead, queueDone\]\);/u,
+  )
+  assert.match(
+    generated,
+    /: readPromise;\s*this\.pendingGPUToCPUCopyIsQueueTail = true;/u,
+  )
+  assert.match(
+    generated,
+    /this\.flushCommands\(\);\s*this\.canvasRenderManager\.draw\(/u,
   )
 })
 
@@ -8635,10 +8838,10 @@ test("explicit Quality criteria fallbacks stay uncertain when Compact cannot dec
       failedFallback.diagnostic?.code,
       "quality-check-unavailable",
     )
-    assert.equal(
-      feedbackForResult(failedFallback, "de-DE")?.code,
-      "quality-check-unavailable",
-    )
+    const fallbackFeedback = feedbackForResult(failedFallback, "de-DE")
+    assert.equal(fallbackFeedback?.code, "quality-check-unavailable")
+    assert.match(fallbackFeedback?.message ?? "", /war gerade nicht verfügbar/u)
+    assert.match(fallbackFeedback?.message ?? "", /später erneut/u)
     const formattedFallback = formatResult(
       failedFallback,
       "de-DE",
@@ -10409,6 +10612,15 @@ test("learner feedback stays short and never exposes criteria or scores", () => 
     "Die Antwort geht noch nicht auf die gestellte Frage ein.",
   )
 
+  const uncertainOffTopicCriterion = result("secret", "uncertain")
+  uncertainOffTopicCriterion.judgeDecision = "fail_off_topic"
+  assert.equal(
+    feedbackForResult(
+      evaluation("uncertain", [uncertainOffTopicCriterion]),
+    )?.code,
+    "unclear",
+  )
+
   const colloquial = evaluation("passed", [result("secret", "met")])
   colloquial.diagnostic = {
     code: "too-colloquial",
@@ -10753,7 +10965,7 @@ function createLLMQuizValidatorRunner(): LLMQuizValidatorRunner {
   ) as LLMQuizValidatorRunner
 }
 
-test("the public version remains pinned exactly to 0.6.2", () => {
+test("the public version remains pinned exactly to 0.6.3", () => {
   const packageJson = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   ) as { version?: string }
@@ -10768,14 +10980,14 @@ test("the public version remains pinned exactly to 0.6.2", () => {
     "utf8",
   )
 
-  assert.equal(packageJson.version, "0.6.2")
-  assert.equal(packageLock.version, "0.6.2")
-  assert.equal(packageLock.packages?.[""]?.version, "0.6.2")
-  assert.match(entry, /const VERSION = "0\.6\.2"/u)
-  assert.match(bundle, /let [\w$]+="0\.6\.2",[\w$]+=globalThis/u)
-  assert.doesNotMatch(bundle, /let [\w$]+="0\.6\.1",[\w$]+=globalThis/u)
-  assert.match(browserSmoke, /window\.LiaLLM\.version === "0\.6\.2"/u)
-  assert.match(readme, /^version:\s+0\.6\.2$/mu)
+  assert.equal(packageJson.version, "0.6.3")
+  assert.equal(packageLock.version, "0.6.3")
+  assert.equal(packageLock.packages?.[""]?.version, "0.6.3")
+  assert.match(entry, /const VERSION = "0\.6\.3"/u)
+  assert.match(bundle, /let [\w$]+="0\.6\.3",[\w$]+=globalThis/u)
+  assert.doesNotMatch(bundle, /let [\w$]+="0\.6\.2",[\w$]+=globalThis/u)
+  assert.match(browserSmoke, /window\.LiaLLM\.version === "0\.6\.3"/u)
+  assert.match(readme, /^version:\s+0\.6\.3$/mu)
   assert.match(readme, /^script:\s+\.\/dist\/index\.js$/mu)
   assert.doesNotMatch(
     readme,
@@ -11092,7 +11304,7 @@ test("LLMQuiz forwards its explicit question and operator", async () => {
   await run(
     {
       LiaLLM: {
-        version: "0.6.2",
+        version: "0.6.3",
         parseMacroOptions,
         parseCriteriaBlock,
         parseReferenceVariants,
@@ -11132,7 +11344,7 @@ test("LLMQuiz rejects coverage without a criteria block before evaluation", asyn
   await run(
     {
       LiaLLM: {
-        version: "0.6.2",
+        version: "0.6.3",
         parseMacroOptions,
         parseCriteriaBlock,
         parseReferenceVariants,
@@ -11178,7 +11390,7 @@ test("LLMQuiz preserves required criteria when coverage is omitted", async () =>
   await run(
     {
       LiaLLM: {
-        version: "0.6.2",
+        version: "0.6.3",
         parseMacroOptions,
         parseCriteriaBlock: () => criteriaBlock,
         parseReferenceVariants,
@@ -11231,7 +11443,7 @@ test("LLMQuiz shares cloned coverage criteria and thresholds with language analy
   await run(
     {
       LiaLLM: {
-        version: "0.6.2",
+        version: "0.6.3",
         parseMacroOptions,
         parseCriteriaBlock: () => criteriaBlock,
         parseReferenceVariants,
@@ -11549,6 +11761,13 @@ test("manual Quality criteria calibration covers coverage and an explicit counte
     ),
     "utf8",
   )
+  const runner = readFileSync(
+    new URL("../test/run-browser-calibration.mjs", import.meta.url),
+    "utf8",
+  )
+  const packageJson = JSON.parse(
+    readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+  ) as { scripts?: Record<string, string> }
   const calibrationScript = html.match(
     /<script>\n([\s\S]*?)\n<\/script>/u,
   )?.[1]
@@ -11560,6 +11779,17 @@ test("manual Quality criteria calibration covers coverage and an explicit counte
   assert.match(html, /result\.model\.task === "generative-assessment"/u)
   assert.match(html, /window\.LiaLLM\.getStatus\(\)/u)
   assert.match(html, /20 \* 60 \* 1000/u)
+  assert.match(html, /searchParams\.get\("qualityTier"\)/u)
+  assert.match(html, /quota: 1_600_000_000/u)
+  assert.match(html, /Qwen3-1\.7B-q4f16_1-MLC/u)
+  assert.match(html, /requestedQualityModelUsed/u)
+  assert.match(runner, /smallQualityCalibration/u)
+  assert.match(runner, /43_117/u)
+  assert.match(runner, /webgpu-small-profile-20260904-v1/u)
+  assert.match(
+    packageJson.scripts?.["test:browser-quality-criteria-small"] ?? "",
+    /qualityTier=small/u,
+  )
   assert.match(html, /met >= item\.minimumMet/u)
   assert.match(html, /expectedPassed: true,[\s\S]*minimumMet: 6/u)
   assert.match(html, /expectedContradiction: false/u)

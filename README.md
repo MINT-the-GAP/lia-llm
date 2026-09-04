@@ -1,6 +1,6 @@
 <!--
 author:      MINT-the-GAP, Martin Lommatzsch
-version:     0.6.2
+version:     0.6.3
 language:    de
 narrator:    Deutsch Female
 comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
@@ -118,8 +118,8 @@ Promise.resolve()
     if (!window.LiaLLM) {
       throw new Error("lia-llm konnte nicht geladen werden.")
     }
-    if (window.LiaLLM.version !== "0.6.2") {
-      throw new Error(`lia-llm 0.6.2 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
+    if (window.LiaLLM.version !== "0.6.3") {
+      throw new Error(`lia-llm 0.6.3 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
     }
 
     const options = window.LiaLLM.parseMacroOptions(optionSource)
@@ -499,6 +499,19 @@ oder unscharfe Zuordnung wie „Bildmitte“ gegenüber „Hintergrund“ ist da
 Kriterien wie Präsens werden direkt am Antworttext geprüft. Abwesenheitskriterien wie „keine
 erfundene Geschichte“ sind erfüllt, wenn der verbotene Inhalt fehlt; die Regel muss in der Antwort
 nicht eigens erwähnt werden.
+
+Passende Belege für dasselbe Einzelkriterium dürfen über mehrere Sätze der vollständigen
+Lernendenantwort verteilt sein. Eine Formulierung wie „mindestens ein X, etwa A oder B“ wird
+wörtlich als Auswahl gelesen: Ein passendes Beispiel genügt; nicht gewählte Beispiele gelten weder
+als fehlend noch als widersprochen. „Etwa“ allein hebt dagegen keine verlangte Anzahl auf. Die
+Hauptformulierung eines Kriteriums und ausdrücklich hinterlegte gleichwertige Varianten haben
+ODER-Bedeutung.
+
+Die intern verwendete `confidence` bezeichnet die Sicherheit, dass die gewählte Entscheidung
+fachlich richtig ist, nicht den Erfüllungsgrad der Lernendenantwort. Deshalb erhält auch ein
+eindeutig erkannter Widerspruch eine hohe Konfidenz. Eine bloß fehlende Aussage bleibt
+`fail_incomplete`; nur eine ausdrückliche logisch unvereinbare Gegenbehauptung ist
+`fail_contradiction`.
 
 Der allein stehende Marker `<!-- lia-llm:solution -->` folgt genau einmal auf das letzte Kriterium.
 Alles danach ist eine zusammenhängende, frei formulierte Musterlösung und wird nicht als zusätzliches
@@ -922,12 +935,22 @@ starten. Fehlt zwischen Cacheprüfung und Aktivierung ein Artefakt oder ist es b
 Netzwerk gesperrt; der Lauf fällt auf Compact zurück und ein späterer Versuch fordert vor dem
 Download erneut eine Bestätigung an.
 
-Auf dem lokal getesteten Edge-151-System mit einer RTX 2070 SUPER verlor Qwen3-1.7B in vier von
-vier warmen Minimalläufen das GPU-Gerät (`DXGI_ERROR_DEVICE_HUNG`). Das Modell ist deshalb
-bewusst Opt-in und weder für diesen Rechner noch pauschal für die Schulrechner zertifiziert. Die
-zwischenzeitlich geprüfte 0.6B-Variante blieb dort technisch stabil, bestand den ohne vorgeschaltete
-Schutzregeln durchgeführten semantischen Stresstest aber nur in 6 von 12 Fällen. Sie wird daher
-nicht als Bewertungsmodell ausgeliefert.
+Auf dem lokal getesteten Edge-151-System mit einer RTX 2070 SUPER verlor die unveränderte
+WebLLM-0.2.84-Laufzeit mit Qwen3-1.7B in vier von vier warmen Minimalläufen das GPU-Gerät
+(`DXGI_ERROR_DEVICE_HUNG`). Version 0.6.3 enthält deshalb eng an diese gepinnte Laufzeit gebundene
+Kompatibilitätskorrekturen: Unveränderliche Shape-Tuples bleiben bis zum Abbau der Engine gültig,
+ausstehende GPU-zu-CPU-Readbacks werden auch bei nachfolgender Queue-Arbeit vollständig abgewartet
+und ein WebGPU-Command-Buffer wird auf höchstens 32 Compute-Pässe begrenzt.
+
+Mit diesem Stand bestanden auf demselben Host ein Cold- und zwei Warm-Direktläufe mit
+Qwen3-1.7B. Der exakte Kriterienfall `5_09` bestand anschließend beide Prüffälle in rund
+139 Sekunden: Die Reproduktion erfüllte im finalen Bundle 8 von 8 Kriterien, die ausdrückliche Gegenbehauptung wurde
+mit vier bestätigten Widersprüchen abgewiesen, und alle 16 Einzelentscheidungen wurden ohne GPU-,
+Grammar- oder Parserfehler abgeschlossen. Das ist ein gezielter Nachweis für diesen 1.7B-Lauf auf
+diesem Host, aber noch keine allgemeine Freigabe: Qwen3-4B, der vollständige
+Cold→Neustart→Offline→Clear-Ablauf und die tatsächlichen Schulgeräte bleiben separat zu prüfen.
+Die zwischenzeitlich geprüfte 0.6B-Variante bestand den semantischen Stresstest nur in 6 von 12
+Fällen und wird nicht als Bewertungsmodell ausgeliefert.
 
 Seit Version 0.5.14 entfernt das Template vor einem neuen Quality-Download die exakt gepinnten
 ausgehenden Qwen3-0.6B-Artefakte. Ein vorhandenes Qwen3-1.7B wird zusätzlich nur dann entfernt,
@@ -986,10 +1009,14 @@ bis zu drei Shards werden parallel vorbereitet. Bereits vollständig gecachte We
 dabei nicht erneut übertragen werden. Ein vorübergehender Fehler des Qualitätsmodells sperrt
 außerdem keine weiteren Versuche in derselben Sitzung. Ein fataler WebGPU-Laufzeitfehler wie
 `device lost`, `DXGI_ERROR_DEVICE_HUNG`, `DXGI_ERROR_DEVICE_REMOVED`,
-`DXGI_ERROR_DEVICE_RESET`, ein bereits freigegebenes (`disposed`) Engine-Objekt oder
-GPU-Speichermangel schaltet das Qualitätsmodell dagegen für die laufende Sitzung ab. So wird ein
-zerstörter GPU-Zustand nicht erneut verwendet; der nun vollständige Modellcache bleibt für einen
-späteren Seitenaufruf erhalten und der Kompakt-Fallback bleibt verfügbar.
+`DXGI_ERROR_DEVICE_RESET`, `Buffer unmapped`, `Buffer is not mapped`, ein bereits
+freigegebenes (`disposed`) Engine-Objekt oder GPU-Speichermangel schaltet das Qualitätsmodell
+dagegen für die laufende Sitzung ab. So wird ein zerstörter GPU-Zustand nicht erneut verwendet;
+der nun vollständige Modellcache bleibt für einen späteren Seitenaufruf erhalten und der
+Kompakt-Fallback bleibt verfügbar. Rohe WebGPU-Meldungen werden nicht als Lernendenfeedback
+ausgegeben. Am Quiz erscheint stattdessen eine verständliche Meldung zur nicht verfügbaren
+Modellprüfung; bei einem direkt gemeldeten Laufzeitfehler empfiehlt sie einen Seiten- und bei
+wiederholtem Auftreten einen Browserneustart.
 
 Die exakt zum Bundle passende ONNX-Web-Laufzeit (`.mjs` und `.wasm`) liegt neben
 `dist/index.js`. Dadurch muss Edge sie nicht mehr von einem zusätzlichen CDN in den anfälligen
@@ -1011,12 +1038,16 @@ außerdem kontrolliert, ob Modell und Laufzeit wirklich im Browsercache angekomm
 fehlgeschlagener Cache-Schreibvorgang erhält ebenfalls eine DebugNotiz. Der Bericht unterscheidet
 unter anderem Offlinebetrieb, HTTP- und Proxyfehler, blockierte Cross-Origin-Anfragen,
 Range-/Größenprobleme, beschädigte Artefakte, fehlenden oder gesperrten CacheStorage und zu wenig
-Speicherplatz. WebGPU-Geräteverlust, die genannten DXGI-Fehler, GPU-Speichermangel und Meldungen
-über bereits freigegebene Objekte werden als Laufzeitfehler ausgewiesen. `Object has already been
-disposed` ist dabei typischerweise der Folgefehler eines zuvor verlorenen GPU-Geräts und kein
-Hinweis auf zu wenig freien Browser-Speicherplatz. Wo der Browser mehrere Ursachen nicht
-unterscheiden kann, wird die Einordnung
-ausdrücklich als Vermutung gekennzeichnet.
+Speicherplatz. WebGPU-Geräteverlust, die genannten DXGI-Fehler, nicht mehr gemappte Puffer
+(`Buffer unmapped`), GPU-Speichermangel und Meldungen über bereits freigegebene Objekte werden als
+Laufzeitfehler ausgewiesen. `Object has already been disposed` und `Buffer unmapped` können
+Folgefehler eines zuvor verlorenen GPU-Geräts sein und sind kein Hinweis auf zu wenig freien
+Browser-Speicherplatz. Eine nicht nach dem JSON-Vertrag validierbare Quality-Entscheidung wird
+getrennt als `quality-output-invalid` und nicht als beschädigtes Modellartefakt eingeordnet.
+Ein Abbruch der strukturierten Runtime-/Grammatikprüfung erhält den eigenen Befund
+`quality-runtime-failed`.
+Wo der Browser mehrere Ursachen nicht unterscheiden kann, wird die Einordnung ausdrücklich als
+Vermutung gekennzeichnet.
 
 Der aktuelle Zustand kann jederzeit manuell geprüft werden:
 
