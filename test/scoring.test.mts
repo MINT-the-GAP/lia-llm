@@ -10173,7 +10173,7 @@ test('AutomaticEvaluator rejects manipulation before model work', async () => {
   }
 })
 
-test("automatic evaluator defaults to compact and uses quality only for explicit or advanced requests", async () => {
+test("automatic evaluator reuses cached quality and downloads it only for explicit or advanced requests", async () => {
   class MockEvaluator {
     readonly status
     readonly modelId
@@ -10348,14 +10348,9 @@ test("automatic evaluator defaults to compact and uses quality only for explicit
     assert.equal(preparation.assessmentEngine, "compact")
     assert.equal(compact.preloadCalls, 1)
     assert.equal(quality.preloadCalls, 0)
-    const first = await automatic.evaluate(request)
-    assert.equal(first.model.id, "compact-test")
-    assert.equal(quality.preloadCalls, 0)
-    assert.equal(quality.evaluateCalls, 0)
-
     let qualitySettled = false
     const firstQualityPromise = automatic
-      .evaluate({ ...request, assessmentEngine: "quality" })
+      .evaluate(request)
       .then((value) => {
         qualitySettled = true
         return value
@@ -10370,10 +10365,7 @@ test("automatic evaluator defaults to compact and uses quality only for explicit
     const firstQuality = await firstQualityPromise
     assert.equal(firstQuality.model.id, "quality-test")
 
-    const second = await automatic.evaluate({
-      ...request,
-      assessmentEngine: "quality",
-    })
+    const second = await automatic.evaluate(request)
     assert.equal(second.model.id, "quality-test")
 
     const compactCallsBeforeLanguage = compact.evaluateCalls
@@ -11489,7 +11481,8 @@ test("automatic evaluator preload prepares compact only and never probes quality
   })
 })
 
-test("automatic evaluator keeps omitted plain and explicit compact requests off quality", async () => {
+test("automatic evaluator keeps explicit compact requests off quality even with a full cache and WebGPU", async () => {
+  await withForegroundQualityRuntime(async () => {
   const compact = new ForegroundWaitMockEvaluator(
     "compact-selection",
     "compact",
@@ -11508,12 +11501,6 @@ test("automatic evaluator keeps omitted plain and explicit compact requests off 
   }
 
   await automatic.preload()
-  compact.resultStatus = "failed"
-  const omittedMiss = await automatic.evaluate(request)
-  assert.equal(omittedMiss.model.id, "compact-selection")
-  assert.equal(omittedMiss.passed, false)
-
-  compact.resultStatus = "passed"
   const explicitCompact = await automatic.evaluate({
     ...request,
     assessmentEngine: "compact",
@@ -11551,6 +11538,7 @@ test("automatic evaluator keeps omitted plain and explicit compact requests off 
   assert.equal(quality.cacheInfoCalls, 0)
   assert.equal(quality.preloadCalls, 0)
   assert.equal(quality.evaluateCalls, 0)
+  })
 })
 
 test("automatic evaluator circuit-breaks a fatal quality preload for the session", async () => {

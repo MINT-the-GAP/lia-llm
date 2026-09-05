@@ -57,11 +57,13 @@ interface EvaluationRun {
 interface AutomaticEvaluatorTimings {
   uncachedQualityWaitMs: number
   cachedQualityWaitMs: number
+  qualityCacheProbeWaitMs: number
 }
 
 const DEFAULT_AUTOMATIC_EVALUATOR_TIMINGS: AutomaticEvaluatorTimings = {
   uncachedQualityWaitMs: 30_000,
   cachedQualityWaitMs: 180_000,
+  qualityCacheProbeWaitMs: 5_000,
 }
 
 type ForegroundWaitResult<T> =
@@ -335,6 +337,11 @@ export class AutomaticEvaluator {
         "cachedQualityWaitMs",
         timings.cachedQualityWaitMs ??
           DEFAULT_AUTOMATIC_EVALUATOR_TIMINGS.cachedQualityWaitMs,
+      ),
+      qualityCacheProbeWaitMs: positiveWaitMs(
+        "qualityCacheProbeWaitMs",
+        timings.qualityCacheProbeWaitMs ??
+          DEFAULT_AUTOMATIC_EVALUATOR_TIMINGS.qualityCacheProbeWaitMs,
       ),
     }
   }
@@ -913,7 +920,7 @@ export class AutomaticEvaluator {
       normalized.operator !== undefined ||
       normalized.languageAnalysis !== undefined ||
       explicitlyRequestsThinking(evaluationOptions)
-    const useQuality =
+    const qualityRequested =
       requestedEngine === "quality" ||
       (requestedEngine === undefined && advancedQualityFeature)
     const implicitLanguageOnly =
@@ -931,11 +938,17 @@ export class AutomaticEvaluator {
 
     this.reportProgress(evaluationOptions, run, {
       phase: "selecting-model",
-      engine: useQuality && this.qualityReady ? "quality" : "compact",
+      engine: requestedEngine !== "compact" && this.qualityReady
+        ? "quality"
+        : "compact",
       message: "Passendes Modell wird ausgewählt …",
     })
 
-    if (!useQuality) {
+    if (
+      requestedEngine === "compact" ||
+      (!qualityRequested &&
+        (this.qualityDegraded || !supportsQualityRuntime()))
+    ) {
       return operatorSafeCompactResult(
         request,
         await this.evaluateCompact(request, evaluationOptions, run),
@@ -943,13 +956,6 @@ export class AutomaticEvaluator {
     }
 
     let compactResult: EvaluationResult | undefined
-    if (implicitLanguageOnly) {
-      compactResult = operatorSafeCompactResult(
-        request,
-        await this.evaluateCompact(request, evaluationOptions, run),
-      )
-      assertRunActive(run)
-    }
 
     if (
       this.qualityReady &&
@@ -965,7 +971,21 @@ export class AutomaticEvaluator {
 
     let qualityCache: ModelCacheInfo | undefined
     try {
-      qualityCache = await waitForRun(this.getQualityCacheInfo(), run)
+      const probe = this.getQualityCacheInfo()
+      if (qualityRequested) {
+        qualityCache = await waitForRun(probe, run)
+      } else {
+        const result = await waitForRunWithTimeout(
+          probe,
+          this.timings.qualityCacheProbeWaitMs,
+          run,
+        )
+        if (!result.timedOut) qualityCache = result.value
+        // A later quiz/tab may finish downloading Quality before the next check.
+        if (!qualityCache?.cached && this.qualityCacheInfoPromise === probe) {
+          this.qualityCacheInfoPromise = null
+        }
+      }
     } catch (error) {
       if (isAbortError(error)) throw error
     }
@@ -977,6 +997,14 @@ export class AutomaticEvaluator {
         evaluationOptions,
         run,
         compactResult,
+      )
+    }
+
+    // Ordinary quizzes reuse Quality locally, without downloading or repairing it.
+    if (!qualityRequested && !qualityCache?.cached) {
+      return operatorSafeCompactResult(
+        request,
+        await this.evaluateCompact(request, evaluationOptions, run),
       )
     }
 
@@ -1022,6 +1050,14 @@ export class AutomaticEvaluator {
         )
       }
       return qualityUnavailableSafeCompactResult(request, compactResult)
+    }
+
+    if (implicitLanguageOnly) {
+      compactResult = operatorSafeCompactResult(
+        request,
+        await this.evaluateCompact(request, evaluationOptions, run),
+      )
+      assertRunActive(run)
     }
 
     const qualityUpgrade = this.startQualityUpgrade(qualityCache)

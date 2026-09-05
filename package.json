@@ -14,6 +14,7 @@
     "pretest": "npm run prepare:webllm",
     "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test test/scoring.test.mts",
     "test:browser-smoke": "node test/run-browser-calibration.mjs test/browser-api-smoke.html cpu",
+    "test:browser-textarea": "node test/run-browser-calibration.mjs test/browser-quiz-textarea.html cpu",
     "test:browser-criteria": "node test/run-browser-calibration.mjs test/browser-criteria-calibration.html cpu",
     "test:browser-quality-criteria": "node test/run-browser-calibration.mjs test/browser-quality-criteria-calibration.html webgpu",
     "test:browser-quality-criteria-small": "node test/run-browser-calibration.mjs test/browser-quality-criteria-calibration.html?qualityTier=small webgpu",

@@ -836,7 +836,8 @@ bleibt sie im Kursquelltext und im Browser auffindbar.
 ### Mehrzeilige Antworten
 
 `data-llm-textarea="5"` erzeugt ein vergrößerbares Feld mit fünf sichtbaren Zeilen. Werte von 2 bis
-12 sind möglich. Absätze und Leerzeilen bleiben bei der Auswertung erhalten. Im Feld bleiben alle
+12 sind möglich, auch innerhalb von `dynFlex`-Spalten und anderen verschachtelten Containern.
+Absätze und Leerzeilen bleiben bei der Auswertung erhalten. Im Feld bleiben alle
 vier Pfeiltasten beim Cursor und lösen keinen Folienwechsel aus. Das sichtbare Feld liegt in einem
 eigenen Shadow-DOM-Sidecar; die von LiaScript verwaltete Quiz-Kindliste bleibt dabei unverändert.
 

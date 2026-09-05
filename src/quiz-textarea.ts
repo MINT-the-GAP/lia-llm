@@ -64,18 +64,18 @@ function quizForHost(host: HTMLElement): HTMLElement | null {
   const slide = host.closest<HTMLElement>("main.lia-slide__content")
   if (!slide) return null
 
-  let top = host
-  while (top.parentElement && top.parentElement !== slide) {
-    top = top.parentElement
-  }
-  if (top.parentElement !== slide) return null
-
-  let previous = top.previousElementSibling as HTMLElement | null
-  while (previous) {
-    if (previous.matches(".lia-quiz")) return previous
-    const quizzes = previous.querySelectorAll<HTMLElement>(".lia-quiz")
-    if (quizzes.length > 0) return quizzes[quizzes.length - 1] ?? null
-    previous = previous.previousElementSibling as HTMLElement | null
+  // Macro sidecars can be nested in layout containers such as DynFlex columns.
+  // Search each level before ascending so the local quiz takes precedence.
+  let current: HTMLElement | null = host
+  while (current && current !== slide) {
+    let previous = current.previousElementSibling as HTMLElement | null
+    while (previous) {
+      if (previous.matches(".lia-quiz")) return previous
+      const quizzes = previous.querySelectorAll<HTMLElement>(".lia-quiz")
+      if (quizzes.length > 0) return quizzes[quizzes.length - 1] ?? null
+      previous = previous.previousElementSibling as HTMLElement | null
+    }
+    current = current.parentElement
   }
   return null
 }

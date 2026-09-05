@@ -1,0 +1,214 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>lia-llm quiz textarea browser regression</title>
+<style>
+  .dynFlex { display: flex; gap: 1rem; }
+  .dynFlexItem { flex: 1; min-width: 0; }
+</style>
+<body>
+  <main class="lia-slide__content">
+    <section class="dynFlex">
+      <div class="flex-child dynFlexItem">
+        <div data-dynflex-block="1" data-elm-owned>
+          <div id="left-quiz" class="lia-quiz" data-llm-textarea="5"
+            data-llm-placeholder="Left answer" data-elm-owned>
+            <input id="left-input" class="lia-quiz__input" value="Left initial">
+          </div>
+          <lia-llm-textarea-host id="left-host" hidden data-elm-owned>elm-owned-placeholder</lia-llm-textarea-host>
+        </div>
+        <div class="dynFlex-resizer"></div>
+      </div>
+      <div class="flex-child dynFlexItem">
+        <section class="dynFlex">
+          <div class="flex-child dynFlexItem">
+            <div data-dynflex-block="1" data-elm-owned>
+              <div id="right-quiz" class="lia-quiz" data-llm-textarea="8"
+                data-llm-placeholder="Right answer" data-elm-owned>
+                <input id="right-input" class="lia-quiz__input" value="Right initial">
+              </div>
+            </div>
+            <div data-dynflex-block="1" data-elm-owned>
+              <p data-elm-owned><lia-llm-textarea-host id="right-host" hidden data-elm-owned>elm-owned-placeholder</lia-llm-textarea-host></p>
+            </div>
+            <div class="dynFlex-resizer"></div>
+          </div>
+          <div class="flex-child dynFlexItem" id="dynamic-column">
+            <div class="dynFlex-resizer"></div>
+          </div>
+        </section>
+        <div class="dynFlex-resizer"></div>
+      </div>
+    </section>
+    <section class="dynFlex">
+      <div class="flex-child dynFlexItem" data-elm-owned>
+        <div class="lia-quiz" data-elm-owned>
+          <input id="native-input" class="lia-quiz__input" value="Native">
+        </div>
+        <lia-llm-textarea-host id="native-host" hidden data-elm-owned>elm-owned-placeholder</lia-llm-textarea-host>
+      </div>
+      <div class="flex-child dynFlexItem" data-elm-owned>
+        <div class="lia-quiz" data-llm-textarea="false" data-elm-owned>
+          <input id="false-input" class="lia-quiz__input" value="False">
+        </div>
+        <lia-llm-textarea-host id="false-host" hidden data-elm-owned>elm-owned-placeholder</lia-llm-textarea-host>
+      </div>
+      <div class="flex-child dynFlexItem" data-elm-owned>
+        <div class="lia-quiz" data-llm-textarea="0" data-elm-owned>
+          <input id="zero-input" class="lia-quiz__input" value="Zero">
+        </div>
+        <lia-llm-textarea-host id="zero-host" hidden data-elm-owned>elm-owned-placeholder</lia-llm-textarea-host>
+      </div>
+    </section>
+  </main>
+  <script>
+    window.__liaCalibration = []
+    window.__liaCalibrationExpected = 8
+    window.__liaCalibrationDone = false
+
+    const byId = id => document.getElementById(id)
+    const areaFor = id => byId(id).shadowRoot?.querySelector("textarea")
+    const lightDom = new Map()
+    const rememberLightDom = () => {
+      document.querySelectorAll("[data-elm-owned]").forEach(element => {
+        if (!lightDom.has(element)) lightDom.set(element, [...element.childNodes])
+      })
+    }
+    rememberLightDom()
+
+    const assert = (condition, message) => {
+      if (!condition) throw new Error(message)
+    }
+    // A task boundary lets MutationObserver and reconciliation microtasks finish.
+    const settle = () => new Promise(resolve => setTimeout(resolve, 0))
+    const record = async (name, run) => {
+      try {
+        await run()
+        window.__liaCalibration.push({ name, matches: true })
+      } catch (error) {
+        window.__liaCalibration.push({ name, matches: false, error: String(error) })
+      }
+    }
+
+    ;(async () => {
+      try {
+        await new Promise((resolve, reject) => {
+          const script = document.createElement("script")
+          script.src = "../dist/index.js"
+          script.onload = resolve
+          script.onerror = () => reject(new Error("Cannot load ../dist/index.js"))
+          document.head.append(script)
+        })
+        if (document.readyState === "loading") {
+          await new Promise(resolve => document.addEventListener("DOMContentLoaded", resolve, { once: true }))
+        }
+        await settle()
+
+        await record("nested dynFlex hosts use their local quiz", () => {
+          for (const [side, rows, placeholder] of [
+            ["left", 5, "Left answer"],
+            ["right", 8, "Right answer"],
+          ]) {
+            const area = areaFor(side + "-host")
+            assert(area && !byId(side + "-host").hidden, side + ": visible textarea missing")
+            assert(area.rows === rows, side + ": wrong rows")
+            assert(area.placeholder === placeholder, side + ": wrong placeholder")
+            assert(byId(side + "-input").getAttribute("aria-hidden") === "true", side + ": native input still exposed")
+          }
+        })
+
+        await record("neighboring quizzes synchronize independently in both directions", () => {
+          const left = areaFor("left-host")
+          const right = areaFor("right-host")
+          assert(left && right, "Both textarea proxies are required")
+          assert(left.value === "Left initial" && right.value === "Right initial", "Initial values belong to the wrong quiz")
+          let inputEvents = 0
+          const onInput = () => { inputEvents += 1 }
+          byId("left-input").addEventListener("input", onInput)
+          left.value = "First line\nSecond line"
+          left.dispatchEvent(new Event("input", { bubbles: true }))
+          byId("left-input").removeEventListener("input", onInput)
+          assert(byId("left-input").value === "First line\u2028Second line", "Multiline answer did not reach the local native input")
+          assert(inputEvents === 1, "Textarea should dispatch one native input event")
+          assert(byId("right-input").value === "Right initial", "Left textarea changed the neighboring answer")
+          byId("right-input").value = "Right updated\u2028Next line"
+          byId("right-input").dispatchEvent(new Event("input", { bubbles: true }))
+          assert(right.value === "Right updated\nNext line", "Native answer did not update its textarea")
+          assert(left.value === "First line\nSecond line", "Right input changed the neighboring textarea")
+        })
+
+        await record("missing and disabled textarea options preserve native inputs", () => {
+          for (const name of ["native", "false", "zero"]) {
+            const input = byId(name + "-input")
+            assert(!areaFor(name + "-host") && byId(name + "-host").hidden, name + ": unexpected textarea")
+            assert(input.getAttribute("aria-hidden") === null && input.style.cssText === "", name + ": native input was hidden")
+          }
+        })
+
+        await record("local option changes update only the matching textarea", async () => {
+          byId("left-quiz").setAttribute("data-llm-textarea", "6")
+          byId("left-quiz").setAttribute("data-llm-placeholder", "Updated left answer")
+          await settle()
+          const left = areaFor("left-host")
+          const right = areaFor("right-host")
+          assert(left?.rows === 6 && left.placeholder === "Updated left answer", "Local option changes were not applied")
+          assert(right?.rows === 8 && right.placeholder === "Right answer", "Local option changes affected the neighbor")
+        })
+
+        await record("dynamically inserted nested quiz is enhanced", async () => {
+          const block = document.createElement("div")
+          block.setAttribute("data-dynflex-block", "1")
+          block.setAttribute("data-elm-owned", "")
+          block.innerHTML = '<div class="lia-quiz" data-llm-textarea="5" data-llm-placeholder="Dynamic answer" data-elm-owned><input id="dynamic-input" class="lia-quiz__input" value="Dynamic initial" style="color: blue" tabindex="2"></div><p data-elm-owned><lia-llm-textarea-host id="dynamic-host" hidden data-elm-owned>elm-owned-placeholder</lia-llm-textarea-host></p>'
+          const column = byId("dynamic-column")
+          column.insertBefore(block, column.lastElementChild)
+          rememberLightDom()
+          await settle()
+          const area = areaFor("dynamic-host")
+          assert(area?.rows === 5 && area.value === "Dynamic initial" && area.placeholder === "Dynamic answer", "Inserted quiz was not enhanced with its own configuration")
+        })
+
+        await record("removing and reinserting the host restores and reconnects its input", async () => {
+          const host = byId("dynamic-host")
+          assert(host, "Dynamic host missing")
+          const parent = host.parentElement
+          const nextSibling = host.nextSibling
+          const input = byId("dynamic-input")
+          host.remove()
+          await settle()
+          assert(input.style.color === "blue" && !input.style.position, "Removing the host did not restore the original style")
+          assert(input.getAttribute("tabindex") === "2" && input.getAttribute("aria-hidden") === null, "Removing the host did not restore native accessibility")
+          input.value = "While detached"
+          parent.insertBefore(host, nextSibling)
+          await settle()
+          const area = areaFor("dynamic-host")
+          assert(area?.value === "While detached" && !host.hidden, "Reinserted host did not reconnect")
+          assert(host.shadowRoot.querySelectorAll("textarea").length === 1, "Reinserted host duplicated its textarea")
+          area.value = "After reinsertion"
+          area.dispatchEvent(new Event("input", { bubbles: true }))
+          assert(input.value === "After reinsertion", "Reinserted textarea did not synchronize")
+          assert(byId("right-input").value === "Right updated\u2028Next line", "Reinsertion changed the neighboring answer")
+        })
+
+        await record("disabling an enhanced quiz restores the native input", async () => {
+          byId("left-quiz").setAttribute("data-llm-textarea", "false")
+          await settle()
+          assert(!areaFor("left-host") && byId("left-host").hidden, "Disabled quiz still has a textarea")
+          assert(byId("left-input").style.cssText === "" && byId("left-input").getAttribute("aria-hidden") === null, "Disabled quiz did not restore its native input")
+          byId("left-quiz").setAttribute("data-llm-textarea", "5")
+          await settle()
+          assert(areaFor("left-host")?.rows === 5, "Reenabled quiz did not recreate its textarea")
+        })
+
+        await record("Elm-owned light DOM child lists retain node identity and order", () => {
+          for (const [element, nodes] of lightDom) {
+            assert(element.childNodes.length === nodes.length && nodes.every((node, index) => element.childNodes[index] === node), "Light DOM children changed for " + (element.id || element.tagName))
+          }
+        })
+      } catch (error) {
+        window.__liaCalibrationError = String(error)
+      } finally {
+        window.__liaCalibrationDone = true
+      }
+    })()
+  </script>
+</body>
