@@ -458,7 +458,7 @@ Der echte Aufgabenwortlaut wird als zweiter Makroparameter an die Auswertung üb
 ### Aufruf und Optionen
 
 Der Makroaufruf steht in derselben Zeile wie die öffnenden drei Backticks des `text`-Blocks. Die
-Grundform lautet ``@LLMQuiz(Schwellenwert[;Optionen],`Aufgabenwortlaut`)``.
+Grundform lautet `@LLMQuiz(Schwellenwert[;Optionen],Aufgabenwortlaut)`.
 
 Der erste Makroparameter beginnt immer mit dem verpflichtenden Schwellenwert. Weitere Optionen
 folgen darin, jeweils durch ein Semikolon getrennt. Der zweite Makroparameter ist der vollständige
@@ -479,12 +479,20 @@ die Musterlösung oder der Kriterienblock.
 | `maxthinkingtime` | `0s`, `5s`, `10s`, `15s`, `20s`, `30s` | im adaptiven Zweitlauf `15s` | Begrenzt ausschließlich die zusätzliche Denkzeit, nicht Modellstart oder Grundprüfung; `0s` deaktiviert den Thinking-Lauf |
 | `maxthinkingtokens` | `low`, `medium`, `high`, `ultra`, `extreme` | im adaptiven Zweitlauf `medium` | Begrenzt das Thinking-Ausgabebudget auf 256, 512, 768, 1024 beziehungsweise 2048 Tokens |
 
-Mit den Standardwerten für alle optionalen Einträge genügt die Minimalform
-``@LLMQuiz(0.66,`Beschreibe den Verlauf.`)``. Die empfohlene benannte Form lautet beispielsweise
-``@LLMQuiz(0.66;solution=1;feedback=1,`Beschreibe den Verlauf.`)``.
+Mit den Standardwerten für alle optionalen Einträge genügt die Minimalform; die empfohlene
+benannte Form ergänzt sie um `solution` und `feedback`:
+
+```` markdown
+@LLMQuiz(0.66,`Beschreibe den Verlauf.`)
+@LLMQuiz(0.66;solution=1;feedback=1,`Beschreibe den Verlauf.`)
+````
 
 Für `solution`, `feedback` und `operator` existiert zusätzlich die Kurzform in genau dieser
-Reihenfolge: ``@LLMQuiz(0.66;1;1;beschreiben,`Beschreibe den Verlauf.`)``.
+Reihenfolge:
+
+```` markdown
+@LLMQuiz(0.66;1;1;beschreiben,`Beschreibe den Verlauf.`)
+````
 
 Alle übrigen Optionen sind nur benannt verfügbar. Optionsnamen sind nicht von Groß- und
 Kleinschreibung abhängig und dürfen in beliebiger Reihenfolge stehen. Benannte und positionale
