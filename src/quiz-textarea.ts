@@ -57,7 +57,7 @@ function isEnabled(owner: HTMLElement): boolean {
   return value !== "false" && value !== "0"
 }
 
-function quizForHost(host: HTMLElement): HTMLElement | null {
+export function quizForHost(host: HTMLElement): HTMLElement | null {
   const containingQuiz = host.closest<HTMLElement>(".lia-quiz")
   if (containingQuiz) return containingQuiz
 

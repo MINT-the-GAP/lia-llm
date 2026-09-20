@@ -1,6 +1,6 @@
 <!--
 author:      MINT-the-GAP, Martin Lommatzsch
-version:     0.6.5
+version:     0.6.6
 language:    de
 narrator:    Deutsch Female
 comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
@@ -27,389 +27,15 @@ attribute:   [WebLLM](https://webllm.mlc.ai/docs/) by MLC is licensed under
 
 @LLMQuiz_
 <script output="lia-llm-result-@0">
-const feedbackId = "lia-llm-feedback-@0"
-const activityId = "lia-llm-activity-@0"
-const solutionVariantId = "lia-llm-solution-variant-@0"
-const runId = activityId + "-" + Date.now().toString(36) + "-" +
-  Math.random().toString(36).slice(2)
-const evaluationController = new AbortController()
-const rememberedCheckActivation = window.__liaLlmLastQuizCheckActivation
-if (rememberedCheckActivation) {
-  delete window.__liaLlmLastQuizCheckActivation
-}
-let activeCheckButton =
-  typeof document !== "undefined" &&
-  typeof HTMLButtonElement !== "undefined" &&
-  document.activeElement instanceof HTMLButtonElement &&
-  document.activeElement.classList.contains("lia-quiz__check")
-    ? document.activeElement
-    : typeof HTMLButtonElement !== "undefined" &&
-        rememberedCheckActivation?.button instanceof HTMLButtonElement &&
-        rememberedCheckActivation.button.isConnected &&
-        Date.now() - rememberedCheckActivation.observedAt < 2000
-      ? rememberedCheckActivation.button
-      : null
-let checkButtonInitialDisabled = false
-let checkButtonInitialAriaBusy = null
-const activeQuizRuns =
-  window.__liaLlmActiveQuizRuns instanceof Map
-    ? window.__liaLlmActiveQuizRuns
-    : new Map()
-window.__liaLlmActiveQuizRuns = activeQuizRuns
-const optionSource = `@'1`
-const question = `@'2`
-const referenceSource = `@'3`
-const answer = `@'input`.replace(/\u2028/gu, "\n")
-let active = true
-let finished = false
-let feedbackEnabled = false
-let referenceVariants = []
-let criteriaBlock = null
-let evaluationCriteria
-let evaluationThresholds = null
-let quizOptions = null
-
-function clearActivity() {
-  try {
-    window.LiaLLM?.showActivity?.(activityId, runId, "")
-  } catch {}
-}
-
-function clearSolutionVariant() {
-  try {
-    window.LiaLLM?.clearSolutionVariant?.(solutionVariantId, runId)
-  } catch {}
-}
-
-function setCheckButtonBusy(busy) {
-  if (!activeCheckButton?.isConnected) return
-  activeCheckButton.disabled = busy || checkButtonInitialDisabled
-  if (busy) {
-    activeCheckButton.setAttribute("aria-busy", "true")
-  } else if (checkButtonInitialAriaBusy === null) {
-    activeCheckButton.removeAttribute("aria-busy")
-  } else {
-    activeCheckButton.setAttribute("aria-busy", checkButtonInitialAriaBusy)
-  }
-}
-
-function releaseQuizRun() {
-  if (activeQuizRuns.get(activityId) !== supersedeEvaluation) return
-  activeQuizRuns.delete(activityId)
-  try {
-    setCheckButtonBusy(false)
-  } catch {}
-}
-
-function showLearnerFeedback(feedback, languageCheck) {
-  if (!active) return
-  const visibleFeedback = feedbackEnabled ? feedback : null
-  const displayOptions =
-    visibleFeedback?.orthographyCorrection || languageCheck
-      ? {
-          ...(visibleFeedback?.orthographyCorrection
-            ? { orthographyCorrection: visibleFeedback.orthographyCorrection }
-            : {}),
-          ...(languageCheck ? { languageCheck } : {})
-        }
-      : undefined
-  try {
-    window.LiaLLM?.showFeedback?.(
-      feedbackId,
-      visibleFeedback?.message ?? "",
-      displayOptions
-    )
-  } catch {}
-}
-
-function stoppedError() {
-  const error = new Error("Die Sprachprüfung wurde beendet.")
-  error.name = "AbortError"
-  return error
-}
-
-function finishQuiz(value) {
-  if (!active || finished) return
-  finished = true
-  releaseQuizRun()
-  clearActivity()
-  send.lia(value)
-}
-
-function finishUnassessed(message) {
-  if (!active || finished) return
-  finished = true
-  releaseQuizRun()
-  clearActivity()
-  clearSolutionVariant()
-  try {
-    window.LiaLLM?.showFeedback?.(feedbackId, "")
-  } catch {}
-  send.lia(message, [], false)
-}
-
-function finishTechnicalError(error) {
-  const message = error instanceof Error ? error.message : String(error)
-  finishUnassessed(message)
-}
-
-function abortEvaluation() {
-  if (finished) return
-  active = false
-  finished = true
-  evaluationController.abort()
-  releaseQuizRun()
-  clearActivity()
-  clearSolutionVariant()
-  try {
-    window.LiaLLM?.showFeedback?.(feedbackId, "")
-  } catch {}
-  return true
-}
-
-function restoreCheckButtonFocus() {
-  if (activeCheckButton?.isConnected && !activeCheckButton.disabled) {
-    try {
-      activeCheckButton.focus({ preventScroll: true })
-    } catch {}
-  }
-}
-
-function stopEvaluation() {
-  abortEvaluation()
-}
-
-function stopWaitingState() {
-  if (typeof send.stop === "function") send.stop()
-  else send.lia("LIA: stop")
-}
-
-function supersedeEvaluation() {
-  if (!abortEvaluation()) return
-  stopWaitingState()
-}
-
-function cancelEvaluation() {
-  if (!abortEvaluation()) return
-  stopWaitingState()
-  restoreCheckButtonFocus()
-  if (typeof queueMicrotask === "function") {
-    queueMicrotask(restoreCheckButtonFocus)
-  }
-}
-
-Promise.resolve()
-  .then(() => {
-    const previousQuizRun = activeQuizRuns.get(activityId)
-    if (typeof previousQuizRun === "function") previousQuizRun()
-    checkButtonInitialDisabled = activeCheckButton?.disabled ?? false
-    checkButtonInitialAriaBusy =
-      activeCheckButton?.getAttribute("aria-busy") ?? null
-    activeQuizRuns.set(activityId, supersedeEvaluation)
-    setCheckButtonBusy(true)
-    try {
-      window.LiaLLM?.showFeedback?.(feedbackId, "")
-      window.LiaLLM?.showActivity?.(
-        activityId,
-        runId,
-        "selecting-model",
-        { onCancel: cancelEvaluation }
-      )
-      window.LiaLLM?.setSolutionVariant?.(solutionVariantId, runId)
-    } catch {}
-    send.handle("stop", stopEvaluation)
-
-    if (!window.LiaLLM) {
-      throw new Error("lia-llm konnte nicht geladen werden.")
-    }
-    if (window.LiaLLM.version !== "0.6.5") {
-      throw new Error(`lia-llm 0.6.5 wird benötigt; geladen ist ${window.LiaLLM.version}.`)
-    }
-
-    const options = window.LiaLLM.parseMacroOptions(optionSource)
-    quizOptions = options
-    criteriaBlock = window.LiaLLM.parseCriteriaBlock(referenceSource) ?? null
-    if (options.coverage !== undefined && !criteriaBlock) {
-      throw new Error(
-        "Die Option coverage ist nur mit einem Kriterienblock zulässig."
-      )
-    }
-    evaluationCriteria =
-      options.coverage === undefined
-        ? criteriaBlock?.criteria
-        : criteriaBlock.criteria.map(criterion => ({
-            ...criterion,
-            required: false
-          }))
-    evaluationThresholds = {
-      criterionThreshold: options.passThreshold,
-      ...(options.coverage !== undefined
-        ? { passThreshold: options.coverage }
-        : {})
-    }
-    referenceVariants = window.LiaLLM.parseReferenceVariants(
-      criteriaBlock?.reference ?? referenceSource
-    )
-    feedbackEnabled = options.feedback
-    if (criteriaBlock && options.operator) {
-      throw new Error(
-        "Der atomare Aussagenabgleich prüft Inhalte ohne technischen Operator. Entferne operator=...; das Operatorwort darf im Aufgabenwortlaut stehen bleiben."
-      )
-    }
-    return window.LiaLLM.evaluate({
-      question,
-      answer,
-      reference: referenceVariants[0],
-      referenceVariants: referenceVariants.slice(1),
-      assessmentEngine: options.assessmentEngine,
-      operator: options.operator ?? undefined,
-      criteria: evaluationCriteria,
-      ...evaluationThresholds
-    }, {
-      signal: evaluationController.signal,
-      maxThinkingTimeMs: options.maxThinkingTimeMs,
-      maxThinkingTokens: options.maxThinkingTokens,
-      onProgress: progress => {
-        if (!active || finished) return
-        window.LiaLLM?.showActivity?.(activityId, runId, progress.phase, {
-          message: progress.message,
-          thinkingTimeLimitMs: progress.thinkingTimeLimitMs,
-          thinkingTimeRemainingMs: progress.thinkingTimeRemainingMs,
-          onCancel: cancelEvaluation
-        })
-      }
-    })
-  })
-  .then(result => {
-    if (!active) return
-    if (result.status === "uncertain") {
-      const feedback =
-        window.LiaLLM?.feedbackForResult?.(result, "de-DE") ?? null
-      finishUnassessed(
-        feedback?.message ??
-          "Die Antwort konnte gerade nicht eindeutig bewertet werden. Versuche die Prüfung erneut."
-      )
-      return
-    }
-    if (result.passed) {
-      const selectedReferenceIndex =
-        Number.isInteger(result.selectedReferenceIndex) &&
-        result.selectedReferenceIndex >= 0 &&
-        result.selectedReferenceIndex < referenceVariants.length
-          ? result.selectedReferenceIndex
-          : 0
-      try {
-        window.LiaLLM?.setSolutionVariant?.(
-          solutionVariantId,
-          runId,
-          selectedReferenceIndex
-        )
-      } catch {}
-    } else {
-      clearSolutionVariant()
-    }
-    const feedback = feedbackEnabled
-      ? window.LiaLLM?.feedbackForResult?.(result, "de-DE") ?? null
-      : null
-    const languageCheck =
-      feedbackEnabled &&
-      quizOptions &&
-      (quizOptions.rechtschreibung || quizOptions.satzbau)
-        ? {
-            runId,
-            kind:
-              quizOptions.rechtschreibung && quizOptions.satzbau
-                ? "language"
-                : quizOptions.rechtschreibung
-                  ? "orthography"
-                  : "syntax",
-            run: async signal => {
-              if (!active) throw stoppedError()
-              const languageAnalysis = await window.LiaLLM.evaluateLanguage({
-                question,
-                answer,
-                reference: referenceVariants[0],
-                referenceVariants: referenceVariants.slice(1),
-                assessmentEngine: "quality",
-                operator: quizOptions.operator ?? undefined,
-                criteria: evaluationCriteria,
-                ...evaluationThresholds,
-                languageAnalysis: {
-                  spelling: quizOptions.rechtschreibung,
-                  syntax: quizOptions.satzbau
-                }
-              }, { signal })
-              if (!active) throw stoppedError()
-              const languageFeedback =
-                window.LiaLLM.feedbackForResult(
-                  { ...result, languageAnalysis },
-                  "de-DE"
-                )
-              return {
-                completed: languageAnalysis?.status === "completed",
-                message: languageFeedback?.message ?? "",
-                ...(languageFeedback?.orthographyCorrection
-                  ? {
-                      orthographyCorrection:
-                        languageFeedback.orthographyCorrection
-                    }
-                  : {})
-              }
-            }
-          }
-          : undefined
-    showLearnerFeedback(feedback, languageCheck)
-    finishQuiz(result.status === "passed" ? "true" : "false")
-  })
-  .catch(error => {
-    if (!active) return
-    clearSolutionVariant()
-    const feedback = window.LiaLLM?.feedbackForError?.(error, "de-DE") ?? null
-    if (feedback) {
-      finishUnassessed(feedback.message)
-      return
-    }
-    finishTechnicalError(error)
-  })
-
-"LIA: wait"
+window.LiaLLM.runQuiz("@0", `@'1`, `@'2`, window.LiaLLM.getQuizReference("@0"), `@'input`, send)
 </script>
 <lia-llm-load-overlay-host></lia-llm-load-overlay-host>
 <lia-llm-textarea-host hidden></lia-llm-textarea-host>
-<lia-llm-quiz-use hidden></lia-llm-quiz-use>
+<lia-llm-quiz-use id="lia-llm-quiz-@0" hidden></lia-llm-quiz-use>
 <lia-llm-activity id="lia-llm-activity-@0" hidden></lia-llm-activity>
 <lia-llm-feedback id="lia-llm-feedback-@0"></lia-llm-feedback>
 <script style="display:block" modify="false">
-const solutionResult = "@input(`lia-llm-result-@0`)"
-const solutionOptions = window.LiaLLM?.parseMacroOptions?.(`@'1`)
-const solutionVariantId = "lia-llm-solution-variant-@0"
-const solutionReferenceSource = `@'3`
-const solutionCriteriaBlock =
-  window.LiaLLM?.parseCriteriaBlock?.(solutionReferenceSource)
-const resultSeparator =
-  "\n\n<lia-llm-result-separator></lia-llm-result-separator>"
-
-if (solutionResult === "true" && solutionOptions?.solution) {
-  const solutionReferenceVariants =
-    window.LiaLLM.parseReferenceVariants(
-      solutionCriteriaBlock?.reference ?? solutionReferenceSource
-    )
-  const storedReferenceIndex =
-    window.LiaLLM?.getSolutionVariant?.(solutionVariantId)
-  const selectedReferenceIndex =
-    Number.isInteger(storedReferenceIndex) &&
-    storedReferenceIndex >= 0 &&
-    storedReferenceIndex < solutionReferenceVariants.length
-      ? storedReferenceIndex
-      : 0
-  send.liascript(
-    solutionReferenceVariants[selectedReferenceIndex] + resultSeparator
-  )
-} else if (solutionResult === "true" || solutionResult === "false") {
-  send.liascript(resultSeparator)
-} else {
-  send.clear()
-}
+window.LiaLLM.renderQuizSolution("@0", `@'1`, `@'3`, "@input(`lia-llm-result-@0`)", send)
 </script>
 @end
 -->
@@ -1236,6 +862,15 @@ Block zwischen `BEGIN LIA-LLM DEBUGNOTIZ` und `END LIA-LLM DEBUGNOTIZ` mitsenden
 Der reproduzierbare Cold-/Neustart-/Offline-Härtetest samt Schulnetzbedingungen ist in
 [`test/BROWSER-HARDENING.md`](test/BROWSER-HARDENING.md) dokumentiert.
 
+Seit Version 0.6.6 übergibt `@LLMQuiz_` nur noch die Quizdaten und LiaScripts `send`
+an die gemeinsame Runtime in `src/quiz-runtime.ts` (gebündelt in `dist/index.js`).
+Die reaktive Lösungsanzeige registriert den vollständigen Referenztext einmal pro
+Quiz; die Auswertung liest dieselbe Quelle aus der Runtime. Dadurch werden weder
+die Steuerlogik noch zwei Kopien der Referenz in jeden Codeblock expandiert; die öffentliche Syntax bleibt
+unverändert. Der Browser-Regressions-Test mit sechs langen Aufgaben auf einer Folie
+und dem unveränderten Wochenaufgabenkurs ist in
+[`test/QUIZ-RUNTIME.md`](test/QUIZ-RUNTIME.md) beschrieben.
+
 ## Probieraufgabe
 
 Hier kann die Aufgabe direkt ausprobiert werden. Die Musterlösung bleibt zunächst verborgen und
@@ -1266,8 +901,8 @@ Eine umgekehrte Kernaussage muss falsch bleiben:
 
 > Eis schwimmt, weil es eine höhere Dichte als flüssiges Wasser besitzt.
 
-Beim Folienwechsel beendet der Makro-`stop`-Handler die Ausgabe und die aktive Auswertung der
-verlassenen Aufgabe. Vollständig geladene Cache-Artefakte bleiben erhalten. Eine noch gemeinsam
+Beim Folienwechsel oder Zurücksetzen beendet die Runtime über LiaScripts `stop`-Handler
+und den Lebenszyklus des Quiz-Elements die Ausgabe und die aktive Auswertung der verlassenen Aufgabe. Vollständig geladene Cache-Artefakte bleiben erhalten. Eine noch gemeinsam
 genutzte Quality-Vorbereitung läuft für andere aktive Aufgaben weiter; ohne weiteren Interessenten
 wird sie abgebrochen. Nur eine nach dem oben beschriebenen Zeit-Fallback bereits bewusst losgelöste
 Hintergrundvorbereitung läuft unabhängig vom beendeten Quiz weiter. Dadurch erscheint kein

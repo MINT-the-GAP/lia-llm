@@ -524,8 +524,36 @@ export interface DebugReportOptions {
   print?: boolean
 }
 
+/** LiaScript's quiz script bridge; supplied by each individual macro call. */
+export interface LiaQuizSend {
+  lia(value: string, details?: unknown[], success?: boolean): void
+  handle(event: "stop", callback: () => void): void
+  stop?(): void
+}
+
+export interface LiaQuizSolutionSend {
+  liascript(source: string): void
+  clear(): void
+}
+
 export interface LiaLLMApi {
   readonly version: string
+  getQuizReference(id: string): string
+  runQuiz(
+    id: string,
+    options: string,
+    question: string,
+    reference: string,
+    input: string,
+    send: LiaQuizSend,
+  ): "LIA: wait"
+  renderQuizSolution(
+    id: string,
+    options: string,
+    reference: string,
+    result: string,
+    send: LiaQuizSolutionSend,
+  ): void
   configure(config: Partial<RuntimeConfig>): RuntimeStatus
   preload(): Promise<RuntimeStatus>
   evaluate(

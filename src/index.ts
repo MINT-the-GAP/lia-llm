@@ -19,6 +19,7 @@ import { registerLoadOverlay } from "./load-overlay.ts"
 import { parseMacroOptions } from "./macro-options.ts"
 import { registerQuizTextareas } from "./quiz-textarea.ts"
 import { registerQuizPresenceElement } from "./quiz-presence-element.ts"
+import { getQuizReference, renderQuizSolution, runQuiz, stopQuiz } from "./quiz-runtime.ts"
 import { QualityEvaluator } from "./quality-evaluator.ts"
 import {
   parseCriteria,
@@ -35,7 +36,7 @@ import {
 } from "./solution-element.ts"
 import type { LiaLLMApi } from "./types.ts"
 
-const VERSION = "0.6.5"
+const VERSION = "0.6.6"
 
 interface LiaLLMGlobal {
   LiaLLM?: LiaLLMApi
@@ -83,6 +84,9 @@ if (!api) {
 
   api = {
     version: VERSION,
+    getQuizReference,
+    runQuiz: (...args) => runQuiz(activeApi, ...args),
+    renderQuizSolution: (...args) => renderQuizSolution(activeApi, ...args),
     configure: (config) => evaluator.configure(config),
     preload: () => evaluator.preload(),
     evaluate: (request, options) => evaluator.evaluate(request, options),
@@ -124,9 +128,12 @@ registerDebugDiagnostics(activeApi)
 registerLoadOverlay(activeApi)
 registerQuizTextareas()
 registerActivityElement()
-registerQuizPresenceElement(() => {
-  void activeApi.preload().catch(() => undefined)
-})
+registerQuizPresenceElement(
+  () => {
+    void activeApi.preload().catch(() => undefined)
+  },
+  stopQuiz,
+)
 registerFeedbackElement()
 registerSolutionElement()
 registerResultSeparatorElement()

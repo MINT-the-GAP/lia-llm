@@ -1,6 +1,6 @@
 {
   "name": "lia-llm",
-  "version": "0.6.5",
+  "version": "0.6.6",
   "private": true,
   "description": "Local semantic assessment for open-ended LiaScript questions",
   "license": "MIT",
@@ -13,6 +13,7 @@
     "typecheck": "npm run prepare:webllm && tsc --noEmit",
     "pretest": "npm run prepare:webllm",
     "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test test/scoring.test.mts",
+    "test:browser-quiz-runtime": "node test/run-browser-quiz-runtime.mjs",
     "test:browser-smoke": "node test/run-browser-calibration.mjs test/browser-api-smoke.html cpu",
     "test:browser-textarea": "node test/run-browser-calibration.mjs test/browser-quiz-textarea.html cpu",
     "test:browser-criteria": "node test/run-browser-calibration.mjs test/browser-criteria-calibration.html cpu",

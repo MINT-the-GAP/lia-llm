@@ -79,6 +79,7 @@ import {
   toQuizInputValue,
 } from "../src/quiz-textarea.ts"
 import { parseMacroOptions } from "../src/macro-options.ts"
+import { getQuizReference, renderQuizSolution, runQuiz, stopQuiz } from "../src/quiz-runtime.ts"
 import {
   normalizeAdaptiveThinkingLimits,
   normalizeThinkingLimits,
@@ -152,6 +153,11 @@ import {
   validateOperatorJudgeOutput,
 } from "../src/quality-evaluator.ts"
 import type {
+  ActivityDisplayOptions,
+  FeedbackDisplayOptions,
+  LiaLLMApi,
+  LiaQuizSend,
+  LiaQuizSolutionSend,
   Criterion,
   CriterionInput,
   CriterionResult,
@@ -12378,34 +12384,31 @@ type LLMQuizValidatorRunner = (
   answerInput: string,
 ) => Promise<void>
 
+let quizRuntimeTestId = 0
+
 function createLLMQuizValidatorRunner(): LLMQuizValidatorRunner {
-  const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8")
-  const macro = readme.match(/\n@LLMQuiz_\n([\s\S]*?)\n@end/u)?.[1]
-  const validatorScript = macro?.match(
-    /<script output="lia-llm-result-@0">\n([\s\S]*?)\n<\/script>/u,
-  )?.[1]
-  assert.ok(validatorScript)
-
-  const executable = validatorScript
-    .replace(/^const optionSource = .*$/mu, "const optionSource = optionSourceInput")
-    .replace(/^const question = .*$/mu, "const question = questionInput")
-    .replace(/^const referenceSource = .*$/mu, "const referenceSource = referenceSourceInput")
-    .replace(/^const answer = .*$/mu, "const answer = answerInput")
-    .replace(/^Promise\.resolve\(\)$/mu, "return Promise.resolve()")
-
-  assert.doesNotMatch(executable, /@'(?:1|2|3|input)/u)
-  return new Function(
-    "window",
-    "send",
-    "optionSourceInput",
-    "questionInput",
-    "referenceSourceInput",
-    "answerInput",
-    executable,
-  ) as LLMQuizValidatorRunner
+  const id = "unit-quiz-" + String(++quizRuntimeTestId)
+  return async (
+    windowValue,
+    sendValue,
+    options,
+    question,
+    reference,
+    answer,
+  ) => new Promise<void>((resolve) => {
+    const { LiaLLM: api } = windowValue as { LiaLLM: LiaLLMApi }
+    const send = sendValue as LiaQuizSend
+    assert.equal(runQuiz(api, id, options, question, reference, answer, {
+      ...send,
+      lia: (...args) => {
+        send.lia(...args)
+        resolve()
+      },
+    }), "LIA: wait")
+  })
 }
 
-test("the public version remains pinned exactly to 0.6.5", () => {
+test("the public version remains pinned exactly to 0.6.6", () => {
   const packageJson = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   ) as { version?: string }
@@ -12420,14 +12423,14 @@ test("the public version remains pinned exactly to 0.6.5", () => {
     "utf8",
   )
 
-  assert.equal(packageJson.version, "0.6.5")
-  assert.equal(packageLock.version, "0.6.5")
-  assert.equal(packageLock.packages?.[""]?.version, "0.6.5")
-  assert.match(entry, /const VERSION = "0\.6\.5"/u)
-  assert.match(bundle, /let [\w$]+="0\.6\.5",[\w$]+=globalThis/u)
+  assert.equal(packageJson.version, "0.6.6")
+  assert.equal(packageLock.version, "0.6.6")
+  assert.equal(packageLock.packages?.[""]?.version, "0.6.6")
+  assert.match(entry, /const VERSION = "0\.6\.6"/u)
+  assert.match(bundle, /"0\.6\.6"/u)
   assert.doesNotMatch(bundle, /let [\w$]+="0\.6\.4",[\w$]+=globalThis/u)
-  assert.match(browserSmoke, /window\.LiaLLM\.version === "0\.6\.5"/u)
-  assert.match(readme, /^version:\s+0\.6\.5$/mu)
+  assert.match(browserSmoke, /window\.LiaLLM\.version === "0\.6\.6"/u)
+  assert.match(readme, /^version:\s+0\.6\.6$/mu)
   assert.match(readme, /^script:\s+\.\/dist\/index\.js$/mu)
   assert.doesNotMatch(
     readme,
@@ -12484,7 +12487,7 @@ test("LLMQuiz exposes a canonical wrapper and a compatible question alias", () =
   assert.match(usage, /### Aufruf und Optionen/u)
   assert.match(
     usage,
-    /@LLMQuiz\(Schwellenwert\[;Optionen\],`Aufgabenwortlaut`\)/u,
+    /@LLMQuiz\(Schwellenwert\[;Optionen\],`?Aufgabenwortlaut`?\)/u,
   )
   const optionRows = usage
     .split("\n")
@@ -12524,84 +12527,6 @@ test("LLMQuiz exposes a canonical wrapper and a compatible question alias", () =
   ])
   assert.ok(usage.indexOf("### Aufruf und Optionen") < usage.indexOf("Aufgabe 1:"))
 
-  assert.match(readme, /\.feedbackForResult\?\.\(result, "de-DE"\)/u)
-  assert.match(readme, /\.feedbackForError\?\.\(error, "de-DE"\)/u)
-  assert.match(readme, /\.showFeedback\?\.\(feedbackId,/u)
-  assert.match(readme, /\.showActivity\?\.\(activityId, runId,/u)
-  assert.match(
-    readme,
-    /\.showActivity\?\.\(\s*activityId,\s*runId,\s*"selecting-model",\s*\{ onCancel: cancelEvaluation \}\s*\)/u,
-  )
-  assert.match(readme, /parseMacroOptions\(optionSource\)/u)
-  assert.match(
-    readme,
-    /function finishUnassessed\(message\)[\s\S]*?send\.lia\(message, \[\], false\)/u,
-  )
-  assert.match(
-    readme,
-    /if \(result\.status === "uncertain"\)[\s\S]*?finishUnassessed\(/u,
-  )
-  assert.match(
-    readme,
-    /finishQuiz\(result\.status === "passed" \? "true" : "false"\)/u,
-  )
-  assert.match(
-    readme,
-    /function finishTechnicalError\(error\)[\s\S]*?finishUnassessed\(message\)/u,
-  )
-  assert.match(readme, /send\.handle\("stop",/u)
-  assert.match(readme, /evaluationController\.abort\(\)/u)
-  assert.match(readme, /window\.__liaLlmActiveQuizRuns instanceof Map/u)
-  assert.match(readme, /activeQuizRuns\.get\(activityId\) !== supersedeEvaluation/u)
-  assert.match(readme, /previousQuizRun\(\)/u)
-  assert.match(
-    readme,
-    /activeCheckButton\.disabled = busy \|\| checkButtonInitialDisabled/u,
-  )
-  assert.match(readme, /checkButtonInitialAriaBusy === null/u)
-  assert.match(readme, /signal: evaluationController\.signal/u)
-  assert.match(readme, /maxThinkingTimeMs: options\.maxThinkingTimeMs/u)
-  assert.match(readme, /maxThinkingTokens: options\.maxThinkingTokens/u)
-  assert.match(readme, /onProgress: progress =>/u)
-  assert.match(readme, /message: progress\.message/u)
-  assert.match(readme, /thinkingTimeLimitMs: progress\.thinkingTimeLimitMs/u)
-  assert.match(
-    readme,
-    /thinkingTimeRemainingMs: progress\.thinkingTimeRemainingMs/u,
-  )
-  assert.match(readme, /if \(!active \|\| finished\) return/u)
-  assert.match(readme, /criterionThreshold: options\.passThreshold/u)
-  assert.match(readme, /assessmentEngine:\s*options\.assessmentEngine/u)
-  assert.match(readme, /operator: options\.operator \?\? undefined/u)
-  assert.match(
-    readme,
-    /criteriaBlock = window\.LiaLLM\.parseCriteriaBlock\(referenceSource\) \?\? null/u,
-  )
-  assert.match(readme, /if \(criteriaBlock && options\.operator\)/u)
-  assert.match(
-    readme,
-    /Der atomare Aussagenabgleich prüft Inhalte ohne technischen Operator/u,
-  )
-  const initialEvaluationStart = readme.indexOf(
-    "return window.LiaLLM.evaluate({",
-  )
-  const initialEvaluationEnd = readme.indexOf("}, {", initialEvaluationStart)
-  assert.ok(initialEvaluationStart >= 0 && initialEvaluationEnd > initialEvaluationStart)
-  assert.doesNotMatch(
-    readme.slice(initialEvaluationStart, initialEvaluationEnd),
-    /languageAnalysis/u,
-  )
-  assert.match(readme, /window\.LiaLLM\.evaluateLanguage\(\{/u)
-  assert.match(readme, /spelling: quizOptions\.rechtschreibung/u)
-  assert.match(readme, /syntax: quizOptions\.satzbau/u)
-  assert.match(
-    readme,
-    /quizOptions\.rechtschreibung && quizOptions\.satzbau\s*\? "language"/u,
-  )
-  assert.match(
-    readme,
-    /: quizOptions\.rechtschreibung\s*\? "orthography"\s*: "syntax"/u,
-  )
   assert.match(readme, /\*\*Grammatik und Satzbau prüfen\*\*/u)
   assert.match(readme, /Akkusativ statt Dativ/u)
   assert.match(readme, /bis zu 512 Ausgabetokens/u)
@@ -12623,13 +12548,6 @@ test("LLMQuiz exposes a canonical wrapper and a compatible question alias", () =
     /bloße Ähnlichkeit des Wortstamms reicht ausdrücklich nicht/u,
   )
   assert.match(readme, /null gemeldeten Grammatikfehlern.*kein.*Patchlauf/su)
-  assert.match(readme, /showLearnerFeedback\(feedback, languageCheck\)/u)
-  assert.ok(
-    readme.indexOf("showLearnerFeedback(feedback, languageCheck)") <
-      readme.indexOf(
-        'finishQuiz(result.status === "passed" ? "true" : "false")',
-      ),
-  )
   assert.match(
     readme,
     /<lia-llm-load-overlay-host><\/lia-llm-load-overlay-host>/u,
@@ -12638,31 +12556,6 @@ test("LLMQuiz exposes a canonical wrapper and a compatible question alias", () =
     readme,
     /operator=erklaeren;Rechtschreibung=1;Satzbau=1,`Erkläre, warum/u,
   )
-  assert.match(readme, /const question = `@'2`/u)
-  assert.match(readme, /const referenceSource = `@'3`/u)
-  assert.match(
-    readme,
-    /referenceVariants = window\.LiaLLM\.parseReferenceVariants\(\s*criteriaBlock\?\.reference \?\? referenceSource\s*\)/u,
-  )
-  assert.match(readme, /reference:\s*referenceVariants\[0\]/u)
-  assert.match(
-    readme,
-    /referenceVariants:\s*referenceVariants\.slice\(1\)/u,
-  )
-  assert.match(readme, /result\.selectedReferenceIndex/u)
-  assert.match(
-    readme,
-    /\.setSolutionVariant\?\.\(\s*solutionVariantId,\s*runId,\s*selectedReferenceIndex/u,
-  )
-  assert.match(
-    readme,
-    /\.clearSolutionVariant\?\.\(solutionVariantId, runId\)/u,
-  )
-  assert.match(readme, /return window\.LiaLLM\.evaluate\(\{\s*question,/u)
-  assert.doesNotMatch(readme, /question:\s*"LiaScript-Freitextaufgabe"/u)
-  assert.doesNotMatch(readme, /feedbackEnabled && !result\.passed/u)
-  assert.doesNotMatch(readme, /send\.lia\(feedback\.message, \[\], false\)/u)
-
   const macro = readme.match(
     /\n@LLMQuiz_\n([\s\S]*?)\n@end/u,
   )?.[1]
@@ -12685,45 +12578,15 @@ test("LLMQuiz exposes a canonical wrapper and a compatible question alias", () =
   )
   assert.match(
     macro,
-    /<lia-llm-quiz-use hidden><\/lia-llm-quiz-use>/u,
+    /<lia-llm-quiz-use[^>]* hidden><\/lia-llm-quiz-use>/u,
   )
   assert.doesNotMatch(macro, /^\*{16,}$/mu)
   assert.doesNotMatch(macro, /showSolution/u)
   assert.doesNotMatch(macro, /<lia-llm-solution/u)
-  assert.match(
-    macro,
-    /const solutionResult = "@input\(`lia-llm-result-@0`\)"/u,
-  )
-  assert.match(
-    macro,
-    /solutionResult === "true" && solutionOptions\?\.solution/u,
-  )
-  assert.match(macro, /const solutionReferenceSource = `@'3`/u)
-  assert.match(
-    macro,
-    /window\.LiaLLM\?\.parseCriteriaBlock\?\.\(solutionReferenceSource\)/u,
-  )
-  assert.match(
-    macro,
-    /window\.LiaLLM\.parseReferenceVariants\(\s*solutionCriteriaBlock\?\.reference \?\? solutionReferenceSource\s*\)/u,
-  )
-  assert.match(
-    macro,
-    /window\.LiaLLM\?\.getSolutionVariant\?\.\(solutionVariantId\)/u,
-  )
-  assert.match(
-    macro,
-    /<lia-llm-result-separator><\/lia-llm-result-separator>/u,
-  )
-  assert.match(
-    macro,
-    /solutionReferenceVariants\[selectedReferenceIndex\] \+ resultSeparator/u,
-  )
-  assert.match(
-    macro,
-    /solutionResult === "true" \|\| solutionResult === "false"/u,
-  )
-  assert.match(macro, /send\.clear\(\)/u)
+  assert.ok(Buffer.byteLength(macro, "utf8") < 1000,
+    "The expanded macro must remain a small runtime adapter")
+  assert.doesNotMatch(macro, /new AbortController|Promise\.resolve|function |\.evaluate\(/u)
+  assert.match(macro, /@input\(`lia-llm-result-@0`\)/u)
   assert.match(
     readme,
     /vollständig als LiaScript neu geparst[\s\S]*Inline- und Blockformeln in TeX/u,
@@ -12752,7 +12615,7 @@ test("LLMQuiz forwards its explicit question and operator", async () => {
   await run(
     {
       LiaLLM: {
-        version: "0.6.5",
+        version: "0.6.6",
         parseMacroOptions,
         parseCriteriaBlock,
         parseReferenceVariants,
@@ -12808,7 +12671,7 @@ test("LLMQuiz replaces an active run instead of extending the Quality queue", as
     __liaLlmActiveQuizRuns?: Map<string, () => void>
   } = {
     LiaLLM: {
-      version: "0.6.5",
+      version: "0.6.6",
       parseMacroOptions,
       parseCriteriaBlock,
       parseReferenceVariants,
@@ -12865,7 +12728,9 @@ test("LLMQuiz replaces an active run instead of extending the Quality queue", as
 
   assert.deepEqual(firstSent, ["LIA: stop"])
   assert.deepEqual(secondSent, ["true"])
-  assert.equal(windowValue.__liaLlmActiveQuizRuns?.size, 0)
+  assert.equal((globalThis as typeof globalThis & {
+    __liaLlmActiveQuizRuns?: Map<string, () => void>
+  }).__liaLlmActiveQuizRuns?.size, 0)
 })
 
 test("LLMQuiz rejects coverage without a criteria block before evaluation", async () => {
@@ -12876,7 +12741,7 @@ test("LLMQuiz rejects coverage without a criteria block before evaluation", asyn
   await run(
     {
       LiaLLM: {
-        version: "0.6.5",
+        version: "0.6.6",
         parseMacroOptions,
         parseCriteriaBlock,
         parseReferenceVariants,
@@ -12922,7 +12787,7 @@ test("LLMQuiz preserves required criteria when coverage is omitted", async () =>
   await run(
     {
       LiaLLM: {
-        version: "0.6.5",
+        version: "0.6.6",
         parseMacroOptions,
         parseCriteriaBlock: () => criteriaBlock,
         parseReferenceVariants,
@@ -12975,7 +12840,7 @@ test("LLMQuiz shares cloned coverage criteria and thresholds with language analy
   await run(
     {
       LiaLLM: {
-        version: "0.6.5",
+        version: "0.6.6",
         parseMacroOptions,
         parseCriteriaBlock: () => criteriaBlock,
         parseReferenceVariants,
@@ -13053,24 +12918,6 @@ test("LLMQuiz shares cloned coverage criteria and thresholds with language analy
 })
 
 test("solution=1 renders only the authored flowing criteria solution", () => {
-  const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8")
-  const macro = readme.match(/\n@LLMQuiz_\n([\s\S]*?)\n@end/u)?.[1]
-  const solutionScript = macro?.match(
-    /<script style="display:block" modify="false">\n([\s\S]*?)\n<\/script>/u,
-  )?.[1]
-  assert.ok(solutionScript)
-
-  const executableSolutionScript = solutionScript
-    .replace(
-      'const solutionResult = "@input(`lia-llm-result-@0`)"',
-      'const solutionResult = "true"',
-    )
-    .replace(
-      "const solutionReferenceSource = `@'3`",
-      "const solutionReferenceSource = solutionReferenceSourceInput",
-    )
-  assert.doesNotMatch(executableSolutionScript, /@input/u)
-
   const flowingSolution =
     "Leyla schützt die Dose und untersucht deshalb den Zettel. Finn drängt dagegen auf ein schnelles Ergebnis."
   const solutionSource = [
@@ -13083,62 +12930,466 @@ test("solution=1 renders only the authored flowing criteria solution", () => {
   ].join("\n")
   const rendered: string[] = []
   let cleared = 0
-  const run = new Function(
-    "window",
-    "send",
-    "solutionReferenceSourceInput",
-    executableSolutionScript,
-  )
+  const api = {
+    parseMacroOptions,
+    parseCriteriaBlock,
+    parseReferenceVariants,
+    getSolutionVariant: () => undefined,
+  } as unknown as LiaLLMApi
+  const send = {
+    liascript: (value: string) => rendered.push(value),
+    clear: () => { cleared += 1 },
+  } as unknown as LiaQuizSolutionSend
 
-  run(
-    {
-      LiaLLM: {
-        parseMacroOptions: () => ({ solution: true }),
-        parseCriteriaBlock,
-        parseReferenceVariants,
-        getSolutionVariant: () => undefined,
-      },
-    },
-    {
-      liascript: (value: string) => rendered.push(value),
-      clear: () => {
-        cleared += 1
-      },
-    },
-    solutionSource,
-  )
-
+  renderQuizSolution(api, "flowing-solution", "0.55;solution=1", solutionSource, "true", send)
   assert.deepEqual(rendered, [
-    flowingSolution +
-      "\n\n<lia-llm-result-separator></lia-llm-result-separator>",
+    flowingSolution + "\n\n<lia-llm-result-separator></lia-llm-result-separator>",
   ])
   assert.equal(cleared, 0)
-  assert.doesNotMatch(rendered[0]!, /INTERNES KRITERIUM/u)
-  assert.doesNotMatch(rendered[0]!, /lia-llm:(?:criterion|solution)/u)
+  assert.doesNotMatch(rendered[0]!, /INTERNES KRITERIUM|lia-llm:(?:criterion|solution)/u)
 
   rendered.length = 0
-  run(
-    {
-      LiaLLM: {
-        parseMacroOptions: () => ({ solution: false }),
-        parseCriteriaBlock,
-        parseReferenceVariants,
-        getSolutionVariant: () => undefined,
-      },
-    },
-    {
-      liascript: (value: string) => rendered.push(value),
-      clear: () => {
-        cleared += 1
-      },
-    },
-    solutionSource,
-  )
-  assert.deepEqual(rendered, [
-    "\n\n<lia-llm-result-separator></lia-llm-result-separator>",
-  ])
-  assert.doesNotMatch(rendered[0]!, /Leyla schützt die Dose/u)
+  renderQuizSolution(api, "flowing-solution", "0.55;solution=0", solutionSource, "true", send)
+  assert.deepEqual(rendered, ["\n\n<lia-llm-result-separator></lia-llm-result-separator>"])
   assert.equal(cleared, 0)
+})
+
+function createQuizRuntimeProbe(overrides: Partial<LiaLLMApi> = {}) {
+  const id = "runtime-probe-" + String(++quizRuntimeTestId)
+  const sent: unknown[][] = []
+  const feedback: Array<{ message: string; options?: FeedbackDisplayOptions }> = []
+  const activities: Array<{
+    phase: string
+    options?: ActivityDisplayOptions
+  }> = []
+  const handlers = new Map<string, () => void>()
+  const requests: EvaluationRequest[] = []
+  const api = {
+    version: "0.6.6",
+    parseMacroOptions,
+    parseCriteriaBlock,
+    parseReferenceVariants,
+    evaluate: async (request: EvaluationRequest) => {
+      requests.push(request)
+      return evaluation("passed", [])
+    },
+    evaluateLanguage: async () => ({ status: "completed", spelling: true, syntax: true }),
+    feedbackForResult: (result: EvaluationResult) => ({ code: "none", message: result.status }),
+    feedbackForError: () => null,
+    showFeedback: (_id: string, message: string, options?: FeedbackDisplayOptions) => {
+      feedback.push({ message, options })
+    },
+    showActivity: (_id: string, _runId: string, phase: string, options?: ActivityDisplayOptions) => {
+      activities.push({ phase, options })
+    },
+    setSolutionVariant,
+    getSolutionVariant,
+    clearSolutionVariant,
+    ...overrides,
+  } as LiaLLMApi
+  const send: LiaQuizSend = {
+    handle: (name, handler) => { handlers.set(name, handler) },
+    lia: (...args) => { sent.push(args) },
+  }
+  return {
+    id, api, send, sent, feedback, activities, handlers, requests,
+    start: (
+      options = "0.66;solution=1;feedback=1",
+      reference = "Eine vollständige Referenzantwort.",
+      answer = "Eine hinreichend lange Testantwort.",
+    ) => runQuiz(api, id, options, "Die unveränderte Frage?", reference, answer, send),
+    stop: () => stopQuiz(id),
+  }
+}
+
+async function flushQuizRuntime(): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, 0))
+}
+
+test("LLMQuiz adapter forwards authored text and the LiaScript dependency unchanged", () => {
+  const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8")
+  const macro = readme.match(/\n@LLMQuiz_\n([\s\S]*?)\n@end/u)?.[1]
+  assert.ok(macro)
+  const scripts = [...macro.matchAll(/<script[^>]*>\n([\s\S]*?)\n<\/script>/gu)]
+  assert.equal(scripts.length, 2)
+  const options = "0.55;coverage=0.8;assessmentengine=quality;solution=1"
+  const question = "Erkläre `Begriff`, ${nichtAusführen}, \\ und Zeilen.\nZweite Zeile."
+  const reference = "<!-- lia-llm:criterion -->\n" + "Eine ausführliche Aussage. ".repeat(200)
+  const input = "Meine Antwort mit `Code`, ${Ausdruck} und\u2028Zeilenwechsel."
+  const expand = (referenceText: string): string => macro
+    .replace('"@input(`lia-llm-result-@0`)"', '"true"')
+    .replaceAll("`@'1`", JSON.stringify(options))
+    .replaceAll("`@'2`", JSON.stringify(question))
+    .replaceAll("`@'3`", JSON.stringify(referenceText))
+    .replaceAll("`@'input`", JSON.stringify(input))
+    .replaceAll("@0", "adapter-id")
+  const shortExpansion = expand("Kurz.")
+  const longExpansion = expand(reference)
+  const referenceCopies = macro.split("`@'3`").length - 1
+  assert.equal(referenceCopies, 1)
+  const dataGrowth = referenceCopies * (
+    Buffer.byteLength(JSON.stringify(reference), "utf8") -
+    Buffer.byteLength(JSON.stringify("Kurz."), "utf8")
+  )
+  assert.equal(Buffer.byteLength(longExpansion, "utf8") -
+    Buffer.byteLength(shortExpansion, "utf8"), dataGrowth)
+  const adapterOverhead = Buffer.byteLength(longExpansion, "utf8") - (
+    2 * Buffer.byteLength(JSON.stringify(options), "utf8") +
+    Buffer.byteLength(JSON.stringify(question), "utf8") +
+    referenceCopies * Buffer.byteLength(JSON.stringify(reference), "utf8") +
+    Buffer.byteLength(JSON.stringify(input), "utf8")
+  )
+  assert.ok(adapterOverhead < 1000, `Expanded control overhead: ${adapterOverhead} bytes`)
+  assert.doesNotMatch(longExpansion, /new AbortController|Promise\.resolve|\.evaluate\(/u)
+  const calls: unknown[][] = []
+  const solutionCalls: unknown[][] = []
+  const send = {}
+  let storedReference: unknown
+  const api = {
+    runQuiz: (...args: unknown[]) => { calls.push(args); return "LIA: wait" },
+    getQuizReference: (id: string) => {
+      assert.equal(id, "adapter-id")
+      assert.equal(storedReference, reference)
+      return storedReference
+    },
+    renderQuizSolution: (...args: unknown[]) => {
+      solutionCalls.push(args)
+      storedReference = args[2]
+    },
+  }
+  // LiaScript runs the reactive output on display, before the learner checks.
+  for (const script of scripts.toReversed()) {
+    assert.ok(Buffer.byteLength(script[1]!, "utf8") < 450)
+    const executable = script[1]!
+      .replace('"@input(`lia-llm-result-@0`)"', '"true"')
+      .replaceAll("`@'1`", JSON.stringify(options))
+      .replaceAll("`@'2`", JSON.stringify(question))
+      .replaceAll("`@'3`", JSON.stringify(reference))
+      .replaceAll("`@'input`", JSON.stringify(input))
+      .replaceAll("@0", "adapter-id")
+    assert.doesNotMatch(executable, /@(?:input|'[123])/u)
+    new Function("window", "send", executable)({ LiaLLM: api }, send)
+  }
+  assert.deepEqual(calls, [["adapter-id", options, question, reference, input, send]])
+  assert.deepEqual(solutionCalls, [["adapter-id", options, reference, "true", send]])
+})
+
+test("LLMQuiz registers its reference once on initial rendering even with solution=0", () => {
+  const probe = createQuizRuntimeProbe()
+  const rendered: string[] = []
+  const send = {
+    liascript: (value: string) => { rendered.push(value) },
+    clear: () => undefined,
+  }
+  assert.throws(() => getQuizReference(probe.id), /noch nicht initialisiert/u)
+  for (const result of ["", "false", "true"]) {
+    const reference = "<!-- lia-llm:criterion -->\nUnverändertes Kriterium " + result +
+      ".\n<!-- lia-llm:solution -->\n**Vollständige** Musterlösung mit $a^2$ und `Code`."
+    renderQuizSolution(probe.api, probe.id, "0.66;solution=0", reference, result, send)
+    assert.equal(getQuizReference(probe.id), reference)
+    probe.stop()
+    assert.equal(getQuizReference(probe.id), reference, "Navigation retains authored source")
+  }
+  assert.equal(rendered.length, 2)
+  assert.ok(rendered.every(value => value === "\n\n<lia-llm-result-separator></lia-llm-result-separator>"))
+})
+
+test("LLMQuiz keeps pass/fail assessments separate from uncertain and technical failures", async () => {
+  for (const status of ["passed", "failed", "uncertain"] as const) {
+    const probe = createQuizRuntimeProbe({ evaluate: async () => evaluation(status, []) })
+    probe.start()
+    await flushQuizRuntime()
+    if (status === "uncertain") {
+      assert.deepEqual(probe.sent, [["uncertain", [], false]])
+      assert.equal(probe.feedback.at(-1)?.message, "")
+    } else {
+      assert.deepEqual(probe.sent, [[status === "passed" ? "true" : "false"]])
+      assert.equal(probe.feedback.at(-1)?.message, status)
+    }
+    assert.equal(probe.activities[0]?.phase, "selecting-model")
+    assert.equal(probe.activities.at(-1)?.phase, "")
+    probe.stop()
+  }
+  const technical = createQuizRuntimeProbe({
+    evaluate: async () => { throw new Error("Synthetischer Modellfehler") },
+  })
+  technical.start()
+  await flushQuizRuntime()
+  assert.deepEqual(technical.sent, [["Synthetischer Modellfehler", [], false]])
+  technical.stop()
+  const explained = createQuizRuntimeProbe({
+    evaluate: async () => { throw new Error("Interner Fehler") },
+    feedbackForError: () => ({ code: "unclear", message: "Bitte erneut versuchen." }),
+  })
+  explained.start()
+  await flushQuizRuntime()
+  assert.deepEqual(explained.sent, [["Bitte erneut versuchen.", [], false]])
+  explained.stop()
+})
+
+test("LLMQuiz forwards both engines, references, input newlines and thinking limits", async () => {
+  for (const engine of ["compact", "quality"] as const) {
+    let received: EvaluationOptions | undefined
+    const probe = createQuizRuntimeProbe({
+      evaluate: async (request, options) => {
+        probe.requests.push(request)
+        received = options
+        options?.onProgress?.({
+          phase: "evaluating-quality",
+          message: "Konkreter Fortschritt",
+          thinkingTimeLimitMs: 10_000,
+          thinkingTimeRemainingMs: 7_000,
+        })
+        return evaluation("passed", [])
+      },
+    })
+    probe.start(
+      `0.66;feedback=0;assessmentengine=${engine};` +
+        (engine === "quality" ? "maxthinkingtime=10s;maxthinkingtokens=high" : "maxthinkingtime=0s"),
+      "Erste Referenz.\n<!-- lia-llm:alternative -->\nZweite Referenz.",
+      "Erste Zeile\u2028Zweite Zeile",
+    )
+    await flushQuizRuntime()
+    assert.equal(probe.requests[0]?.assessmentEngine, engine)
+    assert.equal(probe.requests[0]?.question, "Die unveränderte Frage?")
+    assert.equal(probe.requests[0]?.answer, "Erste Zeile\nZweite Zeile")
+    assert.equal(probe.requests[0]?.reference, "Erste Referenz.")
+    assert.deepEqual(probe.requests[0]?.referenceVariants, ["Zweite Referenz."])
+    assert.equal(probe.requests[0]?.languageAnalysis, undefined)
+    assert.ok(received?.signal instanceof AbortSignal)
+    assert.equal(received.maxThinkingTimeMs, engine === "quality" ? 10_000 : 0)
+    if (engine === "quality") {
+      assert.equal(received.maxThinkingTokens, parseMacroOptions("0.66;maxthinkingtokens=high").maxThinkingTokens)
+    }
+    const progress = probe.activities.find(item => item.phase === "evaluating-quality")
+    assert.equal(progress?.options?.message, "Konkreter Fortschritt")
+    assert.equal(progress?.options?.thinkingTimeRemainingMs, 7_000)
+    assert.equal(typeof progress?.options?.onCancel, "function")
+    assert.equal(probe.feedback.at(-1)?.message, "")
+    probe.stop()
+  }
+})
+
+test("LLMQuiz cancels and restarts, rejecting late results and progress from the cancelled run", async () => {
+  const pending: Array<{ options: EvaluationOptions; resolve(result: EvaluationResult): void }> = []
+  const probe = createQuizRuntimeProbe({
+    evaluate: (_request, options) => new Promise(resolve => {
+      assert.ok(options?.signal)
+      pending.push({ options, resolve })
+    }),
+  })
+  let stopped = 0
+  probe.send.stop = () => { stopped += 1 }
+  probe.start()
+  await flushQuizRuntime()
+  assert.equal(pending.length, 1)
+  probe.activities[0]?.options?.onCancel?.()
+  assert.equal(pending[0]?.options.signal?.aborted, true)
+  assert.equal(stopped, 1)
+  assert.deepEqual(probe.sent, [])
+  probe.start()
+  await flushQuizRuntime()
+  assert.equal(pending.length, 2)
+  const activityCount = probe.activities.length
+  pending[0]?.options.onProgress?.({ phase: "evaluating-compact" })
+  pending[0]?.resolve(evaluation("failed", []))
+  await flushQuizRuntime()
+  assert.equal(probe.activities.length, activityCount)
+  assert.deepEqual(probe.sent, [])
+  pending[1]?.resolve(evaluation("passed", []))
+  await flushQuizRuntime()
+  assert.deepEqual(probe.sent, [["true"]])
+  probe.stop()
+})
+
+test("LLMQuiz stops synchronously before evaluation starts and on lifecycle disconnect", async () => {
+  const immediate = createQuizRuntimeProbe()
+  immediate.start()
+  const stopHandler = immediate.handlers.get("stop")
+  assert.equal(typeof stopHandler, "function")
+  stopHandler!()
+  await flushQuizRuntime()
+  assert.equal(immediate.requests.length, 0)
+  assert.deepEqual(immediate.sent, [])
+
+  let signal: AbortSignal | undefined
+  let resolve!: (result: EvaluationResult) => void
+  const detached = createQuizRuntimeProbe({
+    evaluate: (_request, options) => {
+      signal = options?.signal
+      return new Promise(done => { resolve = done })
+    },
+  })
+  detached.start()
+  await flushQuizRuntime()
+  detached.stop()
+  assert.equal(signal?.aborted, true)
+  resolve(evaluation("passed", []))
+  await flushQuizRuntime()
+  assert.deepEqual(detached.sent, [["LIA: stop"]])
+})
+
+test("LLMQuiz invalidates lazy language checks after reset and after a new attempt", async () => {
+  for (const action of ["reset", "restart"] as const) {
+    let languageCalls = 0
+    const probe = createQuizRuntimeProbe({
+      evaluateLanguage: async () => { languageCalls += 1; return undefined },
+    })
+    probe.start("0.66;feedback=1;Rechtschreibung=1;Satzbau=1")
+    await flushQuizRuntime()
+    const language = probe.feedback.at(-1)?.options?.languageCheck
+    assert.ok(language)
+    assert.equal(language.kind, "language")
+    if (action === "reset") probe.handlers.get("stop")!()
+    else probe.start()
+    await assert.rejects(language.run(new AbortController().signal), { name: "AbortError" })
+    assert.equal(languageCalls, 0)
+    await flushQuizRuntime()
+    assert.deepEqual(probe.sent, action === "reset" ? [["true"]] : [["true"], ["true"]])
+    probe.stop()
+  }
+})
+
+test("LLMQuiz language checks stay lazy and preserve feedback for all requested modes", async () => {
+  for (const [options, kind] of [
+    ["Rechtschreibung=1", "orthography"],
+    ["Satzbau=1", "syntax"],
+    ["Rechtschreibung=1;Satzbau=1", "language"],
+  ] as const) {
+    const languageRequests: EvaluationRequest[] = []
+    const probe = createQuizRuntimeProbe({
+      evaluateLanguage: async request => {
+        languageRequests.push(request)
+        return { status: "completed", wordCount: 5, spelling: true, syntax: true }
+      },
+    })
+    probe.start("0.66;feedback=1;" + options)
+    await flushQuizRuntime()
+    assert.equal(languageRequests.length, 0)
+    const language = probe.feedback.at(-1)?.options?.languageCheck
+    assert.equal(language?.kind, kind)
+    const result = await language!.run(new AbortController().signal)
+    assert.equal(result.completed, true)
+    assert.equal(result.message, "passed")
+    assert.equal(languageRequests[0]?.assessmentEngine, "quality")
+    assert.deepEqual(languageRequests[0]?.languageAnalysis, {
+      spelling: kind !== "syntax", syntax: kind !== "orthography",
+    })
+    assert.deepEqual(probe.sent, [["true"]])
+    probe.stop()
+  }
+})
+
+test("LLMQuiz retains the selected solution across navigation and clears it after failure", async () => {
+  let result = { ...evaluation("passed", []), selectedReferenceIndex: 1 }
+  const probe = createQuizRuntimeProbe({ evaluate: async () => result })
+  const source = "Erste Lösung.\n<!-- lia-llm:alternative -->\n**Zweite** Lösung mit $x^2$."
+  const rendered: string[] = []
+  let cleared = 0
+  const send = {
+    liascript: (value: string) => { rendered.push(value) },
+    clear: () => { cleared += 1 },
+  }
+  probe.start("0.66;solution=1", source)
+  await flushQuizRuntime()
+  renderQuizSolution(probe.api, probe.id, "0.66;solution=1", source, "true", send)
+  assert.match(rendered[0]!, /^\*\*Zweite\*\* Lösung mit \$x\^2\$\./u)
+  assert.equal(getSolutionVariant("lia-llm-solution-variant-" + probe.id), 1)
+  probe.stop()
+  assert.equal(getSolutionVariant("lia-llm-solution-variant-" + probe.id), 1)
+  renderQuizSolution(probe.api, probe.id, "0.66;solution=1", source, "true", send)
+  assert.equal(rendered[1], rendered[0], "Returning to a passed quiz retains the selected reference")
+  result = { ...evaluation("failed", []), selectedReferenceIndex: 1 }
+  probe.start("0.66;solution=1", source)
+  await flushQuizRuntime()
+  assert.equal(getSolutionVariant("lia-llm-solution-variant-" + probe.id), undefined)
+  renderQuizSolution(probe.api, probe.id, "0.66;solution=1", source, "false", send)
+  assert.equal(rendered[2], "\n\n<lia-llm-result-separator></lia-llm-result-separator>")
+  for (const unassessed of ["", "LIA: wait", "uncertain", "technischer Fehler"]) {
+    renderQuizSolution(probe.api, probe.id, "0.66;solution=1", source, unassessed, send)
+  }
+  assert.equal(cleared, 4)
+  probe.stop()
+  assert.equal(getSolutionVariant("lia-llm-solution-variant-" + probe.id), undefined)
+})
+
+test("LLMQuiz restores a saved answer only for its solved native quiz and keeps the chosen variant", () => {
+  const probe = createQuizRuntimeProbe({ getSolutionVariant: () => 1 })
+  const source = "Erste Lösung.\n<!-- lia-llm:alternative -->\n**Zweite** Lösung."
+  const rendered: string[] = []
+  let cleared = 0
+  let solved = true
+  let hostPresent = true
+  let inputPresent = true
+  const input = { value: "Gespeicherte Antwort\u2028mit zweiter Zeile." }
+  const quiz = {
+    classList: { contains: (name: string) => name === "solved" && solved },
+    querySelector: (selector: string) => {
+      assert.equal(selector, "input.lia-quiz__input")
+      return inputPresent ? input : null
+    },
+  }
+  const host = {
+    closest: (selector: string) => {
+      assert.equal(selector, ".lia-quiz")
+      return quiz
+    },
+  }
+  const documentDescriptor = Object.getOwnPropertyDescriptor(globalThis, "document")
+  Object.defineProperty(globalThis, "document", {
+    configurable: true,
+    value: {
+      getElementById: (id: string) => {
+        assert.equal(id, "lia-llm-quiz-" + probe.id)
+        return hostPresent ? host : null
+      },
+    },
+  })
+  const send = {
+    liascript: (value: string) => { rendered.push(value) },
+    clear: () => { cleared += 1 },
+  }
+  const render = (result: string, options = "0.66;solution=1") => {
+    renderQuizSolution(probe.api, probe.id, options, source, result, send)
+  }
+  try {
+    render("Gespeicherte Antwort\u2028mit zweiter Zeile.")
+    assert.deepEqual(rendered, [
+      "**Zweite** Lösung.\n\n<lia-llm-result-separator></lia-llm-result-separator>",
+    ])
+    render("Gespeicherte Antwort\nmit zweiter Zeile.")
+    assert.equal(rendered[1], rendered[0], "A saved U+2028 and a newline represent the same answer")
+    assert.equal(cleared, 0)
+
+    // Reset can preserve the input text; the native solved state is essential.
+    solved = false
+    render(input.value)
+    assert.equal(cleared, 1)
+    assert.equal(rendered.length, 2)
+
+    solved = true
+    for (const result of ["Andere Antwort", "Technischer Modellfehler", "uncertain", "LIA: wait", ""]) {
+      render(result)
+    }
+    assert.equal(cleared, 6)
+    assert.equal(rendered.length, 2, "Errors and unrelated outputs must not reveal a solution")
+
+    inputPresent = false
+    render(input.value)
+    inputPresent = true
+    hostPresent = false
+    render(input.value)
+    assert.equal(cleared, 8, "A restored output alone does not establish ownership or success")
+    assert.equal(rendered.length, 2)
+
+    hostPresent = true
+    render(input.value, "0.66;solution=0")
+    assert.equal(rendered[2], "\n\n<lia-llm-result-separator></lia-llm-result-separator>")
+  } finally {
+    if (documentDescriptor) Object.defineProperty(globalThis, "document", documentDescriptor)
+    else Reflect.deleteProperty(globalThis, "document")
+    probe.stop()
+  }
 })
 
 test("operator documentation lists every active runtime profile", () => {
