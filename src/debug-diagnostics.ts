@@ -1219,8 +1219,8 @@ function failureFinding(
       code: "download-cancelled",
       severity: "info",
       confidence: "high",
-      title: "Der Ladevorgang wurde absichtlich beendet.",
-      analysis: "Ein Reset, Cache-Löschen oder Wechsel des Modelllaufs hat den laufenden Download abgebrochen.",
+      title: "Der Ladevorgang wurde abgebrochen.",
+      analysis: "Ein AbortError allein belegt keinen absichtlichen Abbruch; auch Browser oder Netzwerk k\u00f6nnen einen Einzelabruf beenden.",
       evidence,
     }
   }

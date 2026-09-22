@@ -539,6 +539,7 @@ export interface LiaQuizSolutionSend {
 export interface LiaLLMApi {
   readonly version: string
   getQuizReference(id: string): string
+  getQuizReferenceOrEmpty(id: string): string
   runQuiz(
     id: string,
     options: string,

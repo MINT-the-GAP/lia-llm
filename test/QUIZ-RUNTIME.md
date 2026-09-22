@@ -1,7 +1,7 @@
 # Quiz-Runtime und Parser-Regression
 
 Der Test verwendet den aktuellen öffentlichen Viewer unter
-`https://liascript.github.io/course/` in Playwright Chromium und Firefox.
+`https://liascript.github.io/course/` in Playwright und den installierten Windows-Browsern Edge und Chrome.
 Nur die importierte `lia-llm/README.md`, ihr `dist/index.js` und die lokale
 Test-Fixture werden per Request-Routing bereitgestellt. Der Wochenaufgabenkurs
 `5/Deutsch/Lia5_03.md` und seine übrigen Templates werden unverändert geladen.
@@ -11,7 +11,7 @@ Es wird nichts veröffentlicht oder am Wochenaufgabenkurs geändert.
 
 ```sh
 npm ci
-npx playwright-core install chromium firefox
+npx playwright-core install chromium firefox webkit
 npm run build
 npm run test:browser-quiz-runtime
 ```
@@ -22,7 +22,10 @@ blockiert Service-Worker-Caches und schreibt seinen Bericht einschließlich
 Browserversionen, Kurs-Hash und `pageerror`-Ereignissen nach
 `test-results/browser-quiz-runtime.json`.
 
-`LIA_LLM_QUIZ_BROWSERS=chromium` beziehungsweise `firefox` begrenzt die Browser.
+`LIA_LLM_QUIZ_BROWSERS=edge,chrome,brave-sim,webkit,ios-safari,ios-chrome,ios-edge,ios-brave`
+begrenzt die Browser. `brave-sim` verwendet Chromium; die iOS-Profile sind
+iPhone-WebKit-Emulationen mit angepasstem User-Agent. Sie ersetzen keine Tests
+auf installiertem Brave oder physischen iOS-Geräten.
 `LIA_LLM_QUIZ_TIMEOUT_MS` setzt die Ladefrist (Standard: 90000 ms).
 
 ## Abdeckung
@@ -78,6 +81,36 @@ deshalb endet diese fremde Sperre erst mit ihrem Timeout. `lia-llm` bricht die
 Auswertung sofort ab und verwirft verspätete Ergebnisse. Ohne diesen zusätzlichen
 Kursimport ist der sofortige Neustart möglich. Der Test verändert weder
 Bewertung noch Kursinhalt, um diese Sperre zu umgehen.
+
+## Nachweis vom 22. September 2026
+
+Der aktuelle Lauf mit Version 0.6.7 bestand alle 16 Kombinationen aus Browserprofil
+und Szenario: sechs lange Quizfragen sowie der unveränderte Wochenaufgabenkurs.
+Pro Profil wurden die Auswertung, Musterlösung, Fehler, Abbruch, Neustart,
+Folienwechsel und Sprachprüfung geprüft. Der Makrokörper umfasst 605 Bytes
+und enthält den Referenztext nur einmal. Alle Profile meldeten null `pageerror`.
+Build, TypeScript-Prüfung und 266 Unit-Tests bestanden.
+Der detaillierte lokale Bericht liegt unter `test-results/browser-quiz-runtime-final-2026-09-22.json`.
+
+| Profil | Browser-Version | Quiz-Fixture | Wochenaufgabenkurs | Testart |
+| --- | --- | --- | --- | --- |
+| Edge | 153.0.4234.48 | bestanden | bestanden | installiert auf Windows |
+| Chrome | 153.0.8010.53 | bestanden | bestanden | installiert auf Windows |
+| Brave-Näherung | Chromium 151.0.7922.34 | bestanden | bestanden | Chromium ohne Brave Shields |
+| Safari-Näherung | WebKit 26.5 | bestanden | bestanden | WebKit auf Windows |
+| iPhone Safari, Chrome, Edge, Brave | WebKit 26.5 | je bestanden | je bestanden | iPhone 13 Touch-/Viewport-/User-Agent-Emulation |
+
+Der Testrechner läuft mit Windows 10 Pro, Build 19045. Ein Windows-11-Kernel,
+echte Brave Shields und reale iOS-Geräte wurden damit nicht getestet.
+Die vier iPhone-Profile meldeten kein WebGPU. Der Quiz-Test ersetzt die
+Modellberechnung kontrolliert; die Browserintegration selbst lief im echten
+LiaScript-Viewer. Die realen Modell- und Cache-Tests sind separat in
+[`BROWSER-HARDENING.md`](BROWSER-HARDENING.md) dokumentiert.
+
+Mit `LIA_LLM_QUIZ_RELOAD=1` kann ein vollständiger Seitenneustart zusätzlich
+geprüft werden. Der aktuelle Viewer startete danach ein frisches Quiz; die
+Wiederherstellung einer bereits gelösten Quizantwort nach Neustart konnte
+daher nicht erprobt werden.
 
 ## Nachweis vom 20. September 2026
 

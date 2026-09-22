@@ -1,6 +1,6 @@
 const DEFAULT_CHUNK_SIZE_BYTES = 8 * 1024 * 1024
-const DEFAULT_STALL_TIMEOUT_MS = 45_000
-const DEFAULT_RETRY_DELAYS_MS = [0, 750, 2_000, 5_000] as const
+const DEFAULT_STALL_TIMEOUT_MS = 90_000
+const DEFAULT_RETRY_DELAYS_MS = [0, 1_000, 3_000, 7_000, 15_000, 30_000] as const
 const MAX_FULL_FALLBACK_PREFIX_BYTES = 64 * 1024 * 1024
 
 type FetchLike = (
@@ -343,9 +343,11 @@ export class ResilientFetchSession {
   }
 
   private retryDelay(attempt: number): number {
-    return this.retryDelaysMs[
+    const delay = this.retryDelaysMs[
       Math.min(attempt, this.retryDelaysMs.length - 1)
     ] ?? 0
+    // Spread reconnects across clients sharing a throttled school gateway.
+    return delay === 0 ? 0 : Math.round(delay * (0.75 + Math.random() * 0.5))
   }
 
   private reportRetry(request: Request, attempt: number, error: unknown): void {

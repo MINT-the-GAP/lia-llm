@@ -73,7 +73,7 @@ export interface QualityModelCaches {
 export interface QualityModelSelectionInput {
   readonly storage: StorageAvailability
   readonly cache?: QualityModelCaches
-  /** Large is opt-in; the verified small tier is the production default. */
+  /** The caller chooses the preference; an omitted preference stays small. */
   readonly preferredTier?: SelectableQualityModel["tier"]
 }
 
@@ -260,8 +260,8 @@ function decision(
 }
 
 /**
- * Selects the verified small tier by default. The large tier is used only
- * when explicitly preferred or when its cache is the sole viable fallback.
+ * Selects the small tier when no preference is supplied. Production explicitly
+ * prefers large when the free origin budget permits it.
  */
 export function selectQualityModel(
   input: QualityModelSelectionInput,

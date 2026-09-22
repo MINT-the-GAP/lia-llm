@@ -1,6 +1,6 @@
 <!--
 author:      MINT-the-GAP, Martin Lommatzsch
-version:     0.6.6
+version:     0.6.7
 language:    de
 narrator:    Deutsch Female
 comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
@@ -14,7 +14,7 @@ attribute:   [lia-llm: Quellen und Lizenzen](https://github.com/MINT-the-GAP/lia
 
 @LLMQuiz_
 <script output="lia-llm-result-@0">
-window.LiaLLM.runQuiz("@0", `@'1`, `@'2`, window.LiaLLM.getQuizReference("@0"), `@'input`, send)
+window.LiaLLM.runQuiz("@0", `@'1`, `@'2`, `@'3`, `@'input`, send)
 </script>
 <lia-llm-load-overlay-host></lia-llm-load-overlay-host>
 <lia-llm-textarea-host hidden></lia-llm-textarea-host>
@@ -22,7 +22,7 @@ window.LiaLLM.runQuiz("@0", `@'1`, `@'2`, window.LiaLLM.getQuizReference("@0"), 
 <lia-llm-activity id="lia-llm-activity-@0" hidden></lia-llm-activity>
 <lia-llm-feedback id="lia-llm-feedback-@0"></lia-llm-feedback>
 <script style="display:block" modify="false">
-window.LiaLLM.renderQuizSolution("@0", `@'1`, `@'3`, "@input(`lia-llm-result-@0`)", send)
+window.LiaLLM.renderQuizSolution("@0", `@'1`, window.LiaLLM.getQuizReferenceOrEmpty("@0"), "@input(`lia-llm-result-@0`)", send)
 </script>
 @end
 -->
@@ -401,7 +401,9 @@ technischen Obergrenzen: Die Worker-Initialisierung wird nach 120 Sekunden und j
 Modell-Completion der Grundprüfung nach 150 Sekunden hart beendet. Die 150 Sekunden sind deshalb
 keine Obergrenze für die gesamte Prüfung, falls diese mehrere Completions benötigt. Ein solcher
 Timeout verwirft den Worker, sperrt Quality aber nicht dauerhaft; eine erneute Prüfung startet einen
-frischen Worker aus dem vorhandenen Cache.
+frischen Worker aus dem vorhandenen Cache. Nach einer kooperativ unterbrochenen Auswertung hat
+der Worker 30 Sekunden zum Beenden; ein dabei auftretender Timeout nennt diesen Abbruch
+ausdrücklich.
 
 Bei „Antwort wird gründlich geprüft …“ zeigt die Aktivitätsanzeige zunächst, wie viel zusätzliche
 Denkzeit bei Bedarf höchstens vorgesehen ist. Erst wenn der adaptive Thinking-Lauf tatsächlich
@@ -657,8 +659,8 @@ Insbesondere bleibt ein dort festgestelltes `contradicted` unabhängig von `cove
 
 | Stufe | Modell und Laufzeit | Erster Download | Einordnung |
 | --- | --- | ---: | --- |
-| Qualität (Standard, Opt-in) | Qwen3-1.7B über WebLLM | ca. 984 MB | erprobte, ressourcenschonende Quality-Stufe; benötigt WebGPU |
-| Qualität (experimentell) | Qwen3-4B über WebLLM | ca. 2,28 GB (2,12 GiB) | wird nicht automatisch neu heruntergeladen; kann nur als vollständig vorhandener Cache-Fallback dienen, die öffentliche Makro-API bietet keine Large-Auswahl |
+| Qualität (bei genügend Browser-Speicher, Opt-in) | Qwen3-4B über WebLLM | ca. 2,28 GB (2,12 GiB) | bevorzugte Quality-Stufe; benötigt WebGPU und laut WebLLM rund 3,4 GB VRAM |
+| Qualität (Rückfall, Opt-in) | Qwen3-1.7B über WebLLM | ca. 984 MB | erprobte kleinere Stufe bei knapper oder unbekannter Browser-Quote |
 | sicherer Standard/Fallback | mDeBERTa-v3 NLI über Transformers.js | ca. 379 MB inklusive ONNX-Laufzeit | normale Engine ohne Quality-Opt-in; läuft bei Bedarf mit WASM |
 
 Beim standardmäßigen WASM-Start laufen ONNX-Sitzung und Inferenz des
@@ -669,20 +671,14 @@ LiaScript-UI-Thread. Einbettende Seiten müssen dafür die unter
 Vor jedem noch nicht vollständig gecachten Quality-Download wertet das Template, soweit verfügbar,
 `navigator.storage.estimate()` aus. Bei gültiger `quota` und `usage` gilt als frei
 `quota - usage`; zusätzlich bleibt eine Reserve von `max(512 MiB, 10 % der quota)` unangetastet.
-Qwen3-1.7B wird als verlässlicher Standard gewählt, sobald seine 984.000.000 B plus Reserve frei
-sind oder seine Gewichte bereits im Cache liegen. Reicht ein bekanntes Budget nicht einmal dafür,
-startet kein neuer Quality-Download. Fehlt die Storage-API, schlägt sie fehl oder liefert sie keine
-belastbaren Werte, bleibt 1.7B die konservative Auswahl. Qwen3-4B wird standardmäßig nicht neu
-heruntergeladen. Ein bereits vollständig vorhandenes 4B-Modell kann als Fallback wiederverwendet
-werden, wenn 1.7B nicht sicher zusätzlich Platz findet. Der interne Selektor hält einen
-Large-Pfad für Tests und mögliche Integrationen vor; die öffentliche Makro-API stellt diese
-Auswahl derzeit nicht bereit.
-
-Auch bei einer für diese Herkunft gemeldeten Quote von 4.000.000.000 B bleibt 1.7B der
-Produktionsstandard. Erhöht eine Schulrichtlinie nur den allgemeinen HTTP-Diskcache, ohne die von
-`navigator.storage.estimate()` gemeldete Origin-Quote zu erhöhen, bleibt für die Zulässigkeit
-eines Downloads der niedrigere Browserwert maßgeblich. Alle Werte sind Schätzungen; ein späteres
-`QuotaExceededError` kann der Browser trotzdem melden.
+Qwen3-4B wird gewählt, wenn die gemeldeten freien Bytes nach dieser Reserve seine
+2.280.000.000 B abdecken oder das Modell vollständig gecacht ist. Das gilt auch bei einem
+bereits vorhandenen 1.7B-Cache, sofern für 4B zusätzlich genug Platz frei ist. Ein vorhandenes
+1.7B-Modell wird für ein automatisches 4B-Upgrade nicht vor dem Download gelöscht. Wenn nur
+1.7B hineinpasst oder die Storage-API keine belastbaren Werte liefert, wird 1.7B verwendet.
+Reicht ein bekanntes Budget nicht einmal für 1.7B, startet kein neuer Quality-Download.
+Eine höhere allgemeine HTTP-Diskcache-Grenze ersetzt die Origin-Quote nicht. Alle Werte sind
+Schätzungen; ein späteres `QuotaExceededError` kann der Browser trotzdem melden.
 
 Die Prüfung betrifft ausschließlich den Browsercache der aktuellen Herkunft. Sie misst weder
 Arbeitsspeicher noch freien GPU-Speicher und garantiert keine stabile WebGPU-Ausführung. Die
@@ -726,12 +722,9 @@ nicht zum 15-Sekunden-Thinking-Budget gehören.
 Die zwischenzeitlich geprüfte 0.6B-Variante bestand den semantischen Stresstest nur in 6 von 12
 Fällen und wird nicht als Bewertungsmodell ausgeliefert.
 
-Seit Version 0.5.14 entfernt das Template vor einem neuen Quality-Download die exakt gepinnten
-ausgehenden Qwen3-0.6B-Artefakte. Der normale 1.7B-Standard entfernt kein vorhandenes
-Qwen3-1.7B zugunsten eines automatischen 4B-Upgrades. Der entsprechende Large-Pfad ist nur
-intern für Tests und mögliche Integrationen reserviert; die öffentliche Makro-API exponiert ihn
-nicht. Ansonsten bleiben die aktiven
-Quality-Artefakte und fremde WebLLM-Cacheeinträge erhalten.
+Vor einem neuen Quality-Download entfernt das Template weiterhin nur die exakt gepinnten
+ausgehenden Qwen3-0.6B-Artefakte. Ein vorhandener 1.7B-Cache bleibt beim automatischen
+4B-Download erhalten. Fremde WebLLM-Cacheeinträge bleiben ebenfalls erhalten.
 
 Es gibt zwei bewusst getrennte Anzeigen:
 
@@ -780,11 +773,14 @@ Erst danach wird WebGPU initialisiert. Ein späterer GPU-Verlust kann den Netzwe
 nicht mehr abbrechen.
 
 Große Modell- und Laufzeitdateien werden in begrenzten Byte-Bereichen geladen. Bleibt ein Bereich
-45 Sekunden ohne neue Daten oder endet er vorzeitig, bricht das Template nur diesen Bereich ab und
-wiederholt ihn mit kurzen Wartezeiten bis zu viermal. Schlägt anschließend das Schreiben in den
-Browsercache fehl, wird die gesamte Shard-Transaktion mit steigenden Pausen bis zu fünfmal versucht;
-bis zu drei Shards werden parallel vorbereitet. Bereits vollständig gecachte WebLLM-Shards müssen
-dabei nicht erneut übertragen werden. Ein vorübergehender Fehler des Qualitätsmodells sperrt
+90 Sekunden ohne neue Daten oder endet er vorzeitig, wird nur dieser Bereich erneut angefordert.
+Einzelabrufe und komplette Shards haben gestaffelte Wiederholungen mit leicht zufälligen
+Wartezeiten, damit Schulgeräte nach einem Proxy-Abbruch nicht alle gleichzeitig erneut anfragen.
+Pro Browser wird nur ein Gewichts-Shard zurzeit geladen. Bereits vollständig gespeicherte Shards
+bleiben nach einem Fehler erhalten und werden beim nächsten Versuch aus dem Cache verwendet.
+Der Fortschritt erreicht 100 % erst, wenn alle Gewichte erfolgreich im Browsercache gespeichert
+wurden. Ein einzelner AbortError des Browsers beendet den Gesamtdownload nicht sofort. Ein
+vorübergehender Fehler des Qualitätsmodells sperrt
 außerdem keine weiteren Versuche in derselben Sitzung. Ein fataler WebGPU-Laufzeitfehler wie
 `device lost`, `DXGI_ERROR_DEVICE_HUNG`, `DXGI_ERROR_DEVICE_REMOVED`,
 `DXGI_ERROR_DEVICE_RESET`, `Buffer unmapped`, `Buffer is not mapped`, ein bereits
@@ -851,9 +847,10 @@ Der reproduzierbare Cold-/Neustart-/Offline-Härtetest samt Schulnetzbedingungen
 
 Seit Version 0.6.6 übergibt `@LLMQuiz_` nur noch die Quizdaten und LiaScripts `send`
 an die gemeinsame Runtime in `src/quiz-runtime.ts` (gebündelt in `dist/index.js`).
-Die reaktive Lösungsanzeige registriert den vollständigen Referenztext einmal pro
-Quiz; die Auswertung liest dieselbe Quelle aus der Runtime. Dadurch werden weder
-die Steuerlogik noch zwei Kopien der Referenz in jeden Codeblock expandiert; die öffentliche Syntax bleibt
+Seit Version 0.6.7 registriert der Prüfen-Ablauf den vollständigen Referenztext unmittelbar beim
+Start; die reaktive Lösungsanzeige liest ihn danach aus der Runtime. Vor dem
+ersten Prüfen bleibt die Lösungsanzeige leer. Dadurch werden weder die Steuerlogik
+noch zwei Kopien der Referenz in jeden Codeblock expandiert; die öffentliche Syntax bleibt
 unverändert. Der Browser-Regressions-Test mit sechs langen Aufgaben auf einer Folie
 und dem unveränderten Wochenaufgabenkurs ist in
 [`test/QUIZ-RUNTIME.md`](test/QUIZ-RUNTIME.md) beschrieben.

@@ -79,7 +79,7 @@ import {
   toQuizInputValue,
 } from "../src/quiz-textarea.ts"
 import { parseMacroOptions } from "../src/macro-options.ts"
-import { getQuizReference, renderQuizSolution, runQuiz, stopQuiz } from "../src/quiz-runtime.ts"
+import { getQuizReference, getQuizReferenceOrEmpty, renderQuizSolution, runQuiz, stopQuiz } from "../src/quiz-runtime.ts"
 import {
   normalizeAdaptiveThinkingLimits,
   normalizeThinkingLimits,
@@ -5245,6 +5245,10 @@ test('QualityWorkerSupervisor hard-stops a completion that cannot drain after ab
   assert.equal(failure instanceof QualityWorkerTimeoutError, true)
   assert.equal((failure as QualityWorkerTimeoutError | undefined)?.operation, 'completion')
   assert.equal((failure as QualityWorkerTimeoutError | undefined)?.timeoutMs, 10)
+  assert.match(
+    (failure as QualityWorkerTimeoutError).message,
+    /unterbrochene Auswertung/u,
+  )
 })
 
 test('QualityWorkerSupervisor keeps an idle worker for a pre-aborted completion', async () => {
@@ -8055,6 +8059,37 @@ test('quality artifact prefetch fills exact WebLLM caches and reuses them', asyn
   })
 })
 
+test('quality artifact prefetch downloads only the missing final shard after a restart', async () => {
+  const fixture = syntheticQualityPrefetchFixture()
+  const storage = consumingQualityCacheStorage()
+  const lastShardUrl = fixture.expectedCacheUrls.get('webllm/model')?.at(-1)
+  assert.ok(lastShardUrl)
+  const firstRequests: string[] = []
+  const resumedRequests: string[] = []
+
+  await withCacheStorage(storage.asCacheStorage(), async () => {
+    await prefetchQualityArtifacts(
+      fixture.appConfig,
+      new ResilientFetchSession(syntheticQualityFetch(fixture, firstRequests), {
+        retryDelaysMs: [0],
+        shouldChunk: () => false,
+      }),
+    )
+    const modelCache = storage.cachesByName.get('webllm/model')
+    assert.ok(modelCache)
+    assert.equal(await modelCache.delete(lastShardUrl), true)
+    await prefetchQualityArtifacts(
+      fixture.appConfig,
+      new ResilientFetchSession(syntheticQualityFetch(fixture, resumedRequests), {
+        retryDelaysMs: [0],
+        shouldChunk: () => false,
+      }),
+    )
+    await assertSyntheticQualityCache(storage, fixture)
+  })
+  assert.deepEqual(resumedRequests, [lastShardUrl])
+})
+
 test('quality artifact prefetch retries a whole shard after Cache.put stream failure', async () => {
   const fixture = syntheticQualityPrefetchFixture()
   const storage = consumingQualityCacheStorage()
@@ -8090,6 +8125,39 @@ test('quality artifact prefetch retries a whole shard after Cache.put stream fai
     ).length,
     2,
   )
+})
+
+test('quality artifact prefetch recovers a transient AbortError without cancelling remaining shards', async () => {
+  const fixture = syntheticQualityPrefetchFixture()
+  const storage = consumingQualityCacheStorage()
+  const requests: string[] = []
+  const regularFetch = syntheticQualityFetch(fixture, requests)
+  let interrupted = false
+  const session = new ResilientFetchSession(async (input) => {
+    const request = input instanceof Request ? input : new Request(input)
+    if (request.url === fixture.firstShardUrl && !interrupted) {
+      interrupted = true
+      requests.push(request.url)
+      throw new DOMException('The browser interrupted this request', 'AbortError')
+    }
+    return regularFetch(input)
+  }, {
+    retryDelaysMs: [0],
+    shouldChunk: () => false,
+    stallTimeoutMs: 1_000,
+  })
+
+  await withCacheStorage(storage.asCacheStorage(), async () => {
+    await prefetchQualityArtifacts(fixture.appConfig, session)
+    await assertSyntheticQualityCache(storage, fixture)
+  })
+  assert.equal(session.signal.aborted, false)
+  assert.equal(requests.filter((url) => url === fixture.firstShardUrl).length, 2)
+  for (const url of fixture.bodies.keys()) {
+    if (url !== fixture.firstShardUrl) {
+      assert.equal(requests.filter((requested) => requested === url).length, 1)
+    }
+  }
 })
 
 test('quality artifact prefetch replaces a cached shard with a truncated body', async () => {
@@ -12408,7 +12476,7 @@ function createLLMQuizValidatorRunner(): LLMQuizValidatorRunner {
   })
 }
 
-test("the public version remains pinned exactly to 0.6.6", () => {
+test("the public version remains pinned exactly to 0.6.7", () => {
   const packageJson = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   ) as { version?: string }
@@ -12423,14 +12491,14 @@ test("the public version remains pinned exactly to 0.6.6", () => {
     "utf8",
   )
 
-  assert.equal(packageJson.version, "0.6.6")
-  assert.equal(packageLock.version, "0.6.6")
-  assert.equal(packageLock.packages?.[""]?.version, "0.6.6")
-  assert.match(entry, /const VERSION = "0\.6\.6"/u)
-  assert.match(bundle, /"0\.6\.6"/u)
+  assert.equal(packageJson.version, "0.6.7")
+  assert.equal(packageLock.version, "0.6.7")
+  assert.equal(packageLock.packages?.[""]?.version, "0.6.7")
+  assert.match(entry, /const VERSION = "0\.6\.7"/u)
+  assert.match(bundle, /"0\.6\.7"/u)
   assert.doesNotMatch(bundle, /let [\w$]+="0\.6\.4",[\w$]+=globalThis/u)
-  assert.match(browserSmoke, /window\.LiaLLM\.version === "0\.6\.6"/u)
-  assert.match(readme, /^version:\s+0\.6\.6$/mu)
+  assert.match(browserSmoke, /window\.LiaLLM\.version === "0\.6\.7"/u)
+  assert.match(readme, /^version:\s+0\.6\.7$/mu)
   assert.match(readme, /^script:\s+\.\/dist\/index\.js$/mu)
   assert.doesNotMatch(
     readme,
@@ -13006,15 +13074,15 @@ async function flushQuizRuntime(): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, 0))
 }
 
-test("LLMQuiz adapter forwards authored text and the LiaScript dependency unchanged", () => {
+test("LLMQuiz validator registers the single reference before reactive solution rendering", () => {
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8")
   const macro = readme.match(/\n@LLMQuiz_\n([\s\S]*?)\n@end/u)?.[1]
   assert.ok(macro)
   const scripts = [...macro.matchAll(/<script[^>]*>\n([\s\S]*?)\n<\/script>/gu)]
   assert.equal(scripts.length, 2)
   const options = "0.55;coverage=0.8;assessmentengine=quality;solution=1"
-  const question = "Erkläre `Begriff`, ${nichtAusführen}, \\ und Zeilen.\nZweite Zeile."
-  const reference = "<!-- lia-llm:criterion -->\n" + "Eine ausführliche Aussage. ".repeat(200)
+  const question = "Erkl?re `Begriff`, ${nichtAusf?hren}, \ und Zeilen.\nZweite Zeile."
+  const reference = "<!-- lia-llm:criterion -->\n" + "Eine ausf?hrliche Aussage. ".repeat(200)
   const input = "Meine Antwort mit `Code`, ${Ausdruck} und\u2028Zeilenwechsel."
   const expand = (referenceText: string): string => macro
     .replace('"@input(`lia-llm-result-@0`)"', '"true"')
@@ -13043,22 +13111,18 @@ test("LLMQuiz adapter forwards authored text and the LiaScript dependency unchan
   assert.doesNotMatch(longExpansion, /new AbortController|Promise\.resolve|\.evaluate\(/u)
   const calls: unknown[][] = []
   const solutionCalls: unknown[][] = []
+  const references = new Map<string, string>()
   const send = {}
-  let storedReference: unknown
   const api = {
-    runQuiz: (...args: unknown[]) => { calls.push(args); return "LIA: wait" },
-    getQuizReference: (id: string) => {
-      assert.equal(id, "adapter-id")
-      assert.equal(storedReference, reference)
-      return storedReference
+    getQuizReferenceOrEmpty: (id: string) => references.get(id) ?? "",
+    runQuiz: (...args: unknown[]) => {
+      references.set(args[0] as string, args[3] as string)
+      calls.push(args)
+      return "LIA: wait"
     },
-    renderQuizSolution: (...args: unknown[]) => {
-      solutionCalls.push(args)
-      storedReference = args[2]
-    },
+    renderQuizSolution: (...args: unknown[]) => { solutionCalls.push(args) },
   }
-  // LiaScript runs the reactive output on display, before the learner checks.
-  for (const script of scripts.toReversed()) {
+  for (const script of scripts) {
     assert.ok(Buffer.byteLength(script[1]!, "utf8") < 450)
     const executable = script[1]!
       .replace('"@input(`lia-llm-result-@0`)"', '"true"')
@@ -13074,13 +13138,16 @@ test("LLMQuiz adapter forwards authored text and the LiaScript dependency unchan
   assert.deepEqual(solutionCalls, [["adapter-id", options, reference, "true", send]])
 })
 
-test("LLMQuiz registers its reference once on initial rendering even with solution=0", () => {
+test("LLMQuiz solution renderer retains a supplied reference even with solution=0", () => {
   const probe = createQuizRuntimeProbe()
   const rendered: string[] = []
   const send = {
     liascript: (value: string) => { rendered.push(value) },
     clear: () => undefined,
   }
+  assert.throws(() => getQuizReference(probe.id), /noch nicht initialisiert/u)
+  assert.equal(getQuizReferenceOrEmpty(probe.id), "")
+  renderQuizSolution(probe.api, probe.id, "0.66;solution=0", "", "", send)
   assert.throws(() => getQuizReference(probe.id), /noch nicht initialisiert/u)
   for (const result of ["", "false", "true"]) {
     const reference = "<!-- lia-llm:criterion -->\nUnverändertes Kriterium " + result +
@@ -14043,6 +14110,58 @@ test("download policy asks before mobile or uncertain large downloads", () => {
   )
 })
 
+test("QualityEvaluator chooses 4B when the reported school quota fits without evicting 1.7B", async () => {
+  const navigatorObject = globalThis.navigator
+  const previousStorage = Object.getOwnPropertyDescriptor(navigatorObject, "storage")
+  let quota = 6_974_348_663
+  let usage = 531_897_719
+  Object.defineProperty(navigatorObject, "storage", {
+    configurable: true,
+    value: { estimate: async () => ({ quota, usage }) },
+  })
+  try {
+    const inspect = async (smallCached: boolean) => {
+      const evaluator = new QualityEvaluator()
+      const internals = evaluator as unknown as {
+        probeModelCache(model: typeof SMALL_QUALITY_MODEL | typeof LARGE_QUALITY_MODEL): Promise<ModelCacheInfo>
+      }
+      internals.probeModelCache = async (model) => ({
+        supported: true,
+        cached: model.tier === "small" && smallCached,
+        downloadCached: model.tier === "small" && smallCached,
+        filesCached: model.tier === "small" && smallCached ? 4 : 0,
+        filesTotal: 4,
+        estimatedBytes: model.estimatedBytes,
+      })
+      return (await evaluator.getCacheInfo()).qualitySelection
+    }
+
+    const ample = await inspect(false)
+    assert.equal(ample?.model, LARGE_QUALITY_MODEL)
+    assert.equal(ample?.reason, "large-fits")
+
+    // A cached small model stays available if the only way to fit 4B
+    // would be to delete that working cache before a new download.
+    quota = 4_000_000_000
+    usage = 378_614_439 + SMALL_QUALITY_MODEL.estimatedBytes
+    const keepSmall = await inspect(true)
+    assert.equal(keepSmall?.model, SMALL_QUALITY_MODEL)
+    assert.equal(keepSmall?.reason, "small-cached")
+
+    quota = 2_500_000_000
+    usage = 500_000_000
+    const limited = await inspect(false)
+    assert.equal(limited?.model, SMALL_QUALITY_MODEL)
+    assert.equal(limited?.reason, "small-fits")
+  } finally {
+    if (previousStorage) {
+      Object.defineProperty(navigatorObject, "storage", previousStorage)
+    } else {
+      Reflect.deleteProperty(navigatorObject, "storage")
+    }
+  }
+})
+
 test("quality model selection defaults to small and keeps large explicitly selectable", async () => {
   const quota = 4 * 1024 * 1024 * 1024
   const usage = 378_614_439
@@ -14352,6 +14471,49 @@ test("resilient fetch retries only a truncated range and reconstructs all bytes"
     "bytes=0-3",
     "bytes=4-7",
     "bytes=4-7",
+    "bytes=8-9",
+  ])
+})
+
+test("resilient fetch retries a failed final range without starting the file over", async () => {
+  const payload = Uint8Array.from({ length: 10 }, (_value, index) => index)
+  const requestedRanges: string[] = []
+  let failedFinalRange = false
+  const session = new ResilientFetchSession(async (input) => {
+    const request = input instanceof Request ? input : new Request(input)
+    const rangeHeader = request.headers.get("range")
+    assert.ok(rangeHeader)
+    requestedRanges.push(rangeHeader)
+    if (rangeHeader === "bytes=8-9" && !failedFinalRange) {
+      failedFinalRange = true
+      throw new TypeError("Failed to fetch")
+    }
+    const match = rangeHeader.match(/^bytes=(\d+)-(\d+)$/u)
+    assert.ok(match)
+    const start = Number.parseInt(match[1], 10)
+    const end = Math.min(Number.parseInt(match[2], 10), payload.byteLength - 1)
+    return new Response(payload.slice(start, end + 1), {
+      status: 206,
+      headers: {
+        "content-length": String(end - start + 1),
+        "content-range": `bytes ${start}-${end}/${payload.byteLength}`,
+      },
+    })
+  }, {
+    chunkSizeBytes: 4,
+    retryDelaysMs: [0, 0],
+    stallTimeoutMs: 1_000,
+  })
+
+  const response = await session.fetchExact(
+    "https://example.test/weights.bin",
+    payload.byteLength,
+  )
+  assert.deepEqual(new Uint8Array(await response.arrayBuffer()), payload)
+  assert.deepEqual(requestedRanges, [
+    "bytes=0-3",
+    "bytes=4-7",
+    "bytes=8-9",
     "bytes=8-9",
   ])
 })

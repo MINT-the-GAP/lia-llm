@@ -359,6 +359,12 @@ function assertPhase(candidate, cold, warm) {
   if (warm.result.result?.passed !== true) {
     failures.push("Die Offline-Inferenz nach Browserneustart schlug fehl.")
   }
+  for (const [phaseName, phase] of [["Cold-Run", cold], ["Warmstart", warm]]) {
+    if (phase.result.result?.model?.id !==
+      "Xenova/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7") {
+      failures.push(phaseName + ": Die Bewertung verwendete nicht das echte Kompaktmodell.")
+    }
+  }
   for (const [phaseName, phase] of [
     ["Cold-Run", cold],
     ["Warmstart", warm],

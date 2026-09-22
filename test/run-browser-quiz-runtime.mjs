@@ -3,15 +3,31 @@ import { createHash } from "node:crypto"
 import { mkdir, readFile, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { chromium, firefox } from "playwright-core"
+import { chromium, devices, firefox, webkit } from "playwright-core"
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
+const reportPath = path.resolve(root, process.env.LIA_LLM_QUIZ_REPORT || "test-results/browser-quiz-runtime.json")
 const viewer = "https://liascript.github.io/course/"
 const templateBase = "https://raw.githubusercontent.com/MINT-the-GAP/lia-llm/main/"
 const course = "https://raw.githubusercontent.com/MINT-the-GAP/Wochenaufgabe/main/5/Deutsch/Lia5_03.md"
 const fixture = templateBase + "test/fixtures/quiz-runtime.md"
 const timeout = Number(process.env.LIA_LLM_QUIZ_TIMEOUT_MS || 90_000)
 const selected = (process.env.LIA_LLM_QUIZ_BROWSERS || "chromium,firefox").split(",")
+const iphone = devices["iPhone 13"]
+const iosAgent = (token) =>
+  iphone.userAgent.replace(/Version\/[^ ]+ Mobile/u, `${token} Mobile`)
+const candidates = {
+  edge: { type: chromium, launch: { channel: "msedge" }, evidence: "installed Windows Edge" },
+  chrome: { type: chromium, launch: { channel: "chrome" }, evidence: "installed Windows Chrome" },
+  chromium: { type: chromium, launch: {}, evidence: "Playwright Chromium" },
+  firefox: { type: firefox, launch: {}, evidence: "Playwright Firefox" },
+  webkit: { type: webkit, launch: {}, evidence: "Playwright WebKit on Windows; Safari engine proxy" },
+  "brave-sim": { type: chromium, launch: {}, evidence: "Chromium proxy for Brave; Shields and Brave UI are not simulated" },
+  "ios-safari": { type: webkit, launch: {}, context: iphone, evidence: "Playwright WebKit with iPhone touch and viewport emulation; not iOS Safari" },
+  "ios-chrome": { type: webkit, launch: {}, context: { ...iphone, userAgent: iosAgent("CriOS/153.0.0.0") }, evidence: "Playwright WebKit with iPhone and CriOS user-agent emulation; not iOS Chrome" },
+  "ios-edge": { type: webkit, launch: {}, context: { ...iphone, userAgent: iosAgent("EdgiOS/153.0.0.0") }, evidence: "Playwright WebKit with iPhone and EdgiOS user-agent emulation; not iOS Edge" },
+  "ios-brave": { type: webkit, launch: {}, context: { ...iphone, userAgent: iosAgent("Brave/153.0.0.0") }, evidence: "Playwright WebKit with iPhone and Brave user-agent emulation; not iOS Brave" },
+}
 const report = { generatedAt: new Date().toISOString(), viewer, course, browsers: [] }
 
 // Only model computation is substituted. Macro expansion, the public viewer,
@@ -63,7 +79,7 @@ function installEvaluatorStub() {
   })
 }
 
-async function runInteractions(page, result) {
+async function runInteractions(page, result, mobile = false) {
   result.interactions = []
   const record = name => { result.interactions.push(name); console.log("  PASS " + name) }
   const input = index => page.locator(".lia-quiz__input").nth(index)
@@ -75,6 +91,7 @@ async function runInteractions(page, result) {
     await page.evaluate(value => { window.__quizRegression.mode = value }, mode)
     await page.locator("lia-llm-textarea-host textarea").nth(index).fill("Eine ausfuehrliche Antwort.\nEin weiterer begruendeter Satz.")
     if (keyboard) { await check(index).focus(); await check(index).press("Enter") }
+    else if (mobile) await check(index).tap()
     else await check(index).click()
     await page.waitForFunction(previous => window.__quizRegression.calls.length > previous, count, { timeout: 5000 })
     return count
@@ -160,7 +177,8 @@ async function runInteractions(page, result) {
   await page.getByText("Musterloesung B fuer Aufgabe 6.", { exact: false }).waitFor()
   assert.equal(await page.getByText("Musterloesung A fuer Aufgabe 6.", { exact: false }).count(), 0)
   assert.equal(await input(5).isDisabled(), true)
-  await feedback(5).getByRole("button", { name: "Sprache prüfen", exact: true }).click()
+  if (mobile) await feedback(5).getByRole("button", { name: "Sprache prüfen", exact: true }).tap()
+  else await feedback(5).getByRole("button", { name: "Sprache prüfen", exact: true }).click()
   await page.waitForFunction(() => window.__quizRegression.language.length === 1)
   const language = await page.evaluate(() => window.__quizRegression.language[0])
   assert.deepEqual(language.request.languageAnalysis, { spelling: true, syntax: true })
@@ -192,6 +210,16 @@ async function runInteractions(page, result) {
   assert.equal(await page.getByText("Musterloesung A fuer Aufgabe 6.", { exact: false }).count(), 0)
   assert.equal(await input(4).evaluate(element => element.closest(".lia-quiz").classList.contains("solved")), false)
   record("returning to a slide preserves the selected solution and discards outdated results")
+  if (process.env.LIA_LLM_QUIZ_RELOAD === "1") {
+    await page.reload({ waitUntil: "domcontentloaded", timeout })
+    await page.waitForFunction(() => [...document.querySelectorAll("lia-llm-textarea-host")].filter(host => !host.hidden && host.shadowRoot?.querySelector("textarea")).length === 6, null, { timeout })
+    result.reload = {
+      solved: await page.locator(".lia-quiz").nth(5).evaluate(element => element.classList.contains("solved")),
+      selectedSolution: await page.getByText("Musterloesung B fuer Aufgabe 6.", { exact: false }).count(),
+    }
+    if (result.reload.solved) assert.ok(result.reload.selectedSolution > 0, "Restored solved quiz lost its selected solution")
+    record(result.reload.solved ? "page reload restores the saved quiz and solution" : "page reload starts a fresh quiz when the viewer has no persisted result")
+  }
   result.evaluationCount = await page.evaluate(() => window.__quizRegression.calls.length)
 }
 
@@ -251,6 +279,8 @@ async function runWeeklyInteractions(page, result) {
 
 async function main() {
   const readme = await readFile(path.join(root, "README.md"), "utf8")
+  const packageVersion = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")).version
+  report.expectedVersion = packageVersion
   const bundle = await readFile(path.join(root, "dist/index.js"))
   const fixtureSource = await readFile(path.join(root, "test/fixtures/quiz-runtime" + (process.env.LIA_LLM_QUIZ_EXTREME === "1" ? "" : "-representative") + ".md"), "utf8")
   const adapter = readme.match(/(?:^|\n)@LLMQuiz_\r?\n([\s\S]*?)\r?\n@end/)[1]
@@ -261,20 +291,24 @@ async function main() {
   assert.equal((fixtureSource.match(/\x60\x60\x60text @LLMQuiz\(/gu) || []).length, 7)
   report.fixtureBytes = Buffer.byteLength(fixtureSource)
   for (const id of selected) {
-    const type = { chromium, firefox }[id.trim()]
-    assert.ok(type, "Unknown browser " + id)
-    const browserReport = { id, cases: [], errors: [] }
+    const candidate = candidates[id.trim()]
+    assert.ok(candidate, "Unknown browser " + id)
+    const browserReport = { id, evidence: candidate.evidence, cases: [], errors: [] }
     report.browsers.push(browserReport)
     let browser
     try {
-      browser = await type.launch({ headless: true })
+      browser = await candidate.type.launch({ headless: true, ...candidate.launch })
       browserReport.version = browser.version()
       for (const scenario of [
         { name: "six-long-quizzes", url: fixture, slide: 2 },
         { name: "unchanged-weekly-course", url: course, slide: 3 },
       ].filter(scenario => !process.env.LIA_LLM_QUIZ_CASE || scenario.name === process.env.LIA_LLM_QUIZ_CASE)) {
         console.log("[" + id + "] " + scenario.name)
-        const context = await browser.newContext({ viewport: { width: 1440, height: 1100 }, serviceWorkers: "block" })
+        const context = await browser.newContext({
+          viewport: { width: 1440, height: 1100 },
+          serviceWorkers: "block",
+          ...candidate.context,
+        })
         const result = { name: scenario.name, pageErrors: [], requests: [], consoleErrors: [] }
         browserReport.cases.push(result)
         let page
@@ -307,15 +341,45 @@ async function main() {
           result.textareas = await page.locator("lia-llm-textarea-host textarea:visible").count()
           result.quizzes = await page.locator(".lia-quiz__input").count()
           result.title = await page.title()
+          result.capabilities = await page.evaluate(async () => {
+            let storageEstimate = "unavailable"
+            try {
+              if (typeof navigator.storage?.estimate === "function") {
+                const estimate = await Promise.race([
+                  navigator.storage.estimate(),
+                  new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 1500)),
+                ])
+                storageEstimate = {
+                  quota: estimate.quota ?? null,
+                  usage: estimate.usage ?? null,
+                }
+              }
+            } catch (error) {
+              storageEstimate = error?.message || String(error)
+            }
+            return {
+              userAgent: navigator.userAgent,
+              touch: "ontouchstart" in window || navigator.maxTouchPoints > 0,
+              maxTouchPoints: navigator.maxTouchPoints,
+              coarsePointer: matchMedia("(pointer: coarse)").matches,
+              viewportWidth: innerWidth,
+              webGpu: Boolean(navigator.gpu),
+              cacheStorage: typeof caches !== "undefined",
+              secureContext: isSecureContext,
+              storageEstimate,
+              runtimeVersion: window.LiaLLM?.version,
+            }
+          })
+          assert.equal(result.capabilities.runtimeVersion, packageVersion)
           result.viewerScripts = await page.locator("script[src]").evaluateAll(scripts => scripts.map(script => script.src).filter(src => src.startsWith("https://liascript.github.io/course/")))
           assert.equal(result.textareas, 6, "All six answer textareas must be visible")
           assert.ok(result.requests.some(url => url.endsWith("/README.md")), "Local template was not loaded")
-          assert.ok(result.requests.some(url => url.endsWith("/dist/index.js")), "Local bundle was not loaded")
+          assert.ok(result.requests.some(url => new URL(url).pathname.endsWith("/dist/index.js")), "Local bundle was not loaded")
           await page.waitForTimeout(250)
           assert.deepEqual(result.pageErrors, [], "Uncaught browser error while parsing/rendering quizzes")
           result.preloadCalls = await page.evaluate(() => window.__quizRegression.preload)
           assert.ok(result.preloadCalls > 0, "Rendered quizzes must preload their model")
-          if (scenario.url === fixture && process.env.LIA_LLM_QUIZ_EXTREME !== "1") await runInteractions(page, result)
+          if (scenario.url === fixture && process.env.LIA_LLM_QUIZ_EXTREME !== "1") await runInteractions(page, result, candidate.context?.isMobile === true)
           else if (scenario.url === course) await runWeeklyInteractions(page, result)
           assert.deepEqual(result.pageErrors, [], "Uncaught browser error during interaction")
           result.status = "passed"
@@ -325,7 +389,7 @@ async function main() {
           result.status = "failed"
           result.error = String(error.stack || error)
           console.error("[" + id + "/" + scenario.name + "] " + (result.error.length > 1500 ? result.error.slice(0,300) + " ... " + result.error.slice(-1100) : result.error))
-        } finally { await context.close(); await writeFile(path.join(root, "test-results/browser-quiz-runtime.json"), JSON.stringify(report, null, 2) + "\n") }
+        } finally { await context.close(); await writeFile(reportPath, JSON.stringify(report, null, 2) + "\n") }
       }
     } catch (error) { browserReport.errors.push(String(error.stack || error)) }
     finally { if (browser) await browser.close() }
@@ -336,7 +400,7 @@ try { await main() }
 catch (error) { report.error = String(error.stack || error) }
 finally {
   await mkdir(path.join(root, "test-results"), { recursive: true })
-  const target = path.join(root, "test-results/browser-quiz-runtime.json")
+  const target = reportPath
   await writeFile(target, JSON.stringify(report, null, 2) + "\n")
   console.log("Report: " + target)
 }

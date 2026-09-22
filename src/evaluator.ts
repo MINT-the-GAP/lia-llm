@@ -1030,7 +1030,7 @@ export class SemanticEvaluator {
         recordDebugRetry("compact", retry)
         emit<ModelProgress>("lia-llm:progress", {
           status: "retry",
-          message: `Netzwerkunterbrechung – Teil-Download wird erneut versucht (${attempt}/4).`,
+          message: `Netzwerkunterbrechung – Teil-Download wird erneut versucht (${attempt}).`,
         })
       },
       onFailure: (failure) => recordDebugFailure("compact", failure),

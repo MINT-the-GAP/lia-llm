@@ -1,6 +1,6 @@
 # Browser- und Schulnetz-Härtetest
 
-Stand dieser Evidenz: 4. September 2026. Dieses Dokument beschreibt den
+Stand dieser Evidenz: 22. September 2026. Dieses Dokument beschreibt den
 reproduzierbaren Freigabetest für Download, Cache, Browserneustart, echte
 Offline-Inferenz und Cache-Löschung. Die vollständigen PASS-Nachweise dieses
 Ablaufs gelten nur für das kompakte mDeBERTa-Modell mit ONNX Runtime/WASM.
@@ -124,7 +124,63 @@ Real-OS-Nachweis dienen. iOS-/iPadOS- und Android-Freigaben benötigen ein echte
 Gerät oder eine Device-Farm, die Browserprofil, Neustart, Netzwerkblockade und
 Cache-Löschung real abbildet.
 
-## Derzeit belegte Ergebnisse
+## Wiederholung am 22. September 2026
+
+Auf dem Testhost Windows 10 Pro, Build 19045, bestanden die installierten
+Browser Edge 153.0.4234.48 und Chrome 153.0.8010.53 den vollständigen
+Kompaktmodell-Härtetest. Beide luden das Modell in einem frischen Profil,
+bewerteten eine nicht wortgleiche, aber inhaltlich passende Antwort mit dem
+echten mDeBERTa-NLI-Modell und wiederholten dies nach Browserneustart aus dem
+Cache bei vollständig gesperrtem externem Netz. Im Offline-Lauf gab es null
+externe Request-Versuche; `clearCache()` entfernte jeweils acht Einträge.
+Der gemeinsame strukturierte PASS-Bericht liegt unter
+`test-results/browser-hardening-2026-09-22T11-58-55-269Z.json`.
+
+Alle früheren Härtetestberichte bis zur Korrektur der Fixture, darunter die
+Läufe vom 22. September um 10:48 und 11:17 UTC sowie die Vergleichstabelle
+unten, verwendeten eine mit der Referenz wortgleiche Antwort. Sie belegen
+Download, Cache und Neustart, aber keine echte NLI-Inferenz. Der neue Runner
+verlangt deshalb ausdrücklich die Modell-ID in beiden Phasen.
+
+Playwright WebKit 26.5 unter Windows erreichte im frischen Profil erstmals
+100 % des ONNX-Downloads. Der Lauf ist trotzdem **FAIL**: Danach waren null
+von sechs Modelldateien im Cache. Fünf `pageerror`-Ereignisse meldeten
+`Failed writing data to the file system`; nach Browserneustart und Netzsperre
+misslang die Modellvorbereitung. Die damalige Cold-Bewertung verwendete noch
+den exakten Textabgleich und ist kein NLI-Nachweis. Siehe
+`test-results/browser-hardening-2026-09-22T11-23-56-145Z.json`.
+Das ist eine Grenze dieses getesteten WebKit-Builds auf Windows und kein
+Nachweis über Safari auf macOS oder iOS.
+
+### Reale Quality-4B-Prüfung
+
+Edge 153.0.4234.48 und Chrome 153.0.8010.53 wählten bei ausreichender
+Origin-Quote automatisch `Qwen3-4B-q4f16_1-MLC`. Beide luden die
+2,28-GB-Modellgewichte vollständig, starteten WebGPU und bewerteten zwei
+Kriterienfälle richtig: eine hinreichende Antwort als bestanden und einen
+ausdrücklichen Widerspruch als nicht bestanden. Der erste Chrome-Fall
+einschließlich Download dauerte rund 21 Minuten. Der strukturierte
+Chrome-Nachweis liegt unter
+`test-results/browser-quality-criteria-chrome-2026-09-22.json`.
+Nach einem vollständigen Chrome-Browserneustart meldete der gleiche Origin
+alle 74 Gewichtsshards und `cached=true`; beide Bewertungen bestanden erneut.
+Der erste Fall dauerte aus dem Cache 54 Sekunden statt rund 21 Minuten beim
+Cold-Lauf. Dieser Warm-Lauf war nicht vollständig offline geschaltet.
+Die Tests liefen über die lokale Test-Origin und beweisen keine Erreichbarkeit
+der Modell-CDN im Schulnetz.
+
+### Beobachtete Grenze der Kompaktbewertung
+
+In einem zusätzlichen Chrome-Test mit dem echten Kompaktmodell wurden sechs
+sinngleiche Umformulierungen der Eis-Dichte-Erklärung als richtig erkannt.
+Eine weitere sachlich passende Umformulierung wurde als `failed` bewertet
+(Entailment 0,0905; Neutral 0,8891). Das ist ein semantisches Fehlurteil des
+kleineren Modells, kein Download- oder Cachefehler. Der lokale Bericht ist
+`test-results/compact-paraphrase-probe-2026-09-22.json`.
+Der Selbstcheck bleibt formativ; besonders auf Geräten ohne WebGPU kann
+die Kompaktbewertung richtige Antworten übersehen.
+
+## Frühere Vergleichsläufe
 
 Testhost: Windows 10 Pro, Version `10.0.19045`, x64, Node.js `v24.14.0`.
 
@@ -404,13 +460,11 @@ Modellbibliotheksrevision `025bcaf3780fa8254f5e5efd3bfea0a5397248f4`.
 
 Vor einem ungecacheten Quality-Download prüft das Template
 `navigator.storage.estimate()` mit einer Reserve von `max(512 MiB, 10 % der quota)`.
-Version 0.6.5 wählt 1.7B als erprobten Produktionsstandard, sobald diese Stufe sicher passt oder
-ihre Gewichte bereits vorhanden sind; eine große Origin-Quote löst kein automatisches
-4B-Upgrade mehr aus. Bei unbekannter Quote bleibt 1.7B die konservative Auswahl; reicht eine
-bekannte Quote dafür nicht, startet kein neuer Quality-Download. Ein vollständig gecachtes
-4B-Modell kann als Fallback dienen, wenn 1.7B nicht zusätzlich sicher passt. Ein Large-Pfad ist nur
-intern für Tests und mögliche Integrationen reserviert; die öffentliche Makro-API exponiert ihn
-nicht.
+Die aktuelle Produktionsauswahl bevorzugt 4B, wenn 2.280.000.000 B nach Abzug der Reserve
+zusätzlich frei sind oder das 4B-Modell vollständig gecacht ist. Bei knapper oder unbekannter
+Quote bleibt 1.7B der Rückfall; reicht eine bekannte Quote auch dafür nicht, startet kein
+neuer Quality-Download. Ein vorhandener 1.7B-Cache wird für ein automatisches 4B-Upgrade
+nicht vorab gelöscht. Die Zustimmungsabfrage nennt das gewählte Modell und dessen Größe.
 Eine als vollständig gecacht freigegebene Aktivierung bleibt netzwerkgesperrt: Verschwundene oder
 beschädigte Artefakte dürfen erst nach einer neuen Bestätigung nachgeladen werden.
 Das belegt jedoch weder ausreichenden GPU-Speicher noch ein stabiles WebGPU-Gerät. Compact bleibt
@@ -504,9 +558,9 @@ adaptiven Thinking-Pfad. Die gesamte erste Bewertung dauerte in Edge 43.802 ms u
 bestand dieselbe kurze `5_09`-Antwort im unverändert geladenen Worker erneut mit 8 von 8 Kriterien.
 Im beobachteten Zeitraum traten weder `Buffer unmapped` noch ein verlorenes WebGPU-Gerät auf.
 
-Der normale npm-Kurzbefehl verwendet die produktive automatische Stufenwahl und bleibt nun auch
-bei großer Origin-Quote auf Qwen3-1.7B. Für eine zusätzlich erzwungene
-Qwen3-1.7B-Wiederholung besitzt die Test-Fixture den Queryparameter `qualityTier=small`. Da
+Der normale npm-Kurzbefehl verwendet die produktive automatische Stufenwahl und kann bei
+genügend freier Origin-Quote Qwen3-4B herunterladen. Für reproduzierbare
+Qwen3-1.7B-Läufe besitzt die Test-Fixture den Queryparameter `qualityTier=small`. Da
 WebLLM-Caches an die vollständige Origin
 einschließlich Port gebunden sind, muss für vergleichbare Cold-/Warm-Läufe derselbe freie Port
 verwendet werden:

@@ -24,7 +24,7 @@ export const LARGE_QUALITY_MODEL = {
 export const QUALITY_MODELS = [LARGE_QUALITY_MODEL, SMALL_QUALITY_MODEL] as const
 
 // Keep the established constants as aliases for callers that explicitly use
-// the conservative 1.7B default. Runtime selection may choose either model.
+// the 1.7B model. Runtime selection may choose either model.
 export const QUALITY_MODEL_ID = SMALL_QUALITY_MODEL.id
 export const QUALITY_MODEL_REVISION = SMALL_QUALITY_MODEL.revision
 export const QUALITY_MODEL_LIB_REVISION =

@@ -20,9 +20,12 @@ interface QuizRuntimeGlobal {
 const quizSessions = new Map<string, () => void>()
 const quizReferences = new Map<string, string>()
 
-// The reactive solution script runs on initial display, including unsolved
-// quizzes. Store the authored source there once instead of expanding a second
-// copy into the validator. Keep it available for restored quiz results.
+// The validator receives the authored source directly and registers it before
+// any asynchronous work. The solution script can run earlier on initial display.
+export function getQuizReferenceOrEmpty(id: string): string {
+  return quizReferences.get(id) ?? ""
+}
+
 export function getQuizReference(id: string): string {
   const source = quizReferences.get(id)
   if (source === undefined) {
@@ -45,6 +48,7 @@ export function runQuiz(
   input: string,
   send: LiaQuizSend,
 ): "LIA: wait" {
+  quizReferences.set(id, referenceSource)
   const root = (typeof window === "undefined" ? globalThis : window) as
     typeof globalThis & QuizRuntimeGlobal
   const feedbackId = `lia-llm-feedback-${id}`
@@ -412,6 +416,10 @@ export function renderQuizSolution(
   solutionResult: string,
   send: LiaQuizSolutionSend,
 ): void {
+  if (!referenceSource) {
+    send.clear()
+    return
+  }
   quizReferences.set(id, referenceSource)
   const solutionOptions = api?.parseMacroOptions?.(optionSource)
   const solutionVariantId = `lia-llm-solution-variant-${id}`

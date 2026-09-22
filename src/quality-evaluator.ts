@@ -29,6 +29,7 @@ import {
 import {
   estimateAndSelectQualityModel,
   estimateStorageAvailability,
+  selectQualityModel,
   type QualityModelSelectionDecision,
 } from "./quality-model-selection.ts"
 import {
@@ -221,8 +222,10 @@ const QUALITY_CRITERIA_UNCERTAIN_RECHECKS = 1
 const QUALITY_CRITERIA_THINKING_MAX_ITEMS = 2
 const QUALITY_DATA_START = "BEGIN_UNTRUSTED_ASSESSMENT_DATA_JSON"
 const QUALITY_DATA_END = "END_UNTRUSTED_ASSESSMENT_DATA_JSON"
-const QUALITY_ARTIFACT_RETRY_DELAYS_MS = [0, 750, 2_000, 5_000, 10_000] as const
-const QUALITY_ARTIFACT_DOWNLOAD_CONCURRENCY = 3
+const QUALITY_ARTIFACT_RETRY_DELAYS_MS = [0, 1_000, 3_000, 7_000, 15_000, 30_000] as const
+// A classroom can start dozens of downloads through the same school proxy.
+// One transfer per browser avoids multiplying that load for every pupil.
+const QUALITY_ARTIFACT_DOWNLOAD_CONCURRENCY = 1
 const QUALITY_VERIFIED_BYTES_HEADER = "x-lia-llm-verified-bytes"
 const QUALITY_BINARY_VALIDATION_HEADER = "x-lia-llm-binary-validation"
 const QUALITY_WASM_VALIDATION_MARKER = "webassembly-validate-v1"
@@ -1407,7 +1410,7 @@ function now(): number {
 
 export const QUALITY_BASELINE_HARD_TIMEOUT_MS = 150_000
 export const QUALITY_WORKER_RELOAD_HARD_TIMEOUT_MS = 120_000
-export const QUALITY_WORKER_COMPLETION_ABORT_GRACE_MS = 10_000
+export const QUALITY_WORKER_COMPLETION_ABORT_GRACE_MS = 30_000
 
 type QualityEngine = Pick<MLCEngine, "chat" | "reload" | "unload"> & {
   interruptGenerate(): void | Promise<void>
@@ -1446,11 +1449,17 @@ export class QualityWorkerTimeoutError extends Error {
   readonly operation: "reload" | "completion"
   readonly timeoutMs: number
 
-  constructor(operation: "reload" | "completion", timeoutMs: number) {
+  constructor(
+    operation: "reload" | "completion",
+    timeoutMs: number,
+    interrupted = false,
+  ) {
     super(
       operation === "reload"
         ? `Der Quality-Worker konnte das Modell nicht innerhalb von ${timeoutMs} ms laden.`
-        : `Der Quality-Worker konnte die Auswertung nicht innerhalb von ${timeoutMs} ms abschliessen.`,
+        : interrupted
+          ? `Der Quality-Worker hat eine unterbrochene Auswertung nicht innerhalb von ${timeoutMs} ms beendet.`
+          : `Der Quality-Worker konnte die Auswertung nicht innerhalb von ${timeoutMs} ms abschliessen.`,
     )
     this.name = "QualityWorkerTimeoutError"
     this.operation = operation
@@ -1763,6 +1772,7 @@ export class QualityWorkerSupervisor {
           new QualityWorkerTimeoutError(
             "completion",
             this.completionAbortGraceMs,
+            true,
           ),
         )
         resolve()
@@ -3041,10 +3051,12 @@ class QualityDownloadConsentRequiredError extends Error {
 class QualityDownloadProgress {
   private readonly expected = new Map<string, number>()
   private readonly loaded = new Map<string, number>()
+  private readonly completed = new Set<string>()
 
   setWeightPlan(artifacts: readonly QualityWeightArtifact[]): void {
     this.expected.clear()
     this.loaded.clear()
+    this.completed.clear()
     for (const artifact of artifacts) {
       if (artifact.expectedBytes !== undefined) {
         this.expected.set(artifact.url, artifact.expectedBytes)
@@ -3057,6 +3069,7 @@ class QualityDownloadProgress {
   markWeightComplete(artifact: QualityWeightArtifact): void {
     if (artifact.expectedBytes === undefined) return
     this.loaded.set(artifact.url, artifact.expectedBytes)
+    this.completed.add(artifact.url)
     this.report(artifact.url)
   }
 
@@ -3091,7 +3104,10 @@ class QualityDownloadProgress {
     }
     emit<ModelProgress>("lia-llm:progress", {
       status: "progress",
-      progress: (loaded / total) * 100,
+      // Received bytes count only after Cache.put() has completed.
+      progress: this.completed.size === this.expected.size
+        ? 100
+        : Math.min(99, (loaded / total) * 100),
       loaded,
       total,
       file,
@@ -3187,12 +3203,15 @@ async function matchingCachedArtifact(
   }
 }
 
-function terminalQualityArtifactError(error: unknown): boolean {
+function terminalQualityArtifactError(
+  error: unknown,
+  signal?: AbortSignal,
+): boolean {
   if (error instanceof QualityDownloadConsentRequiredError) return true
   if (error instanceof QualityArtifactHttpError) return !error.retryable
   if (!(error instanceof Error)) return false
   return (
-    error.name === "AbortError" ||
+    (error.name === "AbortError" && signal?.aborted === true) ||
     error.name === "QuotaExceededError" ||
     error.name === "SecurityError" ||
     error.name === "NotSupportedError"
@@ -3233,7 +3252,13 @@ async function ensureQualityArtifactCached(
     attempt += 1
   ) {
     const delay = QUALITY_ARTIFACT_RETRY_DELAYS_MS[attempt] ?? 0
-    if (delay > 0) await waitQualityArtifactRetry(delay, session.signal)
+    if (delay > 0) {
+      // Avoid synchronised retries by pupils behind the same proxy.
+      await waitQualityArtifactRetry(
+        Math.round(delay * (0.75 + Math.random() * 0.5)),
+        session.signal,
+      )
+    }
     try {
       const request = new Request(artifact.url)
       const response =
@@ -3279,10 +3304,21 @@ async function ensureQualityArtifactCached(
     } catch (error) {
       lastError = error
       await cache.delete(artifact.url).catch(() => false)
-      if (
-        terminalQualityArtifactError(error) ||
-        attempt + 1 >= QUALITY_ARTIFACT_RETRY_DELAYS_MS.length
-      ) {
+      if (terminalQualityArtifactError(error, session.signal)) throw error
+      if (attempt + 1 >= QUALITY_ARTIFACT_RETRY_DELAYS_MS.length) {
+        // An AbortError from fetch can be a transient browser/network failure.
+        // Once retries are exhausted it must still surface as a load error,
+        // rather than looking like an intentional user cancellation.
+        if (
+          error instanceof Error &&
+          error.name === "AbortError" &&
+          !session.signal.aborted
+        ) {
+          throw new Error(
+            "Der Modell-Download wurde wiederholt unerwartet unterbrochen (AbortError).",
+            { cause: error },
+          )
+        }
         throw error
       }
       recordDebugRetry("quality", {
@@ -3506,7 +3542,7 @@ async function cacheQualityWeights(
         observer?.markWeightComplete(artifact)
       } catch (error) {
         failures.push(error)
-        if (terminalQualityArtifactError(error)) {
+        if (terminalQualityArtifactError(error, session.signal)) {
           stopped = true
           session.abort(errorMessage(error))
           return
@@ -5865,18 +5901,30 @@ export class QualityEvaluator {
       this.probeModelCache(SMALL_QUALITY_MODEL),
       this.probeModelCache(LARGE_QUALITY_MODEL),
     ]).then(async ([small, large]) => {
-      const result = await estimateAndSelectQualityModel({
-        cache: {
-          small: {
-            cached: small.cached,
-            payloadCached: small.downloadCached ?? small.cached,
-          },
-          large: {
-            cached: large.cached,
-            payloadCached: large.downloadCached ?? large.cached,
-          },
+      const cache = {
+        small: {
+          cached: small.cached,
+          payloadCached: small.downloadCached ?? small.cached,
         },
+        large: {
+          cached: large.cached,
+          payloadCached: large.downloadCached ?? large.cached,
+        },
+      }
+      const preferred = await estimateAndSelectQualityModel({
+        cache,
+        preferredTier: "large",
       })
+      // Prefer 4B when it fits without evicting a working 1.7B cache.
+      // Replacing the only usable model before an unverified large download
+      // could leave a pupil with no Quality model after a network failure.
+      const result = preferred.reason === "large-fits-after-small-removal"
+        ? selectQualityModel({
+            storage: preferred.storage,
+            cache,
+            preferredTier: "small",
+          })
+        : preferred
       if (
         generation === this.modelSelectionGeneration &&
         !this.engine
