@@ -1,6 +1,6 @@
 <!--
 author:      MINT-the-GAP, Martin Lommatzsch
-version:     0.6.7
+version:     0.6.8
 language:    de
 narrator:    Deutsch Female
 comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
@@ -522,9 +522,9 @@ Lauf besitzt ein eigenes Abbruchsignal und kein Inhalts-Thinking-Budget. Das ber
 Inhaltsurteil, seine Qualität und die ausgewählte Musterlösung werden dadurch nicht mehr verändert.
 Währenddessen kann weitergearbeitet oder die Folie gewechselt werden; eine neue Inhaltsprüfung
 beendet einen noch laufenden optionalen Sprachjob. Bereits vollständig geladene Cache-Artefakte
-bleiben erhalten. Eine noch laufende gemeinsame Quality-Vorbereitung läuft nur weiter, solange
-mindestens ein anderer aktiver Inhalts- oder Sprachlauf auf sie wartet; andernfalls wird sie
-abgebrochen.
+bleiben erhalten. Ein ausdrücklich bestätigter Quality-Netzwerkdownload läuft auch nach einem
+Folienwechsel im Hintergrund bis zum vollständigen Browsercache weiter. Nur die Auswertung und
+Ausgabe der verlassenen Aufgabe werden beendet.
 
 Die Grammatikprüfung darf bewusst länger dauern als die bisherige Statistik: Nach der allgemeinen
 Sprachanalyse erzeugt der Browser selbst sichere Wortpositionen und Optionen. Stimmen Worttoken,
@@ -748,11 +748,11 @@ Quality-Auswahl beziehungsweise die kompatible implizite Auswahl durch Operator,
 aktiviertes Thinking startet den Quality-Pfad. Dieser wartet bei einem ungecachten oder nur teilweise
 gecachten Qualitätsmodell höchstens 30 Sekunden, bei einem vollständig gecachten Warmstart höchstens
 180 Sekunden. Danach greift der jeweils vorgesehene Kompakt- beziehungsweise `uncertain`-Fallback.
-Hat dieser Zeit-Fallback die globale Quality-Vorbereitung bereits bewusst vom Quiz gelöst, läuft sie
-sichtbar bis zum vollständigen Cache weiter; ein späteres Ende dieses bereits abgeschlossenen
-Quizlaufs bricht den losgelösten Hintergrunddownload nicht ab. Wird eine noch wartende Prüfung
-dagegen ausdrücklich abgebrochen, endet auch ihre Quality-Vorbereitung, sobald kein anderer aktiver
-Lauf mehr auf dieselbe Vorbereitung wartet.
+Sobald ein noch nötiger Quality-Netzwerkdownload ausdrücklich bestätigt wurde, ist er vom
+auslösenden Quiz gelöst und läuft sichtbar bis zum vollständigen Cache weiter. Ein Folienwechsel,
+das Ende des Quizlaufs oder der Zeit-Fallback beendet nur die konkrete Auswertung, nicht mehr den
+bereits freigegebenen Download. Weitere Aufgaben können währenddessen bearbeitet werden und nutzen
+dieselbe Vorbereitung, sobald sie abgeschlossen ist.
 
 Vor jedem noch nicht vollständig gecachten Quality-Download wird unabhängig von Verbindungsart und
 Gerät ausdrücklich gefragt. Das Dialogfeld nennt das ausgewählte Modell, die geschätzte
@@ -886,9 +886,9 @@ Eine umgekehrte Kernaussage muss falsch bleiben:
 > Eis schwimmt, weil es eine höhere Dichte als flüssiges Wasser besitzt.
 
 Beim Folienwechsel oder Zurücksetzen beendet die Runtime über LiaScripts `stop`-Handler
-und den Lebenszyklus des Quiz-Elements die Ausgabe und die aktive Auswertung der verlassenen Aufgabe. Vollständig geladene Cache-Artefakte bleiben erhalten. Eine noch gemeinsam
-genutzte Quality-Vorbereitung läuft für andere aktive Aufgaben weiter; ohne weiteren Interessenten
-wird sie abgebrochen. Nur eine nach dem oben beschriebenen Zeit-Fallback bereits bewusst losgelöste
-Hintergrundvorbereitung läuft unabhängig vom beendeten Quiz weiter. Dadurch erscheint kein
-verspätetes Quizresultat auf einer anderen Folie; ein bereits vorbereitetes Modell steht für spätere
-Aufgaben weiterhin zur Verfügung.
+und den Lebenszyklus des Quiz-Elements die Ausgabe und die aktive Auswertung der verlassenen Aufgabe.
+Vollständig geladene Cache-Artefakte bleiben erhalten. Ein bereits ausdrücklich bestätigter
+Quality-Netzwerkdownload läuft unabhängig vom beendeten Quiz im Hintergrund weiter; ein noch nicht
+bestätigter Downloaddialog wird mit der wartenden Aufgabe beendet. Dadurch erscheint kein
+verspätetes Quizresultat auf einer anderen Folie, während das fertig geladene Modell für spätere
+Aufgaben zur Verfügung steht.

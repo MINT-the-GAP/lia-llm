@@ -10915,7 +10915,7 @@ test("automatic evaluator aborts pending quality consent and restarts immediatel
   })
 })
 
-test("automatic evaluator keeps a shared uncached upgrade alive until its last waiter cancels", async () => {
+test("automatic evaluator keeps a confirmed download alive after all waiters cancel", async () => {
   await withForegroundQualityRuntime(async () => {
     const compact = new ForegroundWaitMockEvaluator(
       "compact-shared-cancel",
@@ -10928,6 +10928,7 @@ test("automatic evaluator keeps a shared uncached upgrade alive until its last w
       foregroundWaitCache(false),
     )
     let firstSignal: AbortSignal | undefined
+    let releasePreload!: () => void
     let reportPreload!: () => void
     const preloadStarted = new Promise<void>((resolve) => {
       reportPreload = resolve
@@ -10936,14 +10937,8 @@ test("automatic evaluator keeps a shared uncached upgrade alive until its last w
       if (call !== 1) return
       firstSignal = signal
       reportPreload()
-      await new Promise<void>((_resolve, reject) => {
-        const abort = (): void => {
-          const error = new Error("quality preload canceled")
-          error.name = "AbortError"
-          reject(error)
-        }
-        if (signal?.aborted) abort()
-        else signal?.addEventListener("abort", abort, { once: true })
+      await new Promise<void>((resolve) => {
+        releasePreload = resolve
       })
     }
     const automatic = new AutomaticEvaluator(
@@ -10979,16 +10974,20 @@ test("automatic evaluator keeps a shared uncached upgrade alive until its last w
     secondController.abort()
     const restarted = automatic.evaluate(request)
     await assert.rejects(second, { name: "AbortError" })
+    assert.equal(firstSignal?.aborted, false)
+    assert.equal(quality.cancelPreloadCalls, 0)
+    assert.equal(quality.preloadCalls, 1)
+    releasePreload()
     const restartedResult = await restarted
-    assert.equal(firstSignal?.aborted, true)
-    assert.equal(quality.cancelPreloadCalls, 1)
-    assert.equal(quality.preloadCalls, 2)
+    assert.equal(firstSignal?.aborted, false)
+    assert.equal(quality.cancelPreloadCalls, 0)
+    assert.equal(quality.preloadCalls, 1)
     assert.equal(quality.evaluateCalls, 1)
     assert.equal(restartedResult.model.id, "quality-shared-cancel")
   })
 })
 
-test("automatic evaluator scopes cancellation to the exact quality upgrade attempt", async () => {
+test("an aborted run cannot cancel a confirmed background quality upgrade", async () => {
   await withForegroundQualityRuntime(async () => {
     const compact = new ForegroundWaitMockEvaluator(
       "compact-upgrade-epoch",
@@ -11066,14 +11065,15 @@ test("automatic evaluator scopes cancellation to the exact quality upgrade attem
     await new Promise((resolve) => setTimeout(resolve, 0))
 
     const secondWasAborted = secondSignal?.aborted === true
-    if (!secondWasAborted) releaseSecondPreload()
-    assert.equal(secondWasAborted, true)
-    assert.equal(quality.cancelPreloadCalls, 1)
+    assert.equal(secondWasAborted, false)
+    assert.equal(quality.cancelPreloadCalls, 0)
+    releaseSecondPreload()
+    await waitForQualityReady(automatic)
 
     releaseFirstCompact()
     const firstResult = await first
     assert.equal(firstResult.model.id, "compact-upgrade-epoch")
-    assert.equal(quality.cancelPreloadCalls, 1)
+    assert.equal(quality.cancelPreloadCalls, 0)
   })
 })
 
@@ -12476,7 +12476,7 @@ function createLLMQuizValidatorRunner(): LLMQuizValidatorRunner {
   })
 }
 
-test("the public version remains pinned exactly to 0.6.7", () => {
+test("the public version remains pinned exactly to 0.6.8", () => {
   const packageJson = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   ) as { version?: string }
@@ -12491,14 +12491,14 @@ test("the public version remains pinned exactly to 0.6.7", () => {
     "utf8",
   )
 
-  assert.equal(packageJson.version, "0.6.7")
-  assert.equal(packageLock.version, "0.6.7")
-  assert.equal(packageLock.packages?.[""]?.version, "0.6.7")
-  assert.match(entry, /const VERSION = "0\.6\.7"/u)
-  assert.match(bundle, /"0\.6\.7"/u)
+  assert.equal(packageJson.version, "0.6.8")
+  assert.equal(packageLock.version, "0.6.8")
+  assert.equal(packageLock.packages?.[""]?.version, "0.6.8")
+  assert.match(entry, /const VERSION = "0\.6\.8"/u)
+  assert.match(bundle, /"0\.6\.8"/u)
   assert.doesNotMatch(bundle, /let [\w$]+="0\.6\.4",[\w$]+=globalThis/u)
-  assert.match(browserSmoke, /window\.LiaLLM\.version === "0\.6\.7"/u)
-  assert.match(readme, /^version:\s+0\.6\.7$/mu)
+  assert.match(browserSmoke, /window\.LiaLLM\.version === "0\.6\.8"/u)
+  assert.match(readme, /^version:\s+0\.6\.8$/mu)
   assert.match(readme, /^script:\s+\.\/dist\/index\.js$/mu)
   assert.doesNotMatch(
     readme,

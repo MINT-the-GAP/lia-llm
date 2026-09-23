@@ -307,6 +307,7 @@ export class AutomaticEvaluator {
   private qualityCacheInfoPromise: Promise<ModelCacheInfo> | null = null
   private qualityUpgradePromise: Promise<boolean> | null = null
   private qualityUpgradeController: AbortController | null = null
+  private qualityUpgradeContinuesInBackground = false
   private qualityUpgradeEpoch = 0
   private readonly qualityUpgradeInterests = new Map<
     Promise<boolean>,
@@ -589,6 +590,11 @@ export class AutomaticEvaluator {
     ) {
       return
     }
+    // Once a network load has been authorized, it belongs to the global
+    // browser cache rather than to the quiz that initiated it. Leaving that
+    // quiz (for example by changing slides) must only stop its foreground
+    // evaluation; aborting the shared transfer would throw away useful work.
+    if (this.qualityUpgradeContinuesInBackground) return
     this.qualityUpgradeInterests.delete(upgrade)
     this.qualityUpgradeEpoch += 1
     this.qualityUpgradePromise = null
@@ -691,6 +697,9 @@ export class AutomaticEvaluator {
       this.markQualityDegraded(generation)
       return false
     }
+    if (!cache.cached) {
+      this.qualityUpgradeContinuesInBackground = true
+    }
 
     await this.qualityEvaluator.preload(cache, true, signal)
     if (
@@ -717,6 +726,7 @@ export class AutomaticEvaluator {
     const generation = this.generation
     const upgradeEpoch = ++this.qualityUpgradeEpoch
     const controller = new AbortController()
+    this.qualityUpgradeContinuesInBackground = false
     this.qualityUpgradeController = controller
     const upgrade = this.upgradeQuality(
       generation,
@@ -746,6 +756,7 @@ export class AutomaticEvaluator {
       this.qualityUpgradeInterests.delete(tracked)
       if (this.qualityUpgradePromise === tracked) {
         this.qualityUpgradePromise = null
+        this.qualityUpgradeContinuesInBackground = false
         if (this.qualityUpgradeController === controller) {
           this.qualityUpgradeController = null
         }
@@ -1288,6 +1299,7 @@ export class AutomaticEvaluator {
     this.qualityUpgradeEpoch += 1
     this.qualityUpgradeController?.abort()
     this.qualityUpgradeController = null
+    this.qualityUpgradeContinuesInBackground = false
     this.qualityUpgradeInterests.clear()
     for (const controller of this.consentControllers) controller.abort()
     this.consentControllers.clear()

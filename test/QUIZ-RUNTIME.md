@@ -84,7 +84,7 @@ Bewertung noch Kursinhalt, um diese Sperre zu umgehen.
 
 ## Nachweis vom 22. September 2026
 
-Der aktuelle Lauf mit Version 0.6.7 bestand alle 16 Kombinationen aus Browserprofil
+Der aktuelle Lauf mit Version 0.6.8 bestand alle 16 Kombinationen aus Browserprofil
 und Szenario: sechs lange Quizfragen sowie der unveränderte Wochenaufgabenkurs.
 Pro Profil wurden die Auswertung, Musterlösung, Fehler, Abbruch, Neustart,
 Folienwechsel und Sprachprüfung geprüft. Der Makrokörper umfasst 605 Bytes
