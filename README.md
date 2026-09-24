@@ -1,6 +1,6 @@
 <!--
 author:      MINT-the-GAP, Martin Lommatzsch
-version:     0.6.8
+version:     0.6.9
 language:    de
 narrator:    Deutsch Female
 comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
@@ -761,11 +761,19 @@ Bestätigung startet den Transfer; eine Ablehnung führt zum vorgesehenen Fallba
 vollständigen Artefakte bereits im Cache, erscheint die Downloadfrage nicht erneut. Für das
 Kompaktmodell gelten weiterhin die netz- und geräteabhängigen Regeln.
 
-Modelldateien liegen in der Browser Cache API. Nur beim ersten ungecacheten Download bittet das
-Template den Browser zusätzlich um persistenten Website-Speicher; ein Cache-Treffer löst auch diese
-Anfrage nicht erneut aus. Die WebLLM-Laufzeit selbst ist im Template gebündelt und wird nicht erst
-von einem CDN nachgeladen. Damit können vollständig geladene Modelle im selben Browserprofil und
-unter derselben Herkunft auch offline wiederverwendet werden.
+Quality-Modelldateien liegen in Chromium-Browsern im Origin Private File System (OPFS), das WebLLM
+direkt wiederverwenden kann. Das umgeht die in Chrome, Edge und Brave beobachteten
+`Cache.put`-Fehler nach einem bereits vollständig empfangenen `tokenizer.json`. Browser ohne OPFS
+verwenden weiterhin CacheStorage; das Kompaktmodell bleibt ebenfalls in CacheStorage. Ein
+vollständiger Quality-Cache einer älteren Version wird weiterverwendet. Ein nur teilweise gefüllter
+alter CacheStorage-Download wird dagegen einmalig sauber in OPFS neu begonnen, statt am selben
+Schreibfehler festzuhängen.
+
+Nur beim ersten ungecacheten Download bittet das Template den Browser zusätzlich um persistenten
+Website-Speicher; ein Speichertreffer löst auch diese Anfrage nicht erneut aus. Die WebLLM-Laufzeit
+selbst ist im Template gebündelt und wird nicht erst von einem CDN nachgeladen. Damit können
+vollständig geladene Modelle im selben Browserprofil und unter derselben Herkunft auch offline
+wiederverwendet werden.
 
 Seit Version 0.5.8 ist der Quality-Download vollständig von der WebGPU-Initialisierung getrennt:
 Konfiguration, Tokenizer, WASM-Laufzeit und alle Gewichts-Shards werden zuerst vollständig gecacht.
@@ -778,8 +786,11 @@ Einzelabrufe und komplette Shards haben gestaffelte Wiederholungen mit leicht zu
 Wartezeiten, damit Schulgeräte nach einem Proxy-Abbruch nicht alle gleichzeitig erneut anfragen.
 Pro Browser wird nur ein Gewichts-Shard zurzeit geladen. Bereits vollständig gespeicherte Shards
 bleiben nach einem Fehler erhalten und werden beim nächsten Versuch aus dem Cache verwendet.
-Der Fortschritt erreicht 100 % erst, wenn alle Gewichte erfolgreich im Browsercache gespeichert
-wurden. Ein einzelner AbortError des Browsers beendet den Gesamtdownload nicht sofort. Ein
+Der Fortschritt erreicht 100 % erst, wenn alle Gewichte erfolgreich im lokalen Modellspeicher
+gespeichert wurden. Ein Schreibfehler nach einem vollständig empfangenen direkten Artefakt wird
+nicht als Netzwerkfehler wiederholt; die DebugNotiz nennt dann ausdrücklich den lokalen
+Speichervorgang. Echte Abbrüche in einem noch laufenden Bereichsdownload bleiben wiederholbar. Ein
+einzelner AbortError des Browsers beendet den Gesamtdownload nicht sofort. Ein
 vorübergehender Fehler des Qualitätsmodells sperrt
 außerdem keine weiteren Versuche in derselben Sitzung. Ein fataler WebGPU-Laufzeitfehler wie
 `device lost`, `DXGI_ERROR_DEVICE_HUNG`, `DXGI_ERROR_DEVICE_REMOVED`,
@@ -808,10 +819,11 @@ absolute, browserübergreifende Dauerhaftigkeit kann eine Webanwendung deshalb n
 
 Bei einem endgültigen Ladefehler schreibt lia-llm automatisch genau eine aufklappbare
 `[Lia-LLM DebugNotiz]` in die Entwicklerkonsole. Nach einem erfolgreichen Netzwerkdownload wird
-außerdem kontrolliert, ob Modell und Laufzeit wirklich im Browsercache angekommen sind; ein
-fehlgeschlagener Cache-Schreibvorgang erhält ebenfalls eine DebugNotiz. Der Bericht unterscheidet
+außerdem kontrolliert, ob Modell und Laufzeit wirklich im lokalen Modellspeicher angekommen sind; ein
+fehlgeschlagener Speicher-Schreibvorgang erhält ebenfalls eine DebugNotiz. Der Bericht unterscheidet
 unter anderem Offlinebetrieb, HTTP- und Proxyfehler, blockierte Cross-Origin-Anfragen,
-Range-/Größenprobleme, beschädigte Artefakte, fehlenden oder gesperrten CacheStorage und zu wenig
+Range-/Größenprobleme, beschädigte Artefakte, fehlenden oder gesperrten CacheStorage beziehungsweise
+OPFS und zu wenig
 Speicherplatz. WebGPU-Geräteverlust, die genannten DXGI-Fehler, nicht mehr gemappte Puffer
 (`Buffer unmapped`), GPU-Speichermangel und Meldungen über bereits freigegebene Objekte werden als
 Laufzeitfehler ausgewiesen. `Object has already been disposed` und `Buffer unmapped` können

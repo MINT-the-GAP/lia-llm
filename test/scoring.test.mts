@@ -228,6 +228,7 @@ class MemoryRuntimeCache {
   keysCalls = 0
   putCalls = 0
   rejectPut = false
+  rejectPutUrl: string | undefined
   lastPutUrl: string | undefined
 
   asCache(): Cache {
@@ -251,7 +252,9 @@ class MemoryRuntimeCache {
   async put(request: RequestInfo | URL, response: Response): Promise<void> {
     this.putCalls += 1
     this.lastPutUrl = requestUrl(request)
-    if (this.rejectPut) throw new Error("Cache quota exceeded")
+    if (this.rejectPut || this.rejectPutUrl === this.lastPutUrl) {
+      throw new Error("Cache quota exceeded")
+    }
     this.entries.set(this.lastPutUrl, response.clone())
   }
 
@@ -987,6 +990,18 @@ test("debug diagnostics distinguish cache quota, access, corruption, and absence
     message: "Failed to execute 'put' on 'Cache': quota exceeded.",
   })
   assert.equal(debugFindingCodes([propagatedQuota])[0], "cache-quota")
+
+  const completedDownloadWriteFailure = debugEvent({
+    kind: "cache",
+    stage: "artifact-store-put",
+    outcome: "error",
+    artifact: "tokenizer.json",
+    details: { backend: "cache" },
+  })
+  assert.equal(
+    debugFindingCodes([completedDownloadWriteFailure])[0],
+    "cache-write-failed",
+  )
 })
 
 test("debug diagnostics flag an uncached model larger than the remaining origin quota", () => {
@@ -8127,6 +8142,43 @@ test('quality artifact prefetch retries a whole shard after Cache.put stream fai
   )
 })
 
+test('quality artifact prefetch does not redownload a completed JSON file after Cache.put failure', async () => {
+  const fixture = syntheticQualityPrefetchFixture()
+  const storage = consumingQualityCacheStorage()
+  const modelCache = storage.cachesByName.get('webllm/model')
+  assert.ok(modelCache instanceof ConsumingMemoryRuntimeCache)
+  const tokenizerUrl = fixture.expectedCacheUrls.get('webllm/model')?.[1]
+  assert.ok(tokenizerUrl?.endsWith('/tokenizer.json'))
+  modelCache.rejectPutUrl = tokenizerUrl
+  const networkRequests: string[] = []
+
+  await withCacheStorage(storage.asCacheStorage(), async () => {
+    await assert.rejects(
+      prefetchQualityArtifacts(
+        fixture.appConfig,
+        new ResilientFetchSession(
+          syntheticQualityFetch(fixture, networkRequests),
+          {
+            retryDelaysMs: [0],
+            shouldChunk: () => false,
+            stallTimeoutMs: 1_000,
+          },
+        ),
+      ),
+      /dauerhaft im Browsercache gespeichert/iu,
+    )
+  })
+
+  assert.equal(
+    networkRequests.filter((url) => url === tokenizerUrl).length,
+    1,
+  )
+  assert.equal(
+    modelCache.consumingPutAttempts.filter((url) => url === tokenizerUrl).length,
+    1,
+  )
+})
+
 test('quality artifact prefetch recovers a transient AbortError without cancelling remaining shards', async () => {
   const fixture = syntheticQualityPrefetchFixture()
   const storage = consumingQualityCacheStorage()
@@ -12476,7 +12528,7 @@ function createLLMQuizValidatorRunner(): LLMQuizValidatorRunner {
   })
 }
 
-test("the public version remains pinned exactly to 0.6.8", () => {
+test("the public version remains pinned exactly to 0.6.9", () => {
   const packageJson = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   ) as { version?: string }
@@ -12491,14 +12543,14 @@ test("the public version remains pinned exactly to 0.6.8", () => {
     "utf8",
   )
 
-  assert.equal(packageJson.version, "0.6.8")
-  assert.equal(packageLock.version, "0.6.8")
-  assert.equal(packageLock.packages?.[""]?.version, "0.6.8")
-  assert.match(entry, /const VERSION = "0\.6\.8"/u)
-  assert.match(bundle, /"0\.6\.8"/u)
+  assert.equal(packageJson.version, "0.6.9")
+  assert.equal(packageLock.version, "0.6.9")
+  assert.equal(packageLock.packages?.[""]?.version, "0.6.9")
+  assert.match(entry, /const VERSION = "0\.6\.9"/u)
+  assert.match(bundle, /"0\.6\.9"/u)
   assert.doesNotMatch(bundle, /let [\w$]+="0\.6\.4",[\w$]+=globalThis/u)
-  assert.match(browserSmoke, /window\.LiaLLM\.version === "0\.6\.8"/u)
-  assert.match(readme, /^version:\s+0\.6\.8$/mu)
+  assert.match(browserSmoke, /window\.LiaLLM\.version === "0\.6\.9"/u)
+  assert.match(readme, /^version:\s+0\.6\.9$/mu)
   assert.match(readme, /^script:\s+\.\/dist\/index\.js$/mu)
   assert.doesNotMatch(
     readme,

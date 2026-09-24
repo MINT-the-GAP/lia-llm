@@ -1015,6 +1015,9 @@ function cacheFindings(
   const corrupt = cacheEvents.find((event) =>
     /corrupt|invalid|integrity/iu.test(event.outcome ?? ""),
   )
+  const writeFailed = cacheEvents.find((event) =>
+    event.stage === "artifact-store-put" && event.outcome === "error",
+  )
   if (quota) {
     findings.push(errorFinding(
       "cache-quota",
@@ -1067,6 +1070,19 @@ function cacheFindings(
       "Das kann in privaten Sitzungen, restriktiven Frames oder durch Richtlinien auftreten.",
       ["Cache-Operation " + (denied.stage ?? "unbekannt") + ": " + denied.errorName + "."],
       "In einem normalen HTTPS-Profil testen und CacheStorage freigeben.",
+    ))
+  }
+  if (writeFailed && !quota && !denied) {
+    findings.push(errorFinding(
+      "cache-write-failed",
+      "Der Browser konnte die vollstaendig empfangene Modelldatei nicht speichern.",
+      "Der Netzwerkabruf war erfolgreich; der Fehler entstand erst beim Schreiben in den lokalen Modellspeicher.",
+      [
+        "Speicherbackend: " +
+          (detailText(writeFailed.details, "backend") ?? "unbekannt") +
+          "; Datei: " + (writeFailed.artifact ?? "unbekannt") + ".",
+      ],
+      "Website-Speicher und Browserrichtlinien pruefen; danach erneut laden.",
     ))
   }
   if (corrupt) {

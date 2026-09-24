@@ -379,22 +379,24 @@ Der lokale Härtetest sendet selbst eine CSP mit `worker-src 'self' blob:`,
 Nur für das Inline-Testskript ergänzt die Fixture `'unsafe-inline'`; das ist
 keine Empfehlung für die produktive Kurs-CSP.
 
-Der Modellcache liegt in CacheStorage der aktuellen Origin, des Browserprofils
-und gegebenenfalls der Storage-Partition. In einem `sandbox`-Iframe muss
-mindestens `allow-same-origin` vorhanden sein; eine opaque Origin kann
-CacheStorage unbenutzbar machen. Tracking Prevention kann Speicher in
-Drittanbieter-Iframes partitionieren oder verweigern. Deshalb muss ein
-LMS-Test im echten Einbettungskontext erfolgen, nicht nur als Top-Level-Seite.
+Das Kompaktmodell liegt in CacheStorage. Quality-Modelle verwenden in
+Chromium-Browsern OPFS und fallen nur ohne OPFS auf CacheStorage zurück. Beide
+Speicher gehören zur aktuellen Origin, zum Browserprofil und gegebenenfalls zur
+Storage-Partition. In einem `sandbox`-Iframe muss mindestens
+`allow-same-origin` vorhanden sein; eine opaque Origin kann beide Ablagen
+unbenutzbar machen. Tracking Prevention kann Speicher in Drittanbieter-Iframes
+partitionieren oder verweigern. Deshalb muss ein LMS-Test im echten
+Einbettungskontext erfolgen, nicht nur als Top-Level-Seite.
 
 Der LiaScript-Service-Worker und der Modellcache sind getrennte Schichten. Das
 Template registriert keinen eigenen Service Worker und benötigt keinen Service
-Worker für CacheStorage. Ein fehlerhaftes oder blockiertes PWA-Workbox-Skript
+Worker für CacheStorage oder OPFS. Ein fehlerhaftes oder blockiertes PWA-Workbox-Skript
 kann trotzdem den Viewer-Offlinepfad beeinträchtigen und muss separat getestet
 werden.
 
 ## Persistenz-, Quota- und Privatmodus-Risiken
 
-- CacheStorage ist origin-, profil- und partitionsgebunden. Ein anderer Host,
+- CacheStorage und OPFS sind origin-, profil- und partitionsgebunden. Ein anderer Host,
   Port, Browserkanal, Profilcontainer oder Einbettungskontext ist kein Warmstart
   desselben Caches.
 - `navigator.storage.persist()` ist nur eine nicht blockierende
@@ -412,9 +414,11 @@ werden.
   Profilverwaltung durch die Schule können den Cache entfernen. Solche Policies
   müssen einen echten Browserneustart und gegebenenfalls einen Neustart des
   Geräts im Testplan enthalten.
-- Das Kompaktmodell und die Runtime verwenden CacheStorage. IndexedDB oder OPFS
-  sind für diesen Modellpfad keine Ersatzablage; LiaScript selbst kann
-  unabhängig davon eigene Zustände speichern.
+- Das Kompaktmodell und seine Runtime verwenden CacheStorage. OPFS ist die
+  bevorzugte Ablage des Quality-Pfads, weil Chromium einen vollständig
+  empfangenen `tokenizer.json` beim anschließenden `Cache.put` mit
+  `NetworkError` ablehnen kann. LiaScript selbst kann unabhängig davon eigene
+  Zustände speichern.
 
 Eine Browserkonsole mit „Tracking Prevention blocked access to storage“ ist
 daher ein relevanter Kontextbefund, beweist allein aber noch nicht die Ursache

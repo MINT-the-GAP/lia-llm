@@ -27,6 +27,12 @@ import {
   type QualityModelDefinition,
 } from "./quality-model-config.ts"
 import {
+  openQualityArtifactStore,
+  preferredQualityArtifactBackend,
+  type QualityArtifactBackend,
+  type QualityArtifactStore,
+} from "./quality-artifact-store.ts"
+import {
   estimateAndSelectQualityModel,
   estimateStorageAvailability,
   selectQualityModel,
@@ -46,7 +52,10 @@ import {
   type GermanSpellingAmbiguity,
   type GermanWordToken,
 } from "./german-spellcheck.ts"
-import { ResilientFetchSession } from "./resilient-fetch.ts"
+import {
+  ResilientFetchSession,
+  shouldChunkModelRequest,
+} from "./resilient-fetch.ts"
 import {
   isFatalQualityEngineError as isKnownFatalQualityEngineError,
   qualityRuntimeErrorMessage as errorMessage,
@@ -3039,6 +3048,30 @@ class QualityArtifactHttpError extends Error {
   }
 }
 
+class QualityArtifactStoreWriteError extends Error {
+  readonly backend: QualityArtifactBackend
+  readonly url: string
+  readonly terminal: boolean
+
+  constructor(
+    backend: QualityArtifactBackend,
+    url: string,
+    terminal: boolean,
+    cause: unknown,
+  ) {
+    super(
+      "Das Modellartefakt konnte nicht dauerhaft im " +
+        (backend === "opfs" ? "OPFS" : "Browsercache") +
+        " gespeichert werden.",
+      { cause },
+    )
+    this.backend = backend
+    this.url = url
+    this.terminal = terminal
+    this.name = "QualityArtifactStoreWriteError"
+  }
+}
+
 class QualityDownloadConsentRequiredError extends Error {
   constructor() {
     super(
@@ -3104,7 +3137,7 @@ class QualityDownloadProgress {
     }
     emit<ModelProgress>("lia-llm:progress", {
       status: "progress",
-      // Received bytes count only after Cache.put() has completed.
+      // Received bytes count only after the local store write has completed.
       progress: this.completed.size === this.expected.size
         ? 100
         : Math.min(99, (loaded / total) * 100),
@@ -3112,7 +3145,7 @@ class QualityDownloadProgress {
       total,
       file,
       message:
-        "Modelldaten werden vollst\u00e4ndig im Browsercache gespeichert \u2026",
+        "Modelldaten werden vollst\u00e4ndig im lokalen Modellspeicher gespeichert \u2026",
     })
   }
 }
@@ -3144,7 +3177,7 @@ function cachedArtifactLength(response: Response): number | undefined {
 }
 
 async function matchingCachedArtifact(
-  cache: Cache,
+  cache: QualityArtifactStore,
   artifact: QualityWeightArtifact,
 ): Promise<Response | undefined> {
   const cached = await cache.match(artifact.url)
@@ -3209,6 +3242,7 @@ function terminalQualityArtifactError(
 ): boolean {
   if (error instanceof QualityDownloadConsentRequiredError) return true
   if (error instanceof QualityArtifactHttpError) return !error.retryable
+  if (error instanceof QualityArtifactStoreWriteError) return error.terminal
   if (!(error instanceof Error)) return false
   return (
     (error.name === "AbortError" && signal?.aborted === true) ||
@@ -3237,8 +3271,41 @@ function waitQualityArtifactRetry(
   })
 }
 
+async function putQualityArtifact(
+  store: QualityArtifactStore,
+  request: Request,
+  response: Response,
+  terminalOnFailure: boolean,
+): Promise<void> {
+  try {
+    await store.put(request, response)
+  } catch (error) {
+    const errorName =
+      error !== null && typeof error === "object" && "name" in error
+        ? String((error as { name?: unknown }).name ?? "")
+        : ""
+    const terminal =
+      terminalOnFailure ||
+      errorName === "QuotaExceededError" ||
+      errorName === "SecurityError" ||
+      errorName === "NotSupportedError"
+    if (!terminal) throw error
+    recordDebugCache("quality", "artifact-store-put", "error", {
+      url: request.url,
+      error,
+      details: { backend: store.backend },
+    })
+    throw new QualityArtifactStoreWriteError(
+      store.backend,
+      request.url,
+      terminal,
+      error,
+    )
+  }
+}
+
 async function ensureQualityArtifactCached(
-  cache: Cache,
+  cache: QualityArtifactStore,
   artifact: QualityWeightArtifact,
   session: ResilientFetchSession,
 ): Promise<Response> {
@@ -3261,6 +3328,7 @@ async function ensureQualityArtifactCached(
     }
     try {
       const request = new Request(artifact.url)
+      const terminalStoreFailure = !shouldChunkModelRequest(request)
       const response =
         artifact.expectedBytes === undefined
           ? await session.fetch(request)
@@ -3270,12 +3338,18 @@ async function ensureQualityArtifactCached(
         throw new QualityArtifactHttpError(artifact.url, response.status)
       }
 
-      // Cache.put consumes the complete custom response stream. Keeping it
-      // inside this retry boundary also retries failures in later byte ranges.
+      // The store consumes the complete custom response stream. Keeping it
+      // inside this boundary retries failures in later byte ranges, while a
+      // write failure after a fully buffered direct response remains terminal.
       const verifiedBytes =
         artifact.expectedBytes ?? cachedArtifactLength(response)
       if (verifiedBytes === undefined) {
-        await cache.put(request, response)
+        await putQualityArtifact(
+          cache,
+          request,
+          response,
+          terminalStoreFailure,
+        )
       } else {
         const headers = new Headers(response.headers)
         headers.delete("content-encoding")
@@ -3285,13 +3359,15 @@ async function ensureQualityArtifactCached(
           QUALITY_VERIFIED_BYTES_HEADER,
           String(verifiedBytes),
         )
-        await cache.put(
+        await putQualityArtifact(
+          cache,
           request,
           new Response(response.body, {
             status: response.status,
             statusText: response.statusText,
             headers,
           }),
+          terminalStoreFailure,
         )
       }
       const stored = await matchingCachedArtifact(cache, artifact)
@@ -3338,7 +3414,7 @@ async function ensureQualityArtifactCached(
 }
 
 async function loadValidatedQualityJson<T>(
-  cache: Cache,
+  cache: QualityArtifactStore,
   artifact: QualityWeightArtifact,
   session: ResilientFetchSession,
   validate: (value: unknown) => T | null,
@@ -3415,7 +3491,7 @@ function bytesHaveRequiredPrefix(
 }
 
 async function validateQualityBinaryResponse(
-  cache: Cache,
+  cache: QualityArtifactStore,
   artifact: QualityWeightArtifact,
   response: Response,
   expectedPrefix?: readonly number[],
@@ -3471,7 +3547,7 @@ async function validateQualityBinaryResponse(
 }
 
 async function ensureValidatedQualityBinary(
-  cache: Cache,
+  cache: QualityArtifactStore,
   artifact: QualityWeightArtifact,
   session: ResilientFetchSession,
   expectedPrefix: readonly number[] | undefined,
@@ -3521,7 +3597,7 @@ async function settleQualityArtifactTasks(
 }
 
 async function cacheQualityWeights(
-  cache: Cache,
+  cache: QualityArtifactStore,
   artifacts: readonly QualityWeightArtifact[],
   session: ResilientFetchSession,
   observer?: QualityArtifactPrefetchObserver,
@@ -3569,21 +3645,20 @@ export async function prefetchQualityArtifacts(
   session: ResilientFetchSession,
   observer?: QualityArtifactPrefetchObserver,
 ): Promise<void> {
-  if (typeof caches === "undefined") {
-    throw new Error("Dieser Browser unterst\u00fctzt keinen Modellcache.")
-  }
-  if (
-    appConfig.cacheBackend !== undefined &&
-    appConfig.cacheBackend !== "cache"
-  ) {
-    throw new Error("Der Quality-Downloader ben\u00f6tigt die Browser Cache API.")
+  const backend = appConfig.cacheBackend ?? "cache"
+  if (backend !== "cache" && backend !== "opfs") {
+    throw new Error(
+      "Der Quality-Downloader unterstuetzt nur CacheStorage oder OPFS.",
+    )
   }
 
   const record = qualityModelRecord(appConfig)
   const modelUrl = normalizedQualityModelUrl(record)
-  const configCache = await caches.open("webllm/config")
-  const modelCache = await caches.open("webllm/model")
-  const wasmCache = await caches.open("webllm/wasm")
+  const [configCache, modelCache, wasmCache] = await Promise.all([
+    openQualityArtifactStore("webllm/config", backend),
+    openQualityArtifactStore("webllm/model", backend),
+    openQualityArtifactStore("webllm/wasm", backend),
+  ])
   const configUrl = new URL("mlc-chat-config.json", modelUrl).href
   const config = await loadValidatedQualityJson(
     configCache,
@@ -3650,11 +3725,9 @@ export async function prefetchQualityArtifacts(
 
 export async function hasPinnedQualityWeightsInCache(
   modelUrl: string,
+  backend: QualityArtifactBackend = preferredQualityArtifactBackend(),
 ): Promise<boolean> {
-  if (typeof caches === "undefined") {
-    throw new Error("Browser cache is not available in this environment.")
-  }
-  const modelCache = await caches.open("webllm/model")
+  const modelCache = await openQualityArtifactStore("webllm/model", backend)
   const manifestUrl = new URL("tensor-cache.json", modelUrl).href
   const manifestResponse = await modelCache.match(manifestUrl)
   if (!manifestResponse?.ok) return false
@@ -3681,8 +3754,6 @@ interface QualityCacheTarget {
 async function deleteQualityCacheTargets(
   targets: readonly QualityCacheTarget[],
 ): Promise<number> {
-  if (typeof caches === "undefined") return 0
-
   const modelUrls = targets.map((target) =>
     target.modelUrl.endsWith("/") ? target.modelUrl : target.modelUrl + "/",
   )
@@ -3706,11 +3777,22 @@ async function deleteQualityCacheTargets(
     },
   ] as const
   let filesDeleted = 0
-  for (const target of cacheTargets) {
-    const cache = await caches.open(target.cacheName)
-    for (const request of await cache.keys()) {
-      if (target.matches(request.url) && (await cache.delete(request))) {
-        filesDeleted += 1
+  const backends: QualityArtifactBackend[] =
+    preferredQualityArtifactBackend() === "opfs"
+      ? ["cache", "opfs"]
+      : ["cache"]
+  for (const backend of backends) {
+    for (const target of cacheTargets) {
+      let store: QualityArtifactStore
+      try {
+        store = await openQualityArtifactStore(target.cacheName, backend)
+      } catch {
+        continue
+      }
+      for (const url of await store.keys()) {
+        if (target.matches(url) && (await store.delete(url))) {
+          filesDeleted += 1
+        }
       }
     }
   }
@@ -3740,8 +3822,13 @@ export function clearQualityModelCache(
   return deleteQualityCacheTargets([qualityCacheTarget(model)])
 }
 
+interface QualityModelCacheProbe extends ModelCacheInfo {
+  readonly backend: QualityArtifactBackend
+}
+
 export class QualityEvaluator {
   private model: QualityModelDefinition = SMALL_QUALITY_MODEL
+  private cacheBackend = preferredQualityArtifactBackend()
   private modelSelection: QualityModelSelectionDecision | null = null
   private modelSelectionPromise: Promise<QualityModelSelectionDecision> | null =
     null
@@ -3892,7 +3979,11 @@ export class QualityEvaluator {
     signal?.addEventListener("abort", onAbort, { once: true })
 
     const model = this.model
-    const appConfig = createQualityAppConfig(webLlm.prebuiltAppConfig, model)
+    const appConfig = createQualityAppConfig(
+      webLlm.prebuiltAppConfig,
+      model,
+      this.cacheBackend,
+    )
     let engine: QualityEngine | null = null
     let stage = "artifact-prefetch"
 
@@ -5792,24 +5883,17 @@ export class QualityEvaluator {
     }
   }
 
-  private async probeModelCache(
+  private async probeModelCacheBackend(
     model: QualityModelDefinition,
-  ): Promise<ModelCacheInfo> {
-    if (typeof caches === "undefined") {
-      recordDebugCache("quality", "model-cache-probe", "unsupported")
-      return {
-        supported: false,
-        cached: false,
-        downloadCached: false,
-        filesCached: 0,
-        filesTotal: 4,
-        estimatedBytes: model.estimatedBytes,
-      }
-    }
-
+    backend: QualityArtifactBackend,
+  ): Promise<QualityModelCacheProbe> {
     let weightsCached = false
     try {
-      const appConfig = createQualityAppConfig(webLlm.prebuiltAppConfig, model)
+      const appConfig = createQualityAppConfig(
+        webLlm.prebuiltAppConfig,
+        model,
+        backend,
+      )
       const modelRecord = appConfig.model_list.find(
         (candidate) => candidate.model_id === model.id,
       )
@@ -5821,9 +5905,12 @@ export class QualityEvaluator {
         ? modelRecord.model
         : `${modelRecord.model}/`
       const configUrl = new URL("mlc-chat-config.json", modelUrl).href
-      weightsCached = await hasPinnedQualityWeightsInCache(modelUrl)
-
-      const configCache = await caches.open("webllm/config")
+      const [configCache, modelCache, wasmCache] = await Promise.all([
+        openQualityArtifactStore("webllm/config", backend),
+        openQualityArtifactStore("webllm/model", backend),
+        openQualityArtifactStore("webllm/wasm", backend),
+      ])
+      weightsCached = await hasPinnedQualityWeightsInCache(modelUrl, backend)
       const configResponse = await configCache.match(configUrl)
       const configCached = configResponse !== undefined
 
@@ -5841,7 +5928,6 @@ export class QualityEvaluator {
           (file) => tokenizerFiles.includes(file),
         )
         if (tokenizerFile) {
-          const modelCache = await caches.open("webllm/model")
           tokenizerCached =
             (await modelCache.match(new URL(tokenizerFile, modelUrl).href)) !==
             undefined
@@ -5850,7 +5936,6 @@ export class QualityEvaluator {
 
       let wasmCached = false
       if (modelRecord.model_lib) {
-        const wasmCache = await caches.open("webllm/wasm")
         wasmCached =
           (await wasmCache.match(modelRecord.model_lib)) !== undefined
       }
@@ -5877,19 +5962,39 @@ export class QualityEvaluator {
         filesCached,
         filesTotal: cacheParts.length,
         estimatedBytes: model.estimatedBytes,
+        backend,
       }
     } catch (error) {
-      recordDebugCache("quality", "model-cache-probe", "error", { error })
+      recordDebugCache("quality", "model-cache-probe", "error", {
+        error,
+        details: { backend },
+      })
       return {
-        supported: true,
+        supported: false,
         cached: false,
         downloadCached: weightsCached,
         filesCached: 0,
         filesTotal: 4,
         estimatedBytes: model.estimatedBytes,
         error: errorMessage(error),
+        backend,
       }
     }
+  }
+
+  private async probeModelCache(
+    model: QualityModelDefinition,
+  ): Promise<QualityModelCacheProbe> {
+    const preferred = preferredQualityArtifactBackend()
+    const primary = await this.probeModelCacheBackend(model, preferred)
+    if (preferred === "cache" || primary.cached) return primary
+
+    // Reuse a complete cache from older releases. Partial CacheStorage
+    // downloads deliberately restart in OPFS because Chromium can repeatedly
+    // reject their next Cache.put after receiving the full response.
+    const legacy = await this.probeModelCacheBackend(model, "cache")
+    if (legacy.cached || !primary.supported) return legacy
+    return primary
   }
 
   private selectModel(): Promise<QualityModelSelectionDecision> {
@@ -5930,6 +6035,8 @@ export class QualityEvaluator {
         !this.engine
       ) {
         this.model = result.model
+        this.cacheBackend =
+          result.model.tier === "large" ? large.backend : small.backend
         this.modelSelection = result
       }
       return result
@@ -5993,8 +6100,6 @@ export class QualityEvaluator {
           }
         }
 
-        if (typeof caches === "undefined") return 0
-
         const activeTargets = QUALITY_MODELS.map((model) => {
           const modelRecord = createQualityAppConfig(
             webLlm.prebuiltAppConfig,
@@ -6016,6 +6121,7 @@ export class QualityEvaluator {
         ])
       } finally {
         this.model = SMALL_QUALITY_MODEL
+        this.cacheBackend = preferredQualityArtifactBackend()
         this.modelSelection = null
         this.modelSelectionPromise = null
         this.sessionFatalError = null

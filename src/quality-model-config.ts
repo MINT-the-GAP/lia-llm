@@ -1,4 +1,8 @@
 import type { AppConfig, ModelRecord } from "@mlc-ai/web-llm"
+import {
+  preferredQualityArtifactBackend,
+  type QualityArtifactBackend,
+} from "./quality-artifact-store.ts"
 
 export interface QualityModelDefinition {
   readonly tier: "small" | "large"
@@ -84,10 +88,11 @@ function pinnedModelRecord(
 export function createQualityAppConfig(
   prebuiltAppConfig: AppConfig,
   model: QualityModelDefinition = SMALL_QUALITY_MODEL,
+  cacheBackend: QualityArtifactBackend = preferredQualityArtifactBackend(),
 ): AppConfig {
   return {
     ...prebuiltAppConfig,
-    cacheBackend: "cache",
+    cacheBackend,
     model_list: [pinnedModelRecord(prebuiltAppConfig, model)],
   }
 }
