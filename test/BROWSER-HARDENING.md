@@ -562,9 +562,9 @@ adaptiven Thinking-Pfad. Die gesamte erste Bewertung dauerte in Edge 43.802 ms u
 bestand dieselbe kurze `5_09`-Antwort im unverändert geladenen Worker erneut mit 8 von 8 Kriterien.
 Im beobachteten Zeitraum traten weder `Buffer unmapped` noch ein verlorenes WebGPU-Gerät auf.
 
-Der normale npm-Kurzbefehl verwendet die produktive automatische Stufenwahl und kann bei
-genügend freier Origin-Quote Qwen3-4B herunterladen. Für reproduzierbare
-Qwen3-1.7B-Läufe besitzt die Test-Fixture den Queryparameter `qualityTier=small`. Da
+Der normale npm-Kurzbefehl verwendet die produktive, GPU-schonendere Qwen3-1.7B-Stufe.
+Der Queryparameter `qualityTier=small` bleibt in der Test-Fixture als explizite
+Reproduzierbarkeitskontrolle erhalten. Da
 WebLLM-Caches an die vollständige Origin
 einschließlich Port gebunden sind, muss für vergleichbare Cold-/Warm-Läufe derselbe freie Port
 verwendet werden:

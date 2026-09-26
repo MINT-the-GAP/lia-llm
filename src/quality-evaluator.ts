@@ -6105,20 +6105,13 @@ export class QualityEvaluator {
           payloadCached: large.downloadCached ?? large.cached,
         },
       }
-      const preferred = await estimateAndSelectQualityModel({
+      const result = await estimateAndSelectQualityModel({
         cache,
-        preferredTier: "large",
       })
-      // Prefer 4B when it fits without evicting a working 1.7B cache.
-      // Replacing the only usable model before an unverified large download
-      // could leave a pupil with no Quality model after a network failure.
-      const result = preferred.reason === "large-fits-after-small-removal"
-        ? selectQualityModel({
-            storage: preferred.storage,
-            cache,
-            preferredTier: "small",
-          })
-        : preferred
+      // Browser storage is not a proxy for GPU memory. Keep the production
+      // default on 1.7B even when the origin quota (or a cached 4B payload)
+      // would permit 4B; tablets and integrated GPUs can otherwise lose the
+      // WebGPU device only after the multi-gigabyte model has loaded.
       if (
         generation === this.modelSelectionGeneration &&
         !this.engine

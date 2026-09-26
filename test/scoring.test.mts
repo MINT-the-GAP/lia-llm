@@ -12191,7 +12191,7 @@ test("automatic evaluator rechecks an explicit quality request after the compact
         remaining: progress.thinkingTimeRemainingMs,
       })),
       [
-        { limit: 15_000, remaining: undefined },
+        { limit: 30_000, remaining: undefined },
         { limit: 5_000, remaining: 5_000 },
         { limit: undefined, remaining: undefined },
       ],
@@ -12694,7 +12694,7 @@ test("LLMQuiz exposes a canonical wrapper and a compatible question alias", () =
   )
   assert.match(
     readme,
-    /^```text @LLMQuiz\(0\.66;solution=1;feedback=1;assessmentengine=quality;operator=erklaeren;maxthinkingtime=15s;maxthinkingtokens=medium,`Erkläre, warum Eis auf flüssigem Wasser schwimmt\.`\)$/mu,
+    /^```text @LLMQuiz\(0\.66;solution=1;feedback=1;assessmentengine=quality;operator=erklaeren;maxthinkingtime=30s;maxthinkingtokens=medium,`Erkläre, warum Eis auf flüssigem Wasser schwimmt\.`\)$/mu,
   )
   assert.doesNotMatch(
     readme,
@@ -12740,7 +12740,7 @@ test("LLMQuiz exposes a canonical wrapper and a compatible question alias", () =
     [
       "`maxthinkingtime`",
       "`0s`, `5s`, `10s`, `15s`, `20s`, `30s`",
-      "im adaptiven Zweitlauf `15s`",
+      "im adaptiven Zweitlauf `30s`",
     ],
     [
       "`maxthinkingtokens`",
@@ -14052,15 +14052,15 @@ test('parseMacroOptions supports named engine selection without changing legacy 
 
 test('thinking limits default safely and reject unsafe API values', () => {
   assert.deepEqual(normalizeThinkingLimits(), {
-    maxTimeMs: 15_000,
+    maxTimeMs: 30_000,
     maxTokens: 512,
   })
   assert.deepEqual(normalizeThinkingLimits({ maxThinkingTokens: 2_048 }), {
-    maxTimeMs: 15_000,
+    maxTimeMs: 30_000,
     maxTokens: 2_048,
   })
   assert.deepEqual(normalizeAdaptiveThinkingLimits(undefined, 159), {
-    maxTimeMs: 15_000,
+    maxTimeMs: 30_000,
     maxTokens: 512,
   })
   assert.deepEqual(normalizeAdaptiveThinkingLimits(undefined, 160), {
@@ -14265,7 +14265,7 @@ test("download policy asks before mobile or uncertain large downloads", () => {
   )
 })
 
-test("QualityEvaluator chooses 4B when the reported school quota fits without evicting 1.7B", async () => {
+test("QualityEvaluator keeps the GPU-safe 1.7B default regardless of reported disk quota", async () => {
   const navigatorObject = globalThis.navigator
   const previousStorage = Object.getOwnPropertyDescriptor(navigatorObject, "storage")
   let quota = 6_974_348_663
@@ -14275,28 +14275,32 @@ test("QualityEvaluator chooses 4B when the reported school quota fits without ev
     value: { estimate: async () => ({ quota, usage }) },
   })
   try {
-    const inspect = async (smallCached: boolean) => {
+    const inspect = async (smallCached: boolean, largeCached = false) => {
       const evaluator = new QualityEvaluator()
       const internals = evaluator as unknown as {
         probeModelCache(model: typeof SMALL_QUALITY_MODEL | typeof LARGE_QUALITY_MODEL): Promise<ModelCacheInfo>
       }
-      internals.probeModelCache = async (model) => ({
-        supported: true,
-        cached: model.tier === "small" && smallCached,
-        downloadCached: model.tier === "small" && smallCached,
-        filesCached: model.tier === "small" && smallCached ? 4 : 0,
-        filesTotal: 4,
-        estimatedBytes: model.estimatedBytes,
-      })
+      internals.probeModelCache = async (model) => {
+        const cached = model.tier === "small" ? smallCached : largeCached
+        return {
+          supported: true,
+          cached,
+          downloadCached: cached,
+          filesCached: cached ? 4 : 0,
+          filesTotal: 4,
+          estimatedBytes: model.estimatedBytes,
+        }
+      }
       return (await evaluator.getCacheInfo()).qualitySelection
     }
 
-    const ample = await inspect(false)
-    assert.equal(ample?.model, LARGE_QUALITY_MODEL)
-    assert.equal(ample?.reason, "large-fits")
+    // Even a complete 4B disk cache must not override the safer default:
+    // neither cache presence nor a large origin quota proves available VRAM.
+    const ample = await inspect(false, true)
+    assert.equal(ample?.model, SMALL_QUALITY_MODEL)
+    assert.equal(ample?.reason, "small-fits")
 
-    // A cached small model stays available if the only way to fit 4B
-    // would be to delete that working cache before a new download.
+    // A cached small model remains preferred as well.
     quota = 4_000_000_000
     usage = 378_614_439 + SMALL_QUALITY_MODEL.estimatedBytes
     const keepSmall = await inspect(true)

@@ -89,7 +89,7 @@ die Musterlösung oder der Kriterienblock.
 | `assessmentengine` | `compact`, `quality` | automatisch | Wählt die Engine der Inhaltsprüfung; normale Prüfungen verwenden `compact`, Operator- oder positive Thinking-Vorgaben `quality` |
 | `Rechtschreibung` | `0`, `1`, `false`, `true` | `false` | Bietet nach der Inhaltsprüfung eine getrennte Prüfung von Rechtschreibung und Zeichensetzung an; benötigt `feedback=1` |
 | `Satzbau` | `0`, `1`, `false`, `true` | `false` | Bietet nach der Inhaltsprüfung eine getrennte Prüfung von Grammatik und Satzbau an; benötigt `feedback=1` |
-| `maxthinkingtime` | `0s`, `5s`, `10s`, `15s`, `20s`, `30s` | im adaptiven Zweitlauf `15s` | Begrenzt ausschließlich die zusätzliche Denkzeit, nicht Modellstart oder Grundprüfung; `0s` deaktiviert den Thinking-Lauf |
+| `maxthinkingtime` | `0s`, `5s`, `10s`, `15s`, `20s`, `30s` | im adaptiven Zweitlauf `30s` | Begrenzt ausschließlich die zusätzliche Denkzeit, nicht Modellstart oder Grundprüfung; `0s` deaktiviert den Thinking-Lauf |
 | `maxthinkingtokens` | `low`, `medium`, `high`, `ultra`, `extreme` | im adaptiven Zweitlauf `medium` | Begrenzt das Thinking-Ausgabebudget auf 256, 512, 768, 1024 beziehungsweise 2048 Tokens |
 
 Mit den Standardwerten für alle optionalen Einträge genügt die Minimalform; die empfohlene
@@ -124,7 +124,7 @@ Aufgabe 1: Erkläre, warum Eis auf flüssigem Wasser schwimmt.
 
 <!-- data-solution-button="off" data-llm-textarea="5" -->
 [[Antwort]]
-```text @LLMQuiz(0.66;solution=1;feedback=1;assessmentengine=quality;operator=erklaeren;maxthinkingtime=15s;maxthinkingtokens=medium,`Erkläre, warum Eis auf flüssigem Wasser schwimmt.`)
+```text @LLMQuiz(0.66;solution=1;feedback=1;assessmentengine=quality;operator=erklaeren;maxthinkingtime=30s;maxthinkingtokens=medium,`Erkläre, warum Eis auf flüssigem Wasser schwimmt.`)
 Eis besitzt eine geringere Dichte als flüssiges Wasser. Beim Gefrieren bildet das
 Wasserstoffbrückennetzwerk eine offene Kristallstruktur, die mehr Volumen einnimmt.
 Deshalb schwimmt Eis an der Oberfläche.
@@ -377,10 +377,10 @@ verwenden.
 
 Ist ein Ergebnis grenznah oder `uncertain`, umfasst die Antwort mindestens 160 Wörter oder ist
 eine Operatorantwort ab 24 Wörtern zu prüfen, kann ein zusätzlicher Thinking-Lauf folgen. Dafür
-gelten grundsätzlich `maxthinkingtime=15s` und `maxthinkingtokens=medium`. Ab 160 Wörtern wird
-jede nicht ausdrücklich gesetzte Dimension adaptiv auf `maxthinkingtime=30s` beziehungsweise
-`maxthinkingtokens=ultra` angehoben. Eine explizit gesetzte Zeit oder Tokenstufe bleibt jeweils
-erhalten; nur die jeweils fehlende Angabe wird automatisch ergänzt.
+gelten für die produktive 1.7B-Stufe grundsätzlich `maxthinkingtime=30s` und
+`maxthinkingtokens=medium`. Ab 160 Wörtern wird eine nicht ausdrücklich gesetzte Tokenstufe
+adaptiv auf `maxthinkingtokens=ultra` angehoben. Eine explizit gesetzte Zeit oder Tokenstufe bleibt
+jeweils erhalten; nur die jeweils fehlende Angabe wird automatisch ergänzt.
 
 Die Zeitangabe begrenzt nur den zusätzlichen Thinking-Lauf nach dem schnellen Erstdurchlauf; Laden,
 Initialisieren und die Grundprüfung des Modells zählen nicht dazu. Bei Ablauf wird die laufende
@@ -659,8 +659,8 @@ Insbesondere bleibt ein dort festgestelltes `contradicted` unabhängig von `cove
 
 | Stufe | Modell und Laufzeit | Erster Download | Einordnung |
 | --- | --- | ---: | --- |
-| Qualität (bei genügend Browser-Speicher, Opt-in) | Qwen3-4B über WebLLM | ca. 2,28 GB (2,12 GiB) | bevorzugte Quality-Stufe; benötigt WebGPU und laut WebLLM rund 3,4 GB VRAM |
-| Qualität (Rückfall, Opt-in) | Qwen3-1.7B über WebLLM | ca. 984 MB | erprobte kleinere Stufe bei knapper oder unbekannter Browser-Quote |
+| Qualität (Opt-in) | Qwen3-1.7B über WebLLM | ca. 984 MB | produktive Quality-Stufe; benötigt WebGPU |
+| Qualität (nur ausdrückliche interne Auswahl) | Qwen3-4B über WebLLM | ca. 2,28 GB (2,12 GiB) | benötigt laut WebLLM rund 3,4 GB VRAM und wird nicht aus der Browser-Speicherquote abgeleitet |
 | sicherer Standard/Fallback | mDeBERTa-v3 NLI über Transformers.js | ca. 379 MB inklusive ONNX-Laufzeit | normale Engine ohne Quality-Opt-in; läuft bei Bedarf mit WASM |
 
 Beim standardmäßigen WASM-Start laufen ONNX-Sitzung und Inferenz des
@@ -671,25 +671,22 @@ LiaScript-UI-Thread. Einbettende Seiten müssen dafür die unter
 Vor jedem noch nicht vollständig gecachten Quality-Download wertet das Template, soweit verfügbar,
 `navigator.storage.estimate()` aus. Bei gültiger `quota` und `usage` gilt als frei
 `quota - usage`; zusätzlich bleibt eine Reserve von `max(512 MiB, 10 % der quota)` unangetastet.
-Qwen3-4B wird gewählt, wenn die gemeldeten freien Bytes nach dieser Reserve seine
-2.280.000.000 B abdecken oder das Modell vollständig gecacht ist. Das gilt auch bei einem
-bereits vorhandenen 1.7B-Cache, sofern für 4B zusätzlich genug Platz frei ist. Ein vorhandenes
-1.7B-Modell wird für ein automatisches 4B-Upgrade nicht vor dem Download gelöscht. Wenn nur
-1.7B hineinpasst oder die Storage-API keine belastbaren Werte liefert, wird 1.7B verwendet.
+Produktiv wird Qwen3-1.7B gewählt, sobald die gemeldeten freien Bytes nach dieser Reserve seine
+984.000.000 B abdecken oder das Modell vollständig gecacht ist. Eine große Origin-Quote und selbst
+ein vollständiger 4B-Cache sind kein Beleg für genügend GPU-Speicher und lösen deshalb kein
+automatisches 4B-Upgrade aus. Nur wenn für 1.7B weder Cache noch Platz vorhanden sind, darf ein
+bereits vollständiger 4B-Cache als letzter lokaler Quality-Bestand verwendet werden.
 Reicht ein bekanntes Budget nicht einmal für 1.7B, startet kein neuer Quality-Download.
 Eine höhere allgemeine HTTP-Diskcache-Grenze ersetzt die Origin-Quote nicht. Alle Werte sind
-Schätzungen; ein späteres `QuotaExceededError` kann der Browser trotzdem melden.
-Scheitert ein noch ungecachter 4B-Download trotz positiver Vorprüfung an der tatsächlichen
-Browsergrenze des Profils, entfernt das Template den unvollständigen 4B-Bestand automatisch und
-setzt denselben bereits bestätigten Ladevorgang mit dem kleineren 1.7B-Qualitätsmodell fort. So
-bleiben Profile mit verlässlicher großer Quote bei 4B, während restriktivere Schülerprofile ohne
-manuelles Leeren der Websitedaten weiterarbeiten können.
+Schätzungen; ein späteres `QuotaExceededError` kann der Browser trotzdem melden. Der vorhandene
+4B→1.7B-Rückfall für ausdrückliche interne 4B-Läufe bleibt erhalten.
 
 Die Prüfung betrifft ausschließlich den Browsercache der aktuellen Herkunft. Sie misst weder
 Arbeitsspeicher noch freien GPU-Speicher und garantiert keine stabile WebGPU-Ausführung. Die
-WebLLM-Konfiguration nennt für Qwen3-4B rund 3.431,59 MB benötigten VRAM. Deshalb muss die 4B-Stufe
-im tatsächlich eingesetzten Browser auf dem konkreten Schulgerät geprüft werden; ein passender
-Cache allein ist keine Freigabe.
+WebLLM-Konfiguration nennt für Qwen3-4B rund 3.431,59 MB benötigten VRAM. Weil Browser dafür keine
+portable Kapazitätsabfrage anbieten, ist die kleinere 1.7B-Stufe der produktive Standard. 4B muss
+im tatsächlich eingesetzten Browser auf dem konkreten Gerät ausdrücklich erprobt werden; ein
+passender Cache allein ist keine Freigabe.
 
 Auch eine vermeintlich vollständig gecachte Quality-Stufe darf keine unbemerkte Netzwerkreparatur
 starten. Fehlt zwischen Cacheprüfung und Aktivierung ein Artefakt oder ist es beschädigt, bleibt das
