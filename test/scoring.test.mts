@@ -8788,6 +8788,109 @@ test("QualityEvaluator keeps a cache-only preload network-blocked", async () => 
   assert.equal(networkAuthorized, false)
 })
 
+test("QualityEvaluator retries the small tier after a large-model quota failure", async () => {
+  const storage = new RuntimeCacheStorageStub()
+  const modelCache = new MemoryRuntimeCache()
+  storage.cachesByName.set("webllm/model", modelCache)
+  storage.cachesByName.set("webllm/config", new MemoryRuntimeCache())
+  storage.cachesByName.set("webllm/wasm", new MemoryRuntimeCache())
+
+  const largeRecord = createQualityAppConfig(
+    webLlm.prebuiltAppConfig,
+    LARGE_QUALITY_MODEL,
+  ).model_list[0]
+  assert.ok(largeRecord)
+  const largeUrl = largeRecord.model.endsWith("/")
+    ? largeRecord.model
+    : largeRecord.model + "/"
+  const partialLargeArtifact = largeUrl + "params/params_shard_0.bin"
+  modelCache.seed(partialLargeArtifact, new Response("partial-large"))
+
+  const selection = selectQualityModel({
+    preferredTier: "large",
+    storage: storageAvailabilityFromEstimate({
+      quota: 4 * 1024 * 1024 * 1024,
+      usage: 0,
+    }),
+  })
+  assert.equal(selection.reason, "large-fits")
+
+  const navigatorObject = globalThis.navigator
+  const storageDescriptor = Object.getOwnPropertyDescriptor(
+    navigatorObject,
+    "storage",
+  )
+  Object.defineProperty(navigatorObject, "storage", {
+    configurable: true,
+    value: {
+      estimate: async () => ({
+        quota:
+          SMALL_QUALITY_MODEL.estimatedBytes +
+          STORAGE_SAFETY_RESERVE_BYTES,
+        usage: 0,
+      }),
+    },
+  })
+
+  const evaluator = new QualityEvaluator()
+  const attempts: Array<{ modelId: string; networkAuthorized: boolean }> = []
+  const internals = evaluator as unknown as {
+    createEngine(
+      networkAuthorized: boolean,
+    ): Promise<{ unload(): Promise<void> }>
+    model: typeof SMALL_QUALITY_MODEL | typeof LARGE_QUALITY_MODEL
+    modelSelection: typeof selection
+  }
+  internals.model = LARGE_QUALITY_MODEL
+  internals.modelSelection = selection
+  internals.createEngine = async (networkAuthorized) => {
+    attempts.push({ modelId: internals.model.id, networkAuthorized })
+    if (attempts.length === 1) {
+      throw new Error(
+        "The model artifact could not be stored.",
+        {
+          cause: new DOMException(
+            "The requested storage quota was exceeded.",
+            "QuotaExceededError",
+          ),
+        },
+      )
+    }
+    return { unload: async () => undefined }
+  }
+
+  try {
+    const status = await withCacheStorage(storage.asCacheStorage(), () =>
+      evaluator.preload(
+        {
+          supported: true,
+          cached: false,
+          downloadCached: false,
+          filesCached: 0,
+          filesTotal: 4,
+          estimatedBytes: LARGE_QUALITY_MODEL.estimatedBytes,
+          qualitySelection: selection,
+        },
+        true,
+      )
+    )
+    assert.equal(status.phase, "ready")
+    assert.equal(status.modelId, SMALL_QUALITY_MODEL.id)
+  } finally {
+    if (storageDescriptor) {
+      Object.defineProperty(navigatorObject, "storage", storageDescriptor)
+    } else {
+      delete (navigatorObject as Navigator & { storage?: StorageManager }).storage
+    }
+  }
+
+  assert.deepEqual(attempts, [
+    { modelId: LARGE_QUALITY_MODEL.id, networkAuthorized: true },
+    { modelId: SMALL_QUALITY_MODEL.id, networkAuthorized: true },
+  ])
+  assert.equal(modelCache.has(partialLargeArtifact), false)
+})
+
 test("QualityEvaluator aborts a direct preload before post-probe cache mutation", async () => {
   const storage = new RuntimeCacheStorageStub()
   const modelCache = new MemoryRuntimeCache()

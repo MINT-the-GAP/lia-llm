@@ -679,6 +679,11 @@ bereits vorhandenen 1.7B-Cache, sofern für 4B zusätzlich genug Platz frei ist.
 Reicht ein bekanntes Budget nicht einmal für 1.7B, startet kein neuer Quality-Download.
 Eine höhere allgemeine HTTP-Diskcache-Grenze ersetzt die Origin-Quote nicht. Alle Werte sind
 Schätzungen; ein späteres `QuotaExceededError` kann der Browser trotzdem melden.
+Scheitert ein noch ungecachter 4B-Download trotz positiver Vorprüfung an der tatsächlichen
+Browsergrenze des Profils, entfernt das Template den unvollständigen 4B-Bestand automatisch und
+setzt denselben bereits bestätigten Ladevorgang mit dem kleineren 1.7B-Qualitätsmodell fort. So
+bleiben Profile mit verlässlicher großer Quote bei 4B, während restriktivere Schülerprofile ohne
+manuelles Leeren der Websitedaten weiterarbeiten können.
 
 Die Prüfung betrifft ausschließlich den Browsercache der aktuellen Herkunft. Sie misst weder
 Arbeitsspeicher noch freien GPU-Speicher und garantiert keine stabile WebGPU-Ausführung. Die

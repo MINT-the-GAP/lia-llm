@@ -3252,6 +3252,36 @@ function terminalQualityArtifactError(
   )
 }
 
+function isStorageQuotaExceeded(error: unknown): boolean {
+  const visited = new Set<unknown>()
+  let current: unknown = error
+  while (
+    current !== null &&
+    typeof current === "object" &&
+    !visited.has(current)
+  ) {
+    visited.add(current)
+    const candidate = current as {
+      readonly name?: unknown
+      readonly message?: unknown
+      readonly cause?: unknown
+    }
+    const name = typeof candidate.name === "string" ? candidate.name : ""
+    const message =
+      typeof candidate.message === "string" ? candidate.message : ""
+    if (
+      name === "QuotaExceededError" ||
+      /(?:quota(?:\s+exceeded)?|Speicher(?:platz)?(?:limit)?)[^.\n]{0,80}(?:full|voll|exceeded|ueberschritten|überschritten)/iu.test(
+        `${name}: ${message}`,
+      )
+    ) {
+      return true
+    }
+    current = candidate.cause
+  }
+  return false
+}
+
 function waitQualityArtifactRetry(
   milliseconds: number,
   signal: AbortSignal,
@@ -4187,7 +4217,66 @@ export class QualityEvaluator {
         }
         this.loadSource = cache.cached ? "cache" : "network"
         this.setPhase("loading")
-        return this.createEngine(!cache.cached, signal)
+        try {
+          return await this.createEngine(!cache.cached, signal)
+        } catch (error) {
+          const failedModel = this.model
+          if (
+            cache.cached ||
+            failedModel.tier !== "large" ||
+            !isStorageQuotaExceeded(error)
+          ) {
+            throw error
+          }
+
+          // Some managed Chromium profiles report a generous origin quota
+          // but enforce a smaller effective OPFS limit while writing. Recover
+          // in the already-authorized load instead of making the learner clear
+          // a partial multi-gigabyte download manually.
+          assertPreloadCurrent()
+          const filesDeleted = await clearQualityModelCache(failedModel)
+          assertPreloadCurrent()
+          const [smallCache, storage] = await Promise.all([
+            this.probeModelCache(SMALL_QUALITY_MODEL),
+            estimateStorageAvailability(),
+          ])
+          assertPreloadCurrent()
+          const fallbackSelection = selectQualityModel({
+            storage,
+            cache: {
+              small: {
+                cached: smallCache.cached,
+                payloadCached:
+                  smallCache.downloadCached ?? smallCache.cached,
+              },
+            },
+            preferredTier: "small",
+          })
+          if (
+            !fallbackSelection.sufficient ||
+            fallbackSelection.model.tier !== "small"
+          ) {
+            throw error
+          }
+
+          this.model = fallbackSelection.model
+          this.cacheBackend = smallCache.backend
+          this.modelSelection = fallbackSelection
+          this.loadSource = smallCache.cached ? "cache" : "network"
+          recordDebugCache(
+            "quality",
+            "quality-tier-quota-fallback",
+            "selected",
+            {
+              details: {
+                filesDeleted,
+                failedModelId: failedModel.id,
+                selectedModelId: fallbackSelection.model.id,
+              },
+            },
+          )
+          return this.createEngine(!smallCache.cached, signal)
+        }
       })()
         .then((engine) => {
           if (
