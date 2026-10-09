@@ -4,7 +4,6 @@ version:     0.6.9
 language:    de
 narrator:    Deutsch Female
 comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
-repository:  https://github.com/MINT-the-GAP/lia-llm
 script:      ./dist/index.js
 
 attribute:   [lia-llm: Quellen und Lizenzen](https://github.com/MINT-the-GAP/lia-llm/blob/main/ATTRIBUTIONS.md)
