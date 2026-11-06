@@ -14,6 +14,7 @@ interface TextareaProxy {
   originalAriaHidden: string | null
   originalTabIndex: string | null
   syncing: boolean
+  resolvedAnswer?: string
   onAreaInput: () => void
   onAreaChange: () => void
   onAreaKeyDown: (event: KeyboardEvent) => void
@@ -186,8 +187,15 @@ function syncPresentation(input: HTMLInputElement, proxy: TextareaProxy): void {
   else if (input.classList.contains("is-failure")) area.setAttribute("aria-invalid", "true")
   else area.removeAttribute("aria-invalid")
 
-  if (!proxy.syncing && input.value !== toQuizInputValue(area.value)) {
-    area.value = fromQuizInputValue(input.value)
+  const resolved = quizForHost(proxy.host)?.classList.contains("resolved") ?? false
+  if (resolved) {
+    proxy.resolvedAnswer ??= area.value
+  } else {
+    proxy.resolvedAnswer = undefined
+  }
+  const presentationValue = proxy.resolvedAnswer ?? fromQuizInputValue(input.value)
+  if (!proxy.syncing && area.value !== presentationValue) {
+    area.value = presentationValue
   }
 }
 
@@ -358,7 +366,7 @@ function enhance(host: HTMLElement): void {
     if (isQuizTextareaNavigationKey(event.key)) event.stopPropagation()
   }
   proxy.onNativeInput = () => {
-    if (!proxy.syncing) area.value = fromQuizInputValue(input.value)
+    if (!proxy.syncing) syncPresentation(input, proxy)
   }
   proxy.onNativeFocus = () => area.focus()
 

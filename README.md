@@ -1,6 +1,6 @@
 <!--
 author:      MINT-the-GAP, Martin Lommatzsch
-version:     0.6.9
+version:     0.7.0
 language:    de
 narrator:    Deutsch Female
 comment:     Lokale, kontextsensitive Auswertung offener LiaScript-Antworten anhand einer Musterlösung.
@@ -13,7 +13,7 @@ attribute:   [lia-llm: Quellen und Lizenzen](https://github.com/MINT-the-GAP/lia
 
 @LLMQuiz_
 <script output="lia-llm-result-@0">
-window.LiaLLM.runQuiz("@0", `@'1`, `@'2`, `@'3`, `@'input`, send)
+window.LiaLLM.runQuiz("@0", `@'1`, `@'2`, window.LiaLLM.getQuizReference("@0"), `@'input`, send)
 </script>
 <lia-llm-load-overlay-host></lia-llm-load-overlay-host>
 <lia-llm-textarea-host hidden></lia-llm-textarea-host>
@@ -21,7 +21,7 @@ window.LiaLLM.runQuiz("@0", `@'1`, `@'2`, `@'3`, `@'input`, send)
 <lia-llm-activity id="lia-llm-activity-@0" hidden></lia-llm-activity>
 <lia-llm-feedback id="lia-llm-feedback-@0"></lia-llm-feedback>
 <script style="display:block" modify="false">
-window.LiaLLM.renderQuizSolution("@0", `@'1`, window.LiaLLM.getQuizReferenceOrEmpty("@0"), "@input(`lia-llm-result-@0`)", send)
+window.LiaLLM.renderQuizSolution("@0", `@'1`, `@'3`, "@input(`lia-llm-result-@0`)", send)
 </script>
 @end
 -->
@@ -62,7 +62,9 @@ Direkt nach dem normalen Textquiz folgt ein als `text` markierter Block. Im ganz
 enthält er die vollständige Musterlösung für den lokalen Vergleich. Im Kriterienmodus trennt
 `<!-- lia-llm:solution -->` die internen Kernaussagen von einer ausformulierten Musterlösung.
 Die Musterlösung wird in der gerenderten Aufgabe zunächst nicht angezeigt. Mit `solution=1`
-erscheint sie erst, nachdem die Antwort als richtig bewertet wurde.
+erscheint sie, nachdem die Antwort als richtig bewertet oder das Quiz nativ aufgelöst wurde.
+Beim Auflösen startet keine Modellprüfung; ohne ausgewählte Alternativlösung wird die erste
+vollständige Variante angezeigt.
 Bei der Anzeige wird ihr Inhalt vollständig als LiaScript neu geparst. Dadurch werden insbesondere
 Markdown-Strukturen sowie Inline- und Blockformeln in TeX gerendert und nicht als Quelltext gezeigt.
 Der echte Aufgabenwortlaut wird als zweiter Makroparameter an die Auswertung übergeben.
@@ -81,7 +83,7 @@ die Musterlösung oder der Kriterienblock.
 | Eintrag | Zulässige Werte | Standard | Bedeutung |
 | --- | --- | --- | --- |
 | `Schwellenwert` | Dezimalzahl von `0` bis `1`, mit Punkt | Pflichtangabe; empfohlen meist `0.66`, bei atomaren Kriterien `0.55` | Mindestkonfidenz für die gesamte Musterlösung beziehungsweise für jedes einzelne Kriterium; keine Gesamtquote |
-| `solution` | `0`, `1`, `false`, `true` | `true` | Zeigt die Musterlösung nach einer richtigen Antwort an; bei `false` bleibt sie immer verborgen |
+| `solution` | `0`, `1`, `false`, `true` | `true` | Zeigt die Musterlösung nach einer richtigen Antwort oder nativem Auflösen an; bei `false` bleibt sie immer verborgen |
 | `feedback` | `0`, `1`, `false`, `true` | `false` | Schaltet eine kurze, priorisierte Rückmeldung ein; für die Sprachoptionen muss `feedback` aktiv sein |
 | `operator` | `erklaeren`, `erlaeutern`, `beschreiben`, `begruenden`, `vergleichen`, `beurteilen` | nicht gesetzt | Prüft zusätzlich die verlangte Antwortform; nicht mit einem Kriterienblock oder ausdrücklich gewähltem `compact` kombinierbar |
 | `coverage` | Dezimalzahl mit `0 < coverage <= 1`, mit Punkt | nicht gesetzt | Aktiviert nur bei einem Kriterienblock eine gewichtete Gesamtquote; ohne die Option bleiben alle Kriterien einzeln erforderlich, ein Widerspruch bleibt immer ein Veto |
@@ -121,7 +123,7 @@ Ein vollständiger Aufruf sieht so aus:
 ```` markdown
 Aufgabe 1: Erkläre, warum Eis auf flüssigem Wasser schwimmt.
 
-<!-- data-solution-button="off" data-llm-textarea="5" -->
+<!-- data-solution-button="2" data-llm-textarea="5" -->
 [[Antwort]]
 ```text @LLMQuiz(0.66;solution=1;feedback=1;assessmentengine=quality;operator=erklaeren;maxthinkingtime=30s;maxthinkingtokens=medium,`Erkläre, warum Eis auf flüssigem Wasser schwimmt.`)
 Eis besitzt eine geringere Dichte als flüssiges Wasser. Beim Gefrieren bildet das
@@ -139,7 +141,7 @@ stehende Kommentarzeile `<!-- lia-llm:alternative -->` getrennt:
 ```` markdown
 Aufgabe: Erkläre, warum Eis auf flüssigem Wasser schwimmt.
 
-<!-- data-solution-button="off" data-llm-textarea="5" -->
+<!-- data-solution-button="2" data-llm-textarea="5" -->
 [[Antwort]]
 ```text @LLMQuiz(0.66;solution=1;feedback=1,`Erkläre, warum Eis auf flüssigem Wasser schwimmt.`)
 Eis besitzt eine geringere Dichte als flüssiges Wasser. Deshalb trägt der Auftrieb das Eis
@@ -153,9 +155,9 @@ ein, ihre Dichte sinkt unter die von flüssigem Wasser und das Eis schwimmt.
 Die Varianten sind vollständige Alternativen mit Oder-Semantik. Die Antwort wird nicht aus
 passenden Einzelteilen mehrerer Varianten zusammengesetzt. Nach einer bestandenen Prüfung zeigt
 der Musterlösungsblock ausschließlich die inhaltlich passendste, von den Autor:innen hinterlegte
-Variante. Bei einem Gleichstand oder falls kein gültiger Auswahlindex vorliegt, wird
-deterministisch die erste Variante verwendet. `solution=0` unterdrückt die Anzeige weiterhin
-vollständig.
+Variante. Bei einem Gleichstand, einem manuellen Auflösen oder falls kein gültiger Auswahlindex
+vorliegt, wird deterministisch die erste Variante verwendet. `solution=0` unterdrückt die
+Anzeige weiterhin vollständig.
 
 Leere oder inhaltlich doppelte Varianten werden abgewiesen. Mehrere Varianten dürfen zusammen
 höchstens 8000 Zeichen enthalten. Die Syntax ist für verschiedene vollständige Lösungswege
@@ -175,7 +177,7 @@ unverändert aktiv.
 Aufgabe: Warum hält Leyla Finn davon ab, die Blechdose aufzubrechen? Erkläre außerdem, was die
 unterschiedlichen Reaktionen über ihre Arbeitsweisen zeigen.
 
-<!-- data-solution-button="off" data-llm-textarea="6" -->
+<!-- data-solution-button="2" data-llm-textarea="6" -->
 [[Antwort]]
 ```text @LLMQuiz(0.55;solution=1;feedback=1,`Warum hält Leyla Finn davon ab, die Blechdose aufzubrechen? Erkläre außerdem, was die unterschiedlichen Reaktionen über ihre Arbeitsweisen zeigen.`)
 <!-- lia-llm:criterion -->
@@ -247,8 +249,9 @@ verbinden, umstellen und sprachlich ausformulieren.
 
 Der erste Zahlenwert des Makros, im Beispiel `0.55`, bleibt die
 Mindestkonfidenz für jedes einzelne Kriterium. Es sind höchstens 16 nichtleere und inhaltlich
-verschiedene Kriterien zulässig. Nach einer bestandenen Prüfung zeigt `solution=1` ausschließlich
-den ausformulierten Text hinter dem Lösungsmarker; Kriterien und technische Marker bleiben unsichtbar.
+verschiedene Kriterien zulässig. Nach einer bestandenen Prüfung oder dem manuellen Auflösen zeigt
+`solution=1` ausschließlich den ausformulierten Text hinter dem Lösungsmarker; Kriterien und
+technische Marker bleiben unsichtbar.
 `solution=0` unterdrückt die Anzeige. Fehlt der neue Lösungsmarker in einem älteren Kriterienblock,
 werden aus Kompatibilitätsgründen weiterhin die zusammengefügten Kriterien als Musterlösung verwendet.
 
@@ -264,7 +267,7 @@ Ein vollständiger Aufruf mit elf Kriterien sieht beispielsweise so aus:
 ```` markdown
 Aufgabe: Beschreibe die Eigenschaften eines Quadrats.
 
-<!-- data-solution-button="off" data-llm-textarea="6" -->
+<!-- data-solution-button="2" data-llm-textarea="6" -->
 [[Antwort]]
 ```text @LLMQuiz(0.55;coverage=0.80;solution=1;feedback=1;assessmentengine=quality;Rechtschreibung=1;Satzbau=1,`Beschreibe die Eigenschaften eines Quadrats.`)
 <!-- lia-llm:criterion -->
@@ -441,8 +444,15 @@ ausschließlich verfügbarer Kompaktbefund zu `uncertain` und bittet um eine ern
 Da ohne das erforderliche Modell die Gesamtaufgabe einschließlich ihrer Antwortform nicht
 zuverlässig geprüft ist, wird der Versuch weder als richtig noch als fachlich falsch verbucht.
 
-Der native LiaScript-Lösungsbutton bleibt bei dieser Quizform ausgeschaltet; die sichtbare Ausgabe
-wird ausschließlich über `solution` gesteuert. Soll die Musterlösung nie erscheinen:
+Die ausführliche Musterlösung folgt LiaScripts nativem Auflösen-Zustand. Deshalb kann
+`data-solution-button` wie bei anderen Quizzen verwendet werden: `on` zeigt **Auflösen**
+sofort, eine positive Ganzzahl erst nach entsprechend vielen Fehlversuchen. Beim Auflösen wird
+keine LLM-Auswertung gestartet; die eingegebene Antwort bleibt im mehrzeiligen Feld erhalten.
+`solution=1` gibt dann die ausformulierte Musterlösung frei. Bei mehreren vollständigen
+Alternativen erscheint beim manuellen Auflösen deterministisch die erste Variante.
+
+Soll die Musterlösung nie erscheinen, werden sowohl die Makrooption als auch der native Button
+deaktiviert:
 
 ```` markdown
 <!-- data-solution-button="off" data-llm-textarea="5" -->
@@ -492,7 +502,7 @@ gemeinsam verwendet werden:
 ```` markdown
 Aufgabe: Erkläre, warum Eis auf flüssigem Wasser schwimmt.
 
-<!-- data-solution-button="off" data-llm-textarea="5" -->
+<!-- data-solution-button="2" data-llm-textarea="5" -->
 [[Antwort]]
 ```text @LLMQuiz(0.66;solution=1;feedback=1;operator=erklaeren;Rechtschreibung=1;Satzbau=1,`Erkläre, warum Eis auf flüssigem Wasser schwimmt.`)
 Eis besitzt eine geringere Dichte als flüssiges Wasser. Beim Gefrieren entsteht eine
@@ -860,24 +870,25 @@ Der reproduzierbare Cold-/Neustart-/Offline-Härtetest samt Schulnetzbedingungen
 
 Seit Version 0.6.6 übergibt `@LLMQuiz_` nur noch die Quizdaten und LiaScripts `send`
 an die gemeinsame Runtime in `src/quiz-runtime.ts` (gebündelt in `dist/index.js`).
-Seit Version 0.6.7 registriert der Prüfen-Ablauf den vollständigen Referenztext unmittelbar beim
-Start; die reaktive Lösungsanzeige liest ihn danach aus der Runtime. Vor dem
-ersten Prüfen bleibt die Lösungsanzeige leer. Dadurch werden weder die Steuerlogik
-noch zwei Kopien der Referenz in jeden Codeblock expandiert; die öffentliche Syntax bleibt
-unverändert. Der Browser-Regressions-Test mit sechs langen Aufgaben auf einer Folie
+Seit Version 0.7.0 registriert die reaktive Lösungsanzeige den vollständigen Referenztext bereits
+beim Rendern. Der Prüfen-Ablauf liest danach dieselbe Kopie aus der Runtime, während die Anzeige
+LiaScripts nativen `resolved`-Zustand beobachtet. Dadurch funktioniert Auflösen ohne vorherige
+Modellprüfung, während weder die Steuerlogik noch zwei Kopien der Referenz in jeden Codeblock
+expandiert werden; die öffentliche Syntax bleibt unverändert. Der Browser-Regressions-Test mit
+sechs langen Aufgaben auf einer Folie
 und dem unveränderten Wochenaufgabenkurs ist in
 [`test/QUIZ-RUNTIME.md`](test/QUIZ-RUNTIME.md) beschrieben.
 
 ## Probieraufgabe
 
 Hier kann die Aufgabe direkt ausprobiert werden. Die Musterlösung bleibt zunächst verborgen und
-erscheint nur nach einer als richtig bewerteten Antwort; bei falschen Antworten wird lediglich das
-eingeschaltete Kurzfeedback angezeigt:
+erscheint nach einer als richtig bewerteten Antwort oder nach zwei Fehlversuchen über **Auflösen**;
+bei falschen Antworten wird zunächst lediglich das eingeschaltete Kurzfeedback angezeigt:
 
 Aufgabe 1: Erkläre, warum Eis auf flüssigem Wasser schwimmt.
 
 
-<!-- data-solution-button="off" data-llm-textarea="5" -->
+<!-- data-solution-button="2" data-llm-textarea="5" -->
 [[Antwort]]
 [[?]] Hinweis
 ```text @LLMQuiz(0.66;solution=1;feedback=1;assessmentengine=compact;Rechtschreibung=1;Satzbau=1,`Erkläre, warum Eis auf flüssigem Wasser schwimmt.`)

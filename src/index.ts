@@ -19,7 +19,14 @@ import { registerLoadOverlay } from "./load-overlay.ts"
 import { parseMacroOptions } from "./macro-options.ts"
 import { registerQuizTextareas } from "./quiz-textarea.ts"
 import { registerQuizPresenceElement } from "./quiz-presence-element.ts"
-import { getQuizReference, getQuizReferenceOrEmpty, renderQuizSolution, runQuiz, stopQuiz } from "./quiz-runtime.ts"
+import {
+  getQuizReference,
+  getQuizReferenceOrEmpty,
+  registerQuizReference,
+  renderQuizSolution,
+  runQuiz,
+  stopQuiz,
+} from "./quiz-runtime.ts"
 import { QualityEvaluator } from "./quality-evaluator.ts"
 import {
   parseCriteria,
@@ -36,7 +43,7 @@ import {
 } from "./solution-element.ts"
 import type { LiaLLMApi } from "./types.ts"
 
-const VERSION = "0.6.9"
+const VERSION = "0.7.0"
 
 interface LiaLLMGlobal {
   LiaLLM?: LiaLLMApi
@@ -86,6 +93,7 @@ if (!api) {
     version: VERSION,
     getQuizReference,
     getQuizReferenceOrEmpty,
+    registerQuizReference,
     runQuiz: (...args) => runQuiz(activeApi, ...args),
     renderQuizSolution: (...args) => renderQuizSolution(activeApi, ...args),
     configure: (config) => evaluator.configure(config),
@@ -156,5 +164,6 @@ export {
   getSolutionVariant,
   setSolutionVariant,
   showSolution,
+  registerQuizReference,
 }
 export type * from "./types.ts"

@@ -19,9 +19,16 @@ interface QuizRuntimeGlobal {
 // attempt, LiaScript stop/reset, or a disconnected quiz retires it as well.
 const quizSessions = new Map<string, () => void>()
 const quizReferences = new Map<string, string>()
+const quizSolutionObservers = new Map<string, MutationObserver>()
 
-// The validator receives the authored source directly and registers it before
-// any asynchronous work. The solution script can run earlier on initial display.
+export function registerQuizReference(id: string, referenceSource: string): void {
+  const normalizedId = id.trim()
+  if (!normalizedId) throw new Error("Die Quiz-ID darf nicht leer sein.")
+  quizReferences.set(normalizedId, referenceSource)
+}
+
+// The lightweight macro adapter registers authored source while rendering.
+// The validator also refreshes it before starting any asynchronous work.
 export function getQuizReferenceOrEmpty(id: string): string {
   return quizReferences.get(id) ?? ""
 }
@@ -36,6 +43,8 @@ export function getQuizReference(id: string): string {
 
 export function stopQuiz(id: string): void {
   quizSessions.get(`lia-llm-activity-${id}`)?.()
+  quizSolutionObservers.get(id)?.disconnect()
+  quizSolutionObservers.delete(id)
 }
 
 /** Shared implementation: the macro only supplies authored data and send. */
@@ -48,7 +57,7 @@ export function runQuiz(
   input: string,
   send: LiaQuizSend,
 ): "LIA: wait" {
-  quizReferences.set(id, referenceSource)
+  registerQuizReference(id, referenceSource)
   const root = (typeof window === "undefined" ? globalThis : window) as
     typeof globalThis & QuizRuntimeGlobal
   const feedbackId = `lia-llm-feedback-${id}`
@@ -420,49 +429,66 @@ export function renderQuizSolution(
     send.clear()
     return
   }
-  quizReferences.set(id, referenceSource)
+  registerQuizReference(id, referenceSource)
   const solutionOptions = api?.parseMacroOptions?.(optionSource)
   const solutionVariantId = `lia-llm-solution-variant-${id}`
   const solutionCriteriaBlock =
     api?.parseCriteriaBlock?.(referenceSource)
   const resultSeparator =
     "\n\n<lia-llm-result-separator></lia-llm-result-separator>"
+  const host = typeof document === "undefined"
+    ? null
+    : document.getElementById(`lia-llm-quiz-${id}`)
+  const quiz = host ? quizForHost(host) : null
 
-  let passed = solutionResult === "true"
-  if (!passed && solutionResult !== "false" && typeof document !== "undefined") {
+  const render = (): void => {
+    let revealed = solutionResult === "true"
+    let resolved = false
+    if (quiz) {
     // On slide restoration the viewer can publish the saved answer instead of
     // the validator result (notably in Firefox). Only recover a passed display
     // when the owning native quiz is still solved and the output is its answer.
     // A reset/open quiz or a technical error must continue to clear the output.
-    const host = document.getElementById(`lia-llm-quiz-${id}`)
-    const quiz = host ? quizForHost(host) : null
-    const input = quiz?.querySelector<HTMLInputElement>("input.lia-quiz__input")
-    passed = Boolean(
-      quiz?.classList.contains("solved") && input &&
-      fromQuizInputValue(input.value) === fromQuizInputValue(solutionResult),
-    )
+      const solved = quiz.classList.contains("solved")
+      resolved = quiz.classList.contains("resolved")
+      const input = quiz.querySelector<HTMLInputElement>("input.lia-quiz__input")
+      if (!solved) revealed = false
+      if (!revealed && solved && solutionResult !== "false") {
+      revealed = Boolean(
+          input &&
+        fromQuizInputValue(input.value) === fromQuizInputValue(solutionResult),
+      )
+      }
+    }
+
+    if ((revealed || resolved) && solutionOptions?.solution) {
+      const solutionReferenceVariants =
+        api.parseReferenceVariants(
+          solutionCriteriaBlock?.reference ?? referenceSource
+        )
+      const storedReferenceIndex =
+        api?.getSolutionVariant?.(solutionVariantId)
+      const selectedReferenceIndex =
+        storedReferenceIndex !== undefined &&
+        Number.isInteger(storedReferenceIndex) &&
+        storedReferenceIndex >= 0 &&
+        storedReferenceIndex < solutionReferenceVariants.length
+          ? storedReferenceIndex
+          : 0
+      send.liascript(
+        solutionReferenceVariants[selectedReferenceIndex] + resultSeparator
+      )
+    } else {
+      send.clear()
+    }
   }
 
-  if (passed && solutionOptions?.solution) {
-    const solutionReferenceVariants =
-      api.parseReferenceVariants(
-        solutionCriteriaBlock?.reference ?? referenceSource
-      )
-    const storedReferenceIndex =
-      api?.getSolutionVariant?.(solutionVariantId)
-    const selectedReferenceIndex =
-      storedReferenceIndex !== undefined &&
-      Number.isInteger(storedReferenceIndex) &&
-      storedReferenceIndex >= 0 &&
-      storedReferenceIndex < solutionReferenceVariants.length
-        ? storedReferenceIndex
-        : 0
-    send.liascript(
-      solutionReferenceVariants[selectedReferenceIndex] + resultSeparator
-    )
-  } else if (passed || solutionResult === "false") {
-    send.liascript(resultSeparator)
-  } else {
-    send.clear()
+  quizSolutionObservers.get(id)?.disconnect()
+  quizSolutionObservers.delete(id)
+  render()
+  if (quiz && typeof MutationObserver !== "undefined") {
+    const observer = new MutationObserver(render)
+    observer.observe(quiz, { attributes: true, attributeFilter: ["class"] })
+    quizSolutionObservers.set(id, observer)
   }
 }

@@ -152,6 +152,20 @@ async function runInteractions(page, result, mobile = false) {
   assert.equal(await input(2).evaluate(element => element.closest(".lia-quiz").classList.contains("solved") || element.classList.contains("is-failure")), false)
   await page.getByText("Regression: technischer Fehler", { exact: false }).first().waitFor()
   record("technical error releases the check button without an incorrect assessment")
+  const callsBeforeResolve = await page.evaluate(() => window.__quizRegression.calls.length)
+  const answerBeforeResolve = await page.locator("lia-llm-textarea-host textarea").nth(2).inputValue()
+  await page.locator(".lia-quiz__resolve").nth(2).click()
+  await page.getByText("Musterloesung A fuer Aufgabe 3.", { exact: false }).waitFor()
+  assert.equal(await page.evaluate(() => window.__quizRegression.calls.length), callsBeforeResolve)
+  assert.equal(
+    await page.locator(".lia-quiz").nth(2).evaluate(element => element.classList.contains("resolved")),
+    true,
+  )
+  assert.equal(
+    await page.locator("lia-llm-textarea-host textarea").nth(2).inputValue(),
+    answerBeforeResolve,
+  )
+  record("native resolve skips evaluation, reveals the first authored solution and preserves the answer")
 
   const cancelled = await start(3, "pending")
   assert.equal(await check(3).isDisabled(), true)

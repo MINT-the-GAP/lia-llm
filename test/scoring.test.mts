@@ -79,7 +79,14 @@ import {
   toQuizInputValue,
 } from "../src/quiz-textarea.ts"
 import { parseMacroOptions } from "../src/macro-options.ts"
-import { getQuizReference, getQuizReferenceOrEmpty, renderQuizSolution, runQuiz, stopQuiz } from "../src/quiz-runtime.ts"
+import {
+  getQuizReference,
+  getQuizReferenceOrEmpty,
+  registerQuizReference,
+  renderQuizSolution,
+  runQuiz,
+  stopQuiz,
+} from "../src/quiz-runtime.ts"
 import {
   normalizeAdaptiveThinkingLimits,
   normalizeThinkingLimits,
@@ -12631,7 +12638,7 @@ function createLLMQuizValidatorRunner(): LLMQuizValidatorRunner {
   })
 }
 
-test("the public version remains pinned exactly to 0.6.9", () => {
+test("the public version remains pinned exactly to 0.7.0", () => {
   const packageJson = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   ) as { version?: string }
@@ -12646,14 +12653,14 @@ test("the public version remains pinned exactly to 0.6.9", () => {
     "utf8",
   )
 
-  assert.equal(packageJson.version, "0.6.9")
-  assert.equal(packageLock.version, "0.6.9")
-  assert.equal(packageLock.packages?.[""]?.version, "0.6.9")
-  assert.match(entry, /const VERSION = "0\.6\.9"/u)
-  assert.match(bundle, /"0\.6\.9"/u)
+  assert.equal(packageJson.version, "0.7.0")
+  assert.equal(packageLock.version, "0.7.0")
+  assert.equal(packageLock.packages?.[""]?.version, "0.7.0")
+  assert.match(entry, /const VERSION = "0\.7\.0"/u)
+  assert.match(bundle, /"0\.7\.0"/u)
   assert.doesNotMatch(bundle, /let [\w$]+="0\.6\.4",[\w$]+=globalThis/u)
-  assert.match(browserSmoke, /window\.LiaLLM\.version === "0\.6\.9"/u)
-  assert.match(readme, /^version:\s+0\.6\.9$/mu)
+  assert.match(browserSmoke, /window\.LiaLLM\.version === "0\.7\.0"/u)
+  assert.match(readme, /^version:\s+0\.7\.0$/mu)
   assert.match(readme, /^script:\s+\.\/dist\/index\.js$/mu)
   assert.doesNotMatch(
     readme,
@@ -12815,6 +12822,7 @@ test("LLMQuiz exposes a canonical wrapper and a compatible question alias", () =
     /vollständig als LiaScript neu geparst[\s\S]*Inline- und Blockformeln in TeX/u,
   )
   assert.match(readme, /data-solution-button="off"/u)
+  assert.match(readme, /data-solution-button="2"/u)
 
   const validatorScript = macro.match(
     /<script output="lia-llm-result-@0">\n([\s\S]*?)\n<\/script>/u,
@@ -13173,8 +13181,8 @@ test("solution=1 renders only the authored flowing criteria solution", () => {
 
   rendered.length = 0
   renderQuizSolution(api, "flowing-solution", "0.55;solution=0", solutionSource, "true", send)
-  assert.deepEqual(rendered, ["\n\n<lia-llm-result-separator></lia-llm-result-separator>"])
-  assert.equal(cleared, 0)
+  assert.deepEqual(rendered, [])
+  assert.equal(cleared, 1)
 })
 
 function createQuizRuntimeProbe(overrides: Partial<LiaLLMApi> = {}) {
@@ -13229,7 +13237,7 @@ async function flushQuizRuntime(): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, 0))
 }
 
-test("LLMQuiz validator registers the single reference before reactive solution rendering", () => {
+test("LLMQuiz registers one reference at render time for checking and native solutions", () => {
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8")
   const macro = readme.match(/\n@LLMQuiz_\n([\s\S]*?)\n@end/u)?.[1]
   assert.ok(macro)
@@ -13270,14 +13278,24 @@ test("LLMQuiz validator registers the single reference before reactive solution 
   const send = {}
   const api = {
     getQuizReferenceOrEmpty: (id: string) => references.get(id) ?? "",
+    getQuizReference: (id: string) => {
+      const value = references.get(id)
+      if (value === undefined) throw new Error("missing reference")
+      return value
+    },
+    registerQuizReference: (id: string, value: string) => {
+      references.set(id, value)
+    },
     runQuiz: (...args: unknown[]) => {
-      references.set(args[0] as string, args[3] as string)
       calls.push(args)
       return "LIA: wait"
     },
-    renderQuizSolution: (...args: unknown[]) => { solutionCalls.push(args) },
+    renderQuizSolution: (...args: unknown[]) => {
+      references.set(args[0] as string, args[2] as string)
+      solutionCalls.push(args)
+    },
   }
-  for (const script of scripts) {
+  for (const script of [scripts[1]!, scripts[0]!]) {
     assert.ok(Buffer.byteLength(script[1]!, "utf8") < 450)
     const executable = script[1]!
       .replace('"@input(`lia-llm-result-@0`)"', '"true"')
@@ -13304,6 +13322,12 @@ test("LLMQuiz solution renderer retains a supplied reference even with solution=
   assert.equal(getQuizReferenceOrEmpty(probe.id), "")
   renderQuizSolution(probe.api, probe.id, "0.66;solution=0", "", "", send)
   assert.throws(() => getQuizReference(probe.id), /noch nicht initialisiert/u)
+  registerQuizReference(probe.id, "Vorab registrierte Referenz.")
+  assert.equal(getQuizReference(probe.id), "Vorab registrierte Referenz.")
+  assert.throws(
+    () => registerQuizReference("  ", "Referenz"),
+    /Quiz-ID darf nicht leer sein/u,
+  )
   for (const result of ["", "false", "true"]) {
     const reference = "<!-- lia-llm:criterion -->\nUnverändertes Kriterium " + result +
       ".\n<!-- lia-llm:solution -->\n**Vollständige** Musterlösung mit $a^2$ und `Code`."
@@ -13312,8 +13336,7 @@ test("LLMQuiz solution renderer retains a supplied reference even with solution=
     probe.stop()
     assert.equal(getQuizReference(probe.id), reference, "Navigation retains authored source")
   }
-  assert.equal(rendered.length, 2)
-  assert.ok(rendered.every(value => value === "\n\n<lia-llm-result-separator></lia-llm-result-separator>"))
+  assert.equal(rendered.length, 0)
 })
 
 test("LLMQuiz keeps pass/fail assessments separate from uncertain and technical failures", async () => {
@@ -13526,11 +13549,11 @@ test("LLMQuiz retains the selected solution across navigation and clears it afte
   await flushQuizRuntime()
   assert.equal(getSolutionVariant("lia-llm-solution-variant-" + probe.id), undefined)
   renderQuizSolution(probe.api, probe.id, "0.66;solution=1", source, "false", send)
-  assert.equal(rendered[2], "\n\n<lia-llm-result-separator></lia-llm-result-separator>")
+  assert.equal(cleared, 1)
   for (const unassessed of ["", "LIA: wait", "uncertain", "technischer Fehler"]) {
     renderQuizSolution(probe.api, probe.id, "0.66;solution=1", source, unassessed, send)
   }
-  assert.equal(cleared, 4)
+  assert.equal(cleared, 5)
   probe.stop()
   assert.equal(getSolutionVariant("lia-llm-solution-variant-" + probe.id), undefined)
 })
@@ -13541,11 +13564,15 @@ test("LLMQuiz restores a saved answer only for its solved native quiz and keeps 
   const rendered: string[] = []
   let cleared = 0
   let solved = true
+  let resolved = false
   let hostPresent = true
   let inputPresent = true
   const input = { value: "Gespeicherte Antwort\u2028mit zweiter Zeile." }
   const quiz = {
-    classList: { contains: (name: string) => name === "solved" && solved },
+    classList: {
+      contains: (name: string) =>
+        (name === "solved" && solved) || (name === "resolved" && resolved),
+    },
     querySelector: (selector: string) => {
       assert.equal(selector, "input.lia-quiz__input")
       return inputPresent ? input : null
@@ -13605,8 +13632,13 @@ test("LLMQuiz restores a saved answer only for its solved native quiz and keeps 
     assert.equal(rendered.length, 2)
 
     hostPresent = true
+    resolved = true
+    render("")
+    assert.equal(rendered.length, 3, "A native resolve reveals the authored solution")
+
+    resolved = false
     render(input.value, "0.66;solution=0")
-    assert.equal(rendered[2], "\n\n<lia-llm-result-separator></lia-llm-result-separator>")
+    assert.equal(cleared, 9)
   } finally {
     if (documentDescriptor) Object.defineProperty(globalThis, "document", documentDescriptor)
     else Reflect.deleteProperty(globalThis, "document")
