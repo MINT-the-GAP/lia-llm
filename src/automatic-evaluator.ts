@@ -24,9 +24,10 @@ import {
   isQualityOutputError,
   isQualityWorkerTimeoutError,
   isRecoverableQualityRequestError,
+  qualityDiagnosticForCriteria,
   QualityEvaluator,
 } from "./quality-evaluator.ts"
-import { normalizeRequest } from "./scoring.ts"
+import { aggregateCriteria, normalizeRequest } from "./scoring.ts"
 import {
   normalizeAdaptiveThinkingLimits,
   normalizeThinkingLimits,
@@ -65,6 +66,10 @@ const DEFAULT_AUTOMATIC_EVALUATOR_TIMINGS: AutomaticEvaluatorTimings = {
   cachedQualityWaitMs: 180_000,
   qualityCacheProbeWaitMs: 5_000,
 }
+
+// A positive Compact decision just above the task threshold can miss a
+// counterclaim. Require stronger evidence to skip an available review.
+const MIN_COMPACT_SUPPORT_TO_SKIP_REVIEW = 0.8
 
 type ForegroundWaitResult<T> =
   | { timedOut: false; value: T }
@@ -316,6 +321,7 @@ export class AutomaticEvaluator {
   private qualityEvaluationQueue: Promise<void> = Promise.resolve()
   private activeLanguageController: AbortController | null = null
   private compactUsers = 0
+  private retainCompactForAutomaticChecks = false
   private compactUnloadPromise: Promise<void> | null = null
   private clearPromise: Promise<number> | null = null
   private readonly consentControllers = new Set<AbortController>()
@@ -392,6 +398,7 @@ export class AutomaticEvaluator {
     if (
       !this.qualityReady ||
       this.qualityDegraded ||
+      this.retainCompactForAutomaticChecks ||
       this.compactUsers > 0 ||
       this.compactUnloadPromise
     ) {
@@ -778,6 +785,10 @@ export class AutomaticEvaluator {
         engine: "compact",
         message: "Kompaktmodell wird vorbereitet …",
       })
+      if (this.compactUnloadPromise) {
+        await waitForRun(this.compactUnloadPromise, run)
+      }
+      assertRunActive(run)
       await waitForRun(this.ensureCompact(), run)
       assertRunActive(run)
       this.reportProgress(options, run, {
@@ -898,6 +909,126 @@ export class AutomaticEvaluator {
     return waitForRun(evaluation, run)
   }
 
+  private async evaluateAutomatic(
+    request: EvaluationRequest,
+    normalized: ReturnType<typeof normalizeRequest>,
+    options: EvaluationOptions | undefined,
+    run: EvaluationRun,
+  ): Promise<EvaluationResult> {
+    // Later automatic checks still start on Compact, even with Quality ready.
+    this.retainCompactForAutomaticChecks = true
+    const compact = await this.evaluateCompact(request, options, run)
+    assertRunActive(run)
+    if (
+      compact.criteria.some(criterion => criterion.status === "contradicted") ||
+      this.qualityDegraded ||
+      !supportsQualityRuntime()
+    ) {
+      return compact
+    }
+
+    const reviewEvidence = compact.criteria.map(criterion =>
+      criterion.status === "met" &&
+      criterion.entailment < MIN_COMPACT_SUPPORT_TO_SKIP_REVIEW
+        ? { ...criterion, status: "uncertain" as const }
+        : criterion,
+    )
+    if (compact.passed && aggregateCriteria(reviewEvidence, normalized.passThreshold).passed) {
+      return compact
+    }
+
+    // Compact can miss an unfamiliar paraphrase. Review open criteria using
+    // the same authored rubric, including the original overall threshold.
+    const openIds = new Set(
+      reviewEvidence.filter(criterion => criterion.status !== "met")
+        .map(criterion => criterion.id),
+    )
+    const openCriteria = normalized.mode === "criteria"
+      ? normalized.criteria.filter(criterion => openIds.has(criterion.id))
+      : undefined
+    if (openCriteria?.length === 0) return compact
+
+    if (!this.qualityReady) {
+      const probe = this.getQualityCacheInfo()
+      let cache: ModelCacheInfo | undefined
+      try {
+        const result = await waitForRunWithTimeout(
+          probe,
+          this.timings.qualityCacheProbeWaitMs,
+          run,
+        )
+        if (!result.timedOut) cache = result.value
+      } catch (error) {
+        if (isAbortError(error)) throw error
+      } finally {
+        if (!cache?.cached && this.qualityCacheInfoPromise === probe) {
+          this.qualityCacheInfoPromise = null
+        }
+      }
+      assertRunActive(run)
+      if (!this.qualityReady) {
+        if (!cache?.cached || this.qualityDegraded) return compact
+        this.reportProgress(options, run, {
+          phase: "preparing-quality",
+          engine: "quality",
+          message: "Lokale Nachprüfung wird vorbereitet …",
+        })
+        const upgrade = this.startQualityUpgrade(cache)
+        const release = this.retainQualityUpgrade(run, upgrade)
+        try {
+          if (!await this.waitForQualityUpgradeInForeground(upgrade, cache, run)) {
+            return compact
+          }
+        } finally {
+          release()
+        }
+      }
+    }
+    assertRunActive(run)
+
+    const reviewed = await this.evaluateQualityWithFallback(
+      openCriteria ? { ...request, criteria: openCriteria } : request,
+      options,
+      run,
+      compact,
+    )
+    if (reviewed === compact) return compact
+
+    const durationMs = Number((compact.durationMs + reviewed.durationMs).toFixed(1))
+    const reviewedById = new Map(reviewed.criteria.map(criterion => [criterion.id, criterion]))
+    if (openCriteria?.some(criterion => !reviewedById.has(criterion.id))) return compact
+
+    const sameReference =
+      (compact.selectedReferenceIndex ?? 0) === (reviewed.selectedReferenceIndex ?? 0)
+    const criteria = compact.criteria.map(criterion => {
+      const checked = reviewedById.get(criterion.id)
+      if (!checked) return criterion
+      const competingEvidence = Math.max(criterion.entailment, criterion.neutral)
+      // Treat disagreement on the same claim as uncertainty. Evidence about
+      // one complete solution variant cannot veto a different valid variant.
+      if (
+        sameReference &&
+        checked.status === "met" &&
+        criterion.contradiction > competingEvidence &&
+        criterion.contradiction - competingEvidence >= normalized.contrastiveMargin
+      ) {
+        return { ...checked, status: "uncertain" as const }
+      }
+      return checked
+    })
+    if (!openCriteria && criteria.every((item, index) => item === reviewed.criteria[index])) {
+      return { ...reviewed, durationMs }
+    }
+    const assessment = aggregateCriteria(criteria, normalized.passThreshold)
+    return {
+      ...reviewed,
+      ...assessment,
+      criteria,
+      diagnostic: qualityDiagnosticForCriteria(criteria, assessment.passed),
+      durationMs,
+    }
+  }
+
   async preload(): Promise<RuntimeStatus> {
     await this.waitForClear()
     const generation = this.generation
@@ -949,21 +1080,20 @@ export class AutomaticEvaluator {
 
     this.reportProgress(evaluationOptions, run, {
       phase: "selecting-model",
-      engine: requestedEngine !== "compact" && this.qualityReady
+      engine: qualityRequested && this.qualityReady
         ? "quality"
         : "compact",
       message: "Passendes Modell wird ausgewählt …",
     })
 
-    if (
-      requestedEngine === "compact" ||
-      (!qualityRequested &&
-        (this.qualityDegraded || !supportsQualityRuntime()))
-    ) {
+    if (requestedEngine === "compact") {
       return operatorSafeCompactResult(
         request,
         await this.evaluateCompact(request, evaluationOptions, run),
       )
+    }
+    if (!qualityRequested) {
+      return this.evaluateAutomatic(request, normalized, evaluationOptions, run)
     }
 
     let compactResult: EvaluationResult | undefined
@@ -982,21 +1112,7 @@ export class AutomaticEvaluator {
 
     let qualityCache: ModelCacheInfo | undefined
     try {
-      const probe = this.getQualityCacheInfo()
-      if (qualityRequested) {
-        qualityCache = await waitForRun(probe, run)
-      } else {
-        const result = await waitForRunWithTimeout(
-          probe,
-          this.timings.qualityCacheProbeWaitMs,
-          run,
-        )
-        if (!result.timedOut) qualityCache = result.value
-        // A later quiz/tab may finish downloading Quality before the next check.
-        if (!qualityCache?.cached && this.qualityCacheInfoPromise === probe) {
-          this.qualityCacheInfoPromise = null
-        }
-      }
+      qualityCache = await waitForRun(this.getQualityCacheInfo(), run)
     } catch (error) {
       if (isAbortError(error)) throw error
     }
@@ -1008,14 +1124,6 @@ export class AutomaticEvaluator {
         evaluationOptions,
         run,
         compactResult,
-      )
-    }
-
-    // Ordinary quizzes reuse Quality locally, without downloading or repairing it.
-    if (!qualityRequested && !qualityCache?.cached) {
-      return operatorSafeCompactResult(
-        request,
-        await this.evaluateCompact(request, evaluationOptions, run),
       )
     }
 
@@ -1311,6 +1419,7 @@ export class AutomaticEvaluator {
     this.qualityCacheInfoPromise = null
     this.qualityUpgradePromise = null
     this.compactUnloadPromise = null
+    this.retainCompactForAutomaticChecks = false
 
     let clearing!: Promise<number>
     clearing = (async () => {

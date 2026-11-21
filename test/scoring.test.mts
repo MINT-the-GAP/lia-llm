@@ -10409,7 +10409,7 @@ test('AutomaticEvaluator rejects manipulation before model work', async () => {
   }
 })
 
-test("automatic evaluator reuses cached quality and downloads it only for explicit or advanced requests", async () => {
+test("automatic evaluator tries Compact first and only rechecks unresolved answers with local Quality", async () => {
   class MockEvaluator {
     readonly status
     readonly modelId
@@ -10425,6 +10425,7 @@ test("automatic evaluator reuses cached quality and downloads it only for explic
     preloadCaches: ModelCacheInfo[] = []
     preloadBarrier: Promise<void> | null = null
     unloadCalls = 0
+    resultStatus: EvaluationResult["status"] = "passed"
     failEvaluation = false
     waitForEvaluationAbort = false
     evaluationAbortObserved = false
@@ -10501,7 +10502,8 @@ test("automatic evaluator reuses cached quality and downloads it only for explic
           else signal.addEventListener("abort", onAbort, { once: true })
         })
       }
-      const value = evaluation("passed", [result("overall", "met", true)])
+      const criterionStatus = this.resultStatus === "passed" ? "met" : this.resultStatus === "uncertain" ? "uncertain" : "missed"
+      const value = evaluation(this.resultStatus, [result("overall", criterionStatus, true)])
       if (request) value.answer = request.answer
       value.model.id = this.modelId
       value.model.device = this.status.device
@@ -10584,6 +10586,10 @@ test("automatic evaluator reuses cached quality and downloads it only for explic
     assert.equal(preparation.assessmentEngine, "compact")
     assert.equal(compact.preloadCalls, 1)
     assert.equal(quality.preloadCalls, 0)
+    const immediate = await automatic.evaluate(request)
+    assert.equal(immediate.model.id, "compact-test")
+    assert.equal(quality.preloadCalls, 0)
+    compact.resultStatus = "failed"
     let qualitySettled = false
     const firstQualityPromise = automatic
       .evaluate(request)
@@ -10593,6 +10599,7 @@ test("automatic evaluator reuses cached quality and downloads it only for explic
       })
     await new Promise((resolve) => setTimeout(resolve, 0))
     assert.equal(qualitySettled, false)
+    assert.equal(compact.evaluateCalls, 2)
     assert.equal(quality.preloadCalls, 1)
     assert.equal(quality.preloadCaches[0]?.cached, true)
     assert.equal(quality.preloadCaches[0]?.downloadCached, true)
@@ -10603,6 +10610,10 @@ test("automatic evaluator reuses cached quality and downloads it only for explic
 
     const second = await automatic.evaluate(request)
     assert.equal(second.model.id, "quality-test")
+    assert.equal(compact.evaluateCalls, 3)
+    assert.equal(compact.preloadCalls, 1)
+    assert.equal(compact.unloadCalls, 0)
+    compact.resultStatus = "passed"
 
     const compactCallsBeforeLanguage = compact.evaluateCalls
     const qualityContentCallsBeforeLanguage = quality.evaluateCalls
@@ -10696,6 +10707,12 @@ test("automatic evaluator reuses cached quality and downloads it only for explic
     assert.equal(networkCompact.evaluateCalls, 1)
     assert.equal(networkQuality.evaluateCalls, 0)
     assert.equal(networkQuality.preloadCalls, 0)
+
+    networkCompact.resultStatus = "uncertain"
+    const unresolved = await networkAutomatic.evaluate(request)
+    assert.equal(unresolved.status, "uncertain")
+    assert.equal(networkQuality.preloadCalls, 0)
+    networkCompact.resultStatus = "passed"
 
     const whitespaceOperator = await networkAutomatic.evaluate({
       ...request,
@@ -10932,6 +10949,84 @@ class ForegroundWaitMockEvaluator {
     return 1
   }
 }
+
+test("automatic criteria recheck preserves resolved criteria and the original pass threshold", async () => {
+  await withForegroundQualityRuntime(async () => {
+    const compact = new ForegroundWaitMockEvaluator("compact", "compact", foregroundWaitCache(true))
+    const quality = new ForegroundWaitMockEvaluator("quality", "quality", foregroundWaitCache(true))
+    const automatic = new AutomaticEvaluator(compact as never, quality as never)
+    const request: EvaluationRequest = {
+      question: "Erkläre, warum Eis auf flüssigem Wasser schwimmt.",
+      answer: "Gefrorenes Wasser ist weniger dicht und bleibt daher an der Oberfläche.",
+      reference: "Eis hat eine geringere Dichte als flüssiges Wasser und schwimmt deshalb.",
+      criteria: [
+        { text: "Eis schwimmt.", weight: 2 },
+        { text: "Eis hat eine geringere Dichte als flüssiges Wasser.", required: true },
+      ],
+      passThreshold: 0.6,
+    }
+    let firstStatus: CriterionResult["status"] = "met"
+    let secondStatus: CriterionResult["status"] = "missed"
+    let reviewedStatus: CriterionResult["status"] = "met"
+    let compactOpposesSecond = false
+    const supported = { ...result("criterion-1", "met"), weight: 2 }
+    compact.evaluate = async () => {
+      compact.evaluateCalls += 1
+      const status = secondStatus === "met" ? "passed" : "failed"
+      return {
+        ...evaluation(status, [
+          { ...supported, status: firstStatus },
+          {
+            ...result("criterion-2", secondStatus, true),
+            entailment: compactOpposesSecond ? 0.34 : 0.7,
+            contradiction: compactOpposesSecond ? 0.53 : 0.05,
+          },
+        ]),
+        mode: "criteria",
+      }
+    }
+    quality.evaluate = async (focused) => {
+      quality.evaluateCalls += 1
+      assert.deepEqual(
+        normalizeRequest(focused).criteria.map(criterion => [criterion.id, criterion.required]),
+        [["criterion-2", true]],
+      )
+      assert.equal(focused.answer, request.answer)
+      return {
+        ...evaluation(reviewedStatus === "met" ? "passed" : "failed", [
+          result("criterion-2", reviewedStatus, true),
+        ]),
+        mode: "criteria",
+      }
+    }
+
+    const reviewed = await automatic.evaluate(request)
+    assert.equal(reviewed.status, "passed")
+    assert.equal(reviewed.coverage, 1)
+    assert.deepEqual(reviewed.criteria, [supported, result("criterion-2", "met", true)])
+    assert.equal(quality.evaluateCalls, 1)
+
+    secondStatus = "met"
+    reviewedStatus = "contradicted"
+    const corrected = await automatic.evaluate(request)
+    assert.equal(corrected.status, "failed")
+    assert.equal(corrected.criteria[1]?.status, "contradicted")
+    assert.equal(quality.evaluateCalls, 2)
+
+    secondStatus = "missed"
+    reviewedStatus = "met"
+    compactOpposesSecond = true
+    const disagreement = await automatic.evaluate(request)
+    assert.equal(disagreement.status, "uncertain")
+    assert.equal(disagreement.criteria[1]?.status, "uncertain")
+    assert.equal(quality.evaluateCalls, 3)
+
+    firstStatus = "contradicted"
+    const contradicted = await automatic.evaluate(request)
+    assert.equal(contradicted.status, "failed")
+    assert.equal(quality.evaluateCalls, 3)
+  })
+})
 
 function foregroundWaitCache(cached: boolean): ModelCacheInfo {
   return {

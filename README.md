@@ -636,8 +636,15 @@ Schwelle liegen. Das stärkere Quality-Modell ist eine optionale Erweiterung:
    verborgene Markierung einliest, startet einmalig die Vorbereitung des Kompaktmodells. Weitere
    Quizze und spätere Folienbesuche starten keinen zweiten Ladevorgang. Ein nur importiertes, aber
    nirgends gerendertes Makro lädt dagegen keine Modelle.
-2. Normale Aufrufe ohne Engine-Angabe und ohne erweiterte Quality-Funktion werden ausschließlich
-   mit Compact geprüft. Sie laden Qwen nicht und benötigen kein WebGPU.
+2. Normale Aufrufe ohne Engine-Angabe und ohne erweiterte Quality-Funktion starten mit Compact.
+   Bei klar gestützten Antworten und festgestellten Widersprüchen endet die Prüfung direkt.
+   Bei offenen oder schwach gestützten Befunden kann ein vollständig lokal verfügbares
+   Quality-Modell nachprüfen, wenn sich das Urteil dadurch ändern kann. Im
+   Kriterienmodus erhält es dafür nur die offenen Kriterien. Beide Schritte gehören zum selben
+   Klick auf **Prüfen** und liefern LiaScript zusammen ein Ergebnis. Bei widersprüchlichen
+   Modellbefunden kann ein entscheidendes Kriterium unbewertet bleiben. Auf Geräten ohne WebGPU
+   oder vollständigen Quality-Cache bleibt der Compact-Befund maßgeblich. Die automatische
+   Nachprüfung startet keinen neuen Modelldownload.
 3. `assessmentengine=quality` wählt den Quality-Pfad ausdrücklich. Zur Rückwärtskompatibilität
    wählen Operatorprüfung, Sprachanalyse und ein ausdrücklich aktivierter Thinking-Lauf Quality
    auch ohne Engine-Angabe. Das konkrete Qwen-Modell wird vor einem nötigen Download anhand des
