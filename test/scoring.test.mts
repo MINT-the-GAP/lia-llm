@@ -13372,6 +13372,30 @@ test("LLMQuiz keeps pass/fail assessments separate from uncertain and technical 
   explained.stop()
 })
 
+test("LLMQuiz counts a too-short answer as a failed trial", async () => {
+  const inputError = new EvaluationInputError(
+    "answer-too-short",
+    "Die Antwort ist zu kurz.",
+    4,
+    12,
+    resolveOperatorRubric("erklaeren"),
+  )
+  const probe = createQuizRuntimeProbe({
+    evaluate: async () => { throw inputError },
+    feedbackForError,
+  })
+
+  probe.start()
+  await flushQuizRuntime()
+
+  assert.deepEqual(probe.sent, [["false"]])
+  assert.equal(
+    probe.feedback.at(-1)?.message,
+    "Die Antwort ist deutlich zu kurz, um etwas zu erklären.",
+  )
+  probe.stop()
+})
+
 test("LLMQuiz forwards both engines, references, input newlines and thinking limits", async () => {
   for (const engine of ["compact", "quality"] as const) {
     let received: EvaluationOptions | undefined

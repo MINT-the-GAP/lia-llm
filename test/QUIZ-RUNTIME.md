@@ -39,6 +39,9 @@ auf installiertem Brave oder physischen iOS-Geräten.
 - Auswertung mit `compact` und `quality`, Kriterien/`coverage`, Feedback,
   Sprachprüfung, passende Lösungsvariante, Aktivitätsanzeige, Abbruch,
   erneuter Start sowie Verwerfen verspäteter Resultate beim Folienwechsel.
+- Zwei identische zu kurze Antworten zählen als Fehlversuche und schalten beim
+  konfigurierten Schwellwert von zwei den nativen Auflösen-Button frei, ohne
+  das Modell aufzurufen.
 - Abbruchsignal, Prüfen-Button, Tastaturbedienung und ARIA-Auszeichnungen.
 - Eine Größenprüfung verhindert, dass die Ablaufsteuerung erneut in den
   Makrokörper wandert. Die Unit-Tests prüfen zusätzlich die expandierte Form

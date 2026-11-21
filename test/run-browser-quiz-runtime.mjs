@@ -42,6 +42,7 @@ function installEvaluatorStub() {
       runtime = api
       state.runs = []
       const originalRun = api.runQuiz
+      const originalEvaluate = api.evaluate.bind(api)
       if (originalRun) api.runQuiz = (...args) => { state.runs.push({ id: args[0], answer: args[4] }); return originalRun(...args) }
       const status = state.status = { phase: "ready", assessmentEngine: "compact", loadSource: "cache" }
       api.getStatus = () => status
@@ -57,6 +58,9 @@ function installEvaluatorStub() {
         return languageAnalysis
       }
       api.evaluate = (request, options = {}) => {
+        if (request.answer.length < 12) {
+          return originalEvaluate(request, options)
+        }
         const entry = { request, engine: request.assessmentEngine, aborted: false, hasSignal: options.signal instanceof AbortSignal }
         state.calls.push(entry)
         options.signal?.addEventListener("abort", () => { entry.aborted = true })
@@ -212,6 +216,49 @@ async function runInteractions(page, result, mobile = false) {
   await navigate(3, 1)
   assert.equal(await page.evaluate(i => window.__quizRegression.calls[i].aborted, abandoned), true)
   await page.evaluate(() => window.__quizRegression.pending.shift()("passed"))
+  const shortArea = page.locator("lia-llm-textarea-host textarea").first()
+  const shortResolve = page.locator(".lia-quiz__resolve").first()
+  const callsBeforeShortAnswer = await page.evaluate(
+    () => window.__quizRegression.calls.length,
+  )
+  await shortArea.fill("Kurz.")
+  result.shortAttempts = []
+  for (const attempt of [1, 2]) {
+    const runsBeforeAttempt = await page.evaluate(
+      () => window.__quizRegression.runs.length,
+    )
+    await check(0).click()
+    await page.waitForFunction(
+      previous => window.__quizRegression.runs.length > previous,
+      runsBeforeAttempt,
+    )
+    await page.waitForFunction(expectedAttempt => {
+      const checkButton = document.querySelector(".lia-quiz__check")
+      const resolveButton = document.querySelector(".lia-quiz__resolve")
+      return expectedAttempt === 1
+        ? checkButton?.textContent?.trim().endsWith("1")
+        : resolveButton?.getAttribute("aria-hidden") === "false"
+    }, attempt)
+    await waitEnabled(0)
+    result.shortAttempts.push({
+      attempt,
+      checkText: await check(0).innerText(),
+      resolveHidden: await shortResolve.getAttribute("aria-hidden"),
+    })
+  }
+  assert.deepEqual(
+    result.shortAttempts.map(entry => entry.resolveHidden),
+    ["true", "false"],
+  )
+  assert.equal(
+    await page.evaluate(() => window.__quizRegression.calls.length),
+    callsBeforeShortAnswer,
+  )
+  assert.match(
+    await feedback(0).locator("[part=content]").innerText(),
+    /zu kurz/u,
+  )
+  record("two identical too-short answers count as failed trials and reveal native resolve")
   await start(0, "passed")
   await page.waitForFunction(() => document.querySelector(".lia-quiz").classList.contains("solved"))
   const short = await page.evaluate(() => window.__quizRegression.calls.at(-1))

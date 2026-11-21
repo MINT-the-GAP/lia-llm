@@ -151,7 +151,7 @@ Musterloesung B fuer Aufgabe 6. Hallo Mira, hast du Lust auf einen gemeinsamen A
 
 Beschreibe die Form eines Quadrats.
 
-<!-- data-llm-textarea="3" -->
+<!-- data-llm-textarea="3" data-solution-button="2" -->
 [[Antwort]]
 ```text @LLMQuiz(0.55;coverage=1;solution=1;feedback=1;assessmentengine=compact,`Beschreibe die Form eines Quadrats.`)
 <!-- lia-llm:criterion -->

@@ -1,4 +1,5 @@
 import type { LLMQuizMacroOptions } from "./macro-options.ts"
+import { EvaluationInputError } from "./learner-feedback.ts"
 import { fromQuizInputValue, quizForHost } from "./quiz-textarea.ts"
 import type {
   CriterionInput,
@@ -406,6 +407,14 @@ export function runQuiz(
       if (!active) return
       clearSolutionVariant()
       const feedback = api?.feedbackForError?.(error, "de-DE") ?? null
+      if (
+        error instanceof EvaluationInputError &&
+        error.code === "answer-too-short"
+      ) {
+        showLearnerFeedback(feedback)
+        finishQuiz("false")
+        return
+      }
       if (feedback) {
         finishUnassessed(feedback.message)
         return

@@ -450,6 +450,8 @@ sofort, eine positive Ganzzahl erst nach entsprechend vielen Fehlversuchen. Beim
 keine LLM-Auswertung gestartet; die eingegebene Antwort bleibt im mehrzeiligen Feld erhalten.
 `solution=1` gibt dann die ausformulierte Musterlösung frei. Bei mehreren vollständigen
 Alternativen erscheint beim manuellen Auflösen deterministisch die erste Variante.
+Eine Antwort, die die erforderliche Mindestlänge unterschreitet, zählt dabei als Fehlversuch;
+technische Modellfehler und nicht eindeutige Bewertungen erhöhen den Zähler weiterhin nicht.
 
 Soll die Musterlösung nie erscheinen, werden sowohl die Makrooption als auch der native Button
 deaktiviert:
