@@ -329,8 +329,8 @@ export interface EvaluationResult {
   model: {
     id: string
     revision: string
-    device: RuntimeDevice | "none"
-    dtype: RuntimeDType | "none"
+    device: RuntimeDevice | "none" | "browser"
+    dtype: RuntimeDType | "none" | "browser"
     task:
       | "natural-language-inference"
       | "generative-assessment"
@@ -580,8 +580,8 @@ export interface LiaLLMApi {
     locale?: string,
     options?: ResultFormatOptions,
   ): string
-  feedbackForResult(result: EvaluationResult, locale?: string): LearnerFeedback | null
-  feedbackForError(error: unknown, locale?: string): LearnerFeedback | null
+  feedbackForResult(result: EvaluationResult, locale?: string, question?: string): LearnerFeedback | null
+  feedbackForError(error: unknown, locale?: string, question?: string): LearnerFeedback | null
   showFeedback(
     id: string,
     message: string,

@@ -131,7 +131,7 @@ async function runInteractions(page, result, mobile = false) {
   await start(0, "failed", true)
   await page.waitForFunction(() => document.querySelector(".lia-quiz__input").classList.contains("is-failure"))
   await waitEnabled(0)
-  assert.match(await feedback(0).locator("[part=content]").innerText(), /noch nicht vollst|incomplete/u)
+  assert.match(await feedback(0).locator("[part=content]").innerText(), /Stütze deine Schlussfolgerung/u)
   const first = await page.evaluate(() => window.__quizRegression.calls[0])
   assert.equal(first.request.assessmentEngine, "compact")
   assert.equal(first.request.criteria.length, 6)
@@ -148,7 +148,7 @@ async function runInteractions(page, result, mobile = false) {
   await waitEnabled(1)
   assert.equal(await input(1).evaluate(element => element.closest(".lia-quiz").classList.contains("solved") || element.classList.contains("is-failure")), false)
   assert.equal(await page.evaluate(() => window.__quizRegression.calls.at(-1).request.assessmentEngine), "quality")
-  await page.getByText("Die Antwort ist noch nicht eindeutig genug.", { exact: false }).first().waitFor()
+  await page.getByText("Die Prüfung konnte deine Antwort noch nicht sicher bewerten.", { exact: false }).first().waitFor()
   record("uncertain stays unassessed and quality reaches the evaluator")
 
   await start(2, "error")
@@ -291,11 +291,24 @@ async function runWeeklyInteractions(page, result) {
   const start = async (index, mode) => {
     const count = await page.evaluate(() => window.__quizRegression.calls.length)
     await page.evaluate(value => { window.__quizRegression.mode = value }, mode)
-    await page.locator("lia-llm-textarea-host textarea").nth(index).fill("Eine begruendete Antwort mit allen erforderlichen Zusammenhaengen.")
+    const area = page.locator("lia-llm-textarea-host textarea").nth(index)
+    const answer = "Eine begruendete Antwort mit allen erforderlichen Zusammenhaengen."
+    await area.fill(answer)
+    if (await area.inputValue() !== answer) await area.pressSequentially(answer)
+    assert.equal(await area.inputValue(), answer)
     await check(index).click()
     await page.waitForFunction(previous => window.__quizRegression.calls.length > previous, count, { timeout: 5000 })
     return count
   }
+  await page.waitForFunction(() => {
+    const visibleLoading = [...document.querySelectorAll("h1,h2")].some(
+      heading => heading.textContent.trim() === "Loading" && heading.getBoundingClientRect().height > 0,
+    )
+    const hosts = [...document.querySelectorAll("lia-llm-quiz-use")]
+    return !visibleLoading && hosts.length === 6 && hosts.every(host =>
+      window.LiaLLM?.getQuizReferenceOrEmpty(host.id.slice("lia-llm-quiz-".length)),
+    )
+  }, null, { timeout })
   const quiz = page.locator(".lia-quiz").first()
   assert.equal(await quiz.getAttribute("data-solution-timer"), "300s")
   assert.equal(await check(0).getAttribute("data-__sol-timer-hooked"), "1")
@@ -325,12 +338,12 @@ async function runWeeklyInteractions(page, result) {
   await page.waitForTimeout(30_500)
   await start(1, "failed")
   await page.waitForFunction(() => !document.querySelectorAll(".lia-quiz__check")[1].disabled)
-  assert.match(await page.locator("lia-llm-feedback").nth(1).locator("[part=content]").innerText(), /noch nicht vollst/u)
+  assert.match(await page.locator("lia-llm-feedback").nth(1).locator("[part=content]").innerText(), /Erkläre, wie die gefragten Punkte zusammenhängen/u)
   result.interactions.push("pending check disables button; cancel aborts and discards stale success; retry shows failed feedback while timer remains active")
 
   await start(2, "uncertain")
   await page.waitForFunction(() => !document.querySelectorAll(".lia-quiz__check")[2].disabled)
-  await page.getByText("Die Antwort ist noch nicht eindeutig genug.", { exact: false }).first().waitFor()
+  await page.getByText("Die Prüfung konnte deine Antwort noch nicht sicher bewerten.", { exact: false }).first().waitFor()
   await start(3, "error")
   await page.waitForFunction(() => !document.querySelectorAll(".lia-quiz__check")[3].disabled)
   await page.getByText("Regression: technischer Fehler", { exact: false }).first().waitFor()

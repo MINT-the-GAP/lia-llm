@@ -1,3 +1,4 @@
+import { getBrowserLanguageModel, readyBrowserQualityPrompt } from "./browser-language-model.ts"
 import {
   captureNetworkSnapshot,
   decideModelDownload,
@@ -20,6 +21,7 @@ import {
 import {
   createAssessmentManipulationResult,
   createExactReferenceMatchResult,
+  evaluateBrowserQuality,
   isFatalQualityEngineError,
   isQualityOutputError,
   isQualityWorkerTimeoutError,
@@ -59,12 +61,18 @@ interface AutomaticEvaluatorTimings {
   uncachedQualityWaitMs: number
   cachedQualityWaitMs: number
   qualityCacheProbeWaitMs: number
+  browserReviewWaitMs: number
+}
+
+interface AutomaticEvaluatorOptions extends Partial<AutomaticEvaluatorTimings> {
+  enableBrowserModelForTesting?: boolean
 }
 
 const DEFAULT_AUTOMATIC_EVALUATOR_TIMINGS: AutomaticEvaluatorTimings = {
   uncachedQualityWaitMs: 30_000,
   cachedQualityWaitMs: 180_000,
   qualityCacheProbeWaitMs: 5_000,
+  browserReviewWaitMs: 8_000,
 }
 
 // A positive Compact decision just above the task threshold can miss a
@@ -164,6 +172,7 @@ async function waitForRunWithTimeout<T>(
 
 function linkRunSignals(run: EvaluationRun): {
   signal: AbortSignal
+  abort(): void
   dispose(): void
 } {
   const controller = new AbortController()
@@ -182,6 +191,7 @@ function linkRunSignals(run: EvaluationRun): {
   }
   return {
     signal: controller.signal,
+    abort: () => controller.abort(),
     dispose: () => {
       for (const signal of signals) {
         signal.removeEventListener("abort", onAbort)
@@ -326,29 +336,35 @@ export class AutomaticEvaluator {
   private clearPromise: Promise<number> | null = null
   private readonly consentControllers = new Set<AbortController>()
   private readonly timings: AutomaticEvaluatorTimings
+  private readonly browserModelEnabled: boolean
 
   constructor(
     compactEvaluator = new SemanticEvaluator(),
     qualityEvaluator = new QualityEvaluator(),
-    timings: Partial<AutomaticEvaluatorTimings> = {},
+    options: AutomaticEvaluatorOptions = {},
   ) {
+    this.browserModelEnabled = options.enableBrowserModelForTesting === true
     this.compactEvaluator = compactEvaluator
     this.qualityEvaluator = qualityEvaluator
     this.timings = {
       uncachedQualityWaitMs: positiveWaitMs(
         "uncachedQualityWaitMs",
-        timings.uncachedQualityWaitMs ??
+        options.uncachedQualityWaitMs ??
           DEFAULT_AUTOMATIC_EVALUATOR_TIMINGS.uncachedQualityWaitMs,
       ),
       cachedQualityWaitMs: positiveWaitMs(
         "cachedQualityWaitMs",
-        timings.cachedQualityWaitMs ??
+        options.cachedQualityWaitMs ??
           DEFAULT_AUTOMATIC_EVALUATOR_TIMINGS.cachedQualityWaitMs,
       ),
       qualityCacheProbeWaitMs: positiveWaitMs(
         "qualityCacheProbeWaitMs",
-        timings.qualityCacheProbeWaitMs ??
+        options.qualityCacheProbeWaitMs ??
           DEFAULT_AUTOMATIC_EVALUATOR_TIMINGS.qualityCacheProbeWaitMs,
+      ),
+      browserReviewWaitMs: positiveWaitMs(
+        "browserReviewWaitMs",
+        options.browserReviewWaitMs ?? DEFAULT_AUTOMATIC_EVALUATOR_TIMINGS.browserReviewWaitMs,
       ),
     }
   }
@@ -909,44 +925,44 @@ export class AutomaticEvaluator {
     return waitForRun(evaluation, run)
   }
 
-  private async evaluateAutomatic(
-    request: EvaluationRequest,
+  private async reviewWithBrowserModel(
     normalized: ReturnType<typeof normalizeRequest>,
     options: EvaluationOptions | undefined,
     run: EvaluationRun,
+  ): Promise<EvaluationResult | undefined> {
+    const browser = getBrowserLanguageModel()
+    if (!browser) return undefined
+
+    const linked = linkRunSignals(run)
+    const evaluate = async (): Promise<EvaluationResult | undefined> => {
+      const prompt = await readyBrowserQualityPrompt(browser, linked.signal)
+      if (!prompt) return undefined
+      this.reportProgress(options, run, {
+        phase: "evaluating-quality",
+        engine: "quality",
+        message: "Browsermodell prüft offene Aspekte …",
+      })
+      return evaluateBrowserQuality(normalized, prompt)
+    }
+    try {
+      const result = await waitForRunWithTimeout(evaluate(), this.timings.browserReviewWaitMs, run)
+      return result.timedOut ? undefined : result.value
+    } catch {
+      assertRunActive(run)
+      return undefined
+    } finally {
+      linked.abort()
+      linked.dispose()
+    }
+  }
+
+  private async reviewWithLocalQuality(
+    request: EvaluationRequest,
+    options: EvaluationOptions | undefined,
+    run: EvaluationRun,
+    compact: EvaluationResult,
   ): Promise<EvaluationResult> {
-    // Later automatic checks still start on Compact, even with Quality ready.
-    this.retainCompactForAutomaticChecks = true
-    const compact = await this.evaluateCompact(request, options, run)
-    assertRunActive(run)
-    if (
-      compact.criteria.some(criterion => criterion.status === "contradicted") ||
-      this.qualityDegraded ||
-      !supportsQualityRuntime()
-    ) {
-      return compact
-    }
-
-    const reviewEvidence = compact.criteria.map(criterion =>
-      criterion.status === "met" &&
-      criterion.entailment < MIN_COMPACT_SUPPORT_TO_SKIP_REVIEW
-        ? { ...criterion, status: "uncertain" as const }
-        : criterion,
-    )
-    if (compact.passed && aggregateCriteria(reviewEvidence, normalized.passThreshold).passed) {
-      return compact
-    }
-
-    // Compact can miss an unfamiliar paraphrase. Review open criteria using
-    // the same authored rubric, including the original overall threshold.
-    const openIds = new Set(
-      reviewEvidence.filter(criterion => criterion.status !== "met")
-        .map(criterion => criterion.id),
-    )
-    const openCriteria = normalized.mode === "criteria"
-      ? normalized.criteria.filter(criterion => openIds.has(criterion.id))
-      : undefined
-    if (openCriteria?.length === 0) return compact
+    if (this.qualityDegraded || !supportsQualityRuntime()) return compact
 
     if (!this.qualityReady) {
       const probe = this.getQualityCacheInfo()
@@ -986,7 +1002,55 @@ export class AutomaticEvaluator {
     }
     assertRunActive(run)
 
-    const reviewed = await this.evaluateQualityWithFallback(
+    return this.evaluateQualityWithFallback(request, options, run, compact)
+  }
+
+  private async evaluateAutomatic(
+    request: EvaluationRequest,
+    normalized: ReturnType<typeof normalizeRequest>,
+    options: EvaluationOptions | undefined,
+    run: EvaluationRun,
+  ): Promise<EvaluationResult> {
+    // Later automatic checks still start on Compact, even with Quality ready.
+    this.retainCompactForAutomaticChecks = true
+    const compact = await this.evaluateCompact(request, options, run)
+    assertRunActive(run)
+    if (
+      compact.criteria.some(criterion => criterion.status === "contradicted")
+    ) {
+      return compact
+    }
+
+    const reviewEvidence = compact.criteria.map(criterion =>
+      criterion.status === "met" &&
+      criterion.entailment < MIN_COMPACT_SUPPORT_TO_SKIP_REVIEW
+        ? { ...criterion, status: "uncertain" as const }
+        : criterion,
+    )
+    if (compact.passed && aggregateCriteria(reviewEvidence, normalized.passThreshold).passed) {
+      return compact
+    }
+
+    // Compact can miss an unfamiliar paraphrase. Review open criteria using
+    // the same authored rubric, including the original overall threshold.
+    const openIds = new Set(
+      reviewEvidence.filter(criterion => criterion.status !== "met")
+        .map(criterion => criterion.id),
+    )
+    const openCriteria = normalized.mode === "criteria"
+      ? normalized.criteria.filter(criterion => openIds.has(criterion.id))
+      : undefined
+    if (openCriteria?.length === 0) return compact
+
+    const browserResult = this.browserModelEnabled
+      ? await this.reviewWithBrowserModel(
+          openCriteria ? { ...normalized, criteria: openCriteria } : normalized,
+          options,
+          run,
+        )
+      : undefined
+    assertRunActive(run)
+    const reviewed = browserResult ?? await this.reviewWithLocalQuality(
       openCriteria ? { ...request, criteria: openCriteria } : request,
       options,
       run,

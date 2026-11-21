@@ -11028,6 +11028,146 @@ test("automatic criteria recheck preserves resolved criteria and the original pa
   })
 })
 
+test("automatic review uses a ready browser model and preserves the existing fallbacks", async () => {
+  await withForegroundQualityRuntime(async () => {
+    const compact = new ForegroundWaitMockEvaluator("compact", "compact", foregroundWaitCache(true))
+    const quality = new ForegroundWaitMockEvaluator("quality", "quality", foregroundWaitCache(true))
+    const automatic = new AutomaticEvaluator(compact as never, quality as never, {
+      browserReviewWaitMs: 30,
+      enableBrowserModelForTesting: true,
+    })
+    const request: EvaluationRequest = {
+      question: "Warum schwimmt Eis auf flüssigem Wasser?",
+      answer: "Gefrorenes Wasser ist weniger dicht. Deshalb bleibt es oben.",
+      reference: "Eis hat eine geringere Dichte als Wasser. Die Dichtedifferenz erklärt den Auftrieb.",
+      criteria: [
+        { text: "Eis schwimmt an der Oberfläche.", weight: 2 },
+        { text: "Eis besitzt eine geringere Dichte als Wasser.", required: true },
+        { text: "Das erklärt den Auftrieb." },
+      ],
+      passThreshold: 0.75,
+    }
+    compact.evaluate = async () => {
+      compact.evaluateCalls += 1
+      return {
+        ...evaluation("failed", [
+          { ...result("criterion-1", "met"), weight: 2 },
+          result("criterion-2", "missed", true),
+          result("criterion-3", "uncertain"),
+        ]),
+        mode: "criteria",
+      }
+    }
+    quality.evaluate = async (focused) => {
+      quality.evaluateCalls += 1
+      return {
+        ...evaluation("passed", normalizeRequest(focused).criteria.map((item) => result(item.id, "met", item.required))),
+        mode: "criteria",
+        model: { ...evaluation("passed", []).model, id: "quality" },
+      }
+    }
+
+    const original = Object.getOwnPropertyDescriptor(globalThis, "LanguageModel")
+    let availability = "available"
+    let creates = 0
+    let destroyed = 0
+    let output = "valid"
+    let browserSignal: AbortSignal | undefined
+    let notifyPromptStarted: (() => void) | undefined
+    let apiReads = 0
+    let browserModelPresent = true
+    const browserModel = {
+      async availability(options: { expectedInputs: { languages: string[] }[] }) {
+        assert.ok(options.expectedInputs[0]?.languages.includes("de"))
+        return availability
+      },
+      async create(options: { initialPrompts: Array<{ role: string }> }) {
+        creates += 1
+        assert.equal(options.initialPrompts[0]?.role, "system")
+        return {
+          async prompt(input: string, options: { responseConstraint: { type: string }; signal: AbortSignal }) {
+            browserSignal = options.signal
+            assert.equal(options.responseConstraint.type, "object")
+            assert.ok(input.includes(request.answer))
+            assert.ok(input.includes("criterion-2") && input.includes("criterion-3"))
+            assert.ok(!input.includes("criterion-1"))
+            notifyPromptStarted?.()
+            if (output === "invalid") return "{}"
+            if (output === "pending") {
+              await new Promise<void>((resolve) => browserSignal!.addEventListener("abort", () => resolve(), { once: true }))
+            }
+            return JSON.stringify({
+              criteria: ["criterion-2", "criterion-3"].map((id) => ({
+                criterion_id: id,
+                decision: "pass",
+                confidence: 0.95,
+                feedback_code: "none",
+                operator_criterion_id: "",
+              })),
+            })
+          },
+          destroy() { destroyed += 1 },
+        }
+      },
+    }
+    Object.defineProperty(globalThis, "LanguageModel", {
+      configurable: true,
+      get() {
+        apiReads += 1
+        return browserModelPresent ? browserModel : undefined
+      },
+    })
+    try {
+      const reviewed = await automatic.evaluate(request)
+      assert.equal(reviewed.model.id, "browser-prompt-api")
+      assert.equal(reviewed.status, "passed")
+      assert.deepEqual(reviewed.criteria.map((item) => item.status), ["met", "met", "met"])
+      assert.equal(reviewed.coverage, 1)
+      assert.equal(reviewed.criteria[0]?.weight, 2)
+      assert.equal(quality.cacheInfoCalls, 0)
+      assert.equal(creates, 1)
+      assert.equal(destroyed, 1)
+
+      availability = "downloadable"
+      assert.equal((await automatic.evaluate(request)).model.id, "quality")
+      assert.equal(creates, 1)
+      availability = "available"
+      assert.equal((await automatic.evaluate({ ...request, assessmentEngine: "quality" })).model.id, "quality")
+      assert.equal((await automatic.evaluate({ ...request, assessmentEngine: "compact" })).model.id, "test/model")
+      assert.equal(creates, 1)
+
+      output = "invalid"
+      assert.equal((await automatic.evaluate(request)).model.id, "quality")
+      output = "pending"
+      assert.equal((await automatic.evaluate(request)).model.id, "quality")
+      assert.equal(browserSignal?.aborted, true)
+
+      const controller = new AbortController()
+      const promptStarted = new Promise<void>((resolve) => { notifyPromptStarted = resolve })
+      const pending = automatic.evaluate(request, { signal: controller.signal })
+      await promptStarted
+      controller.abort()
+      await assert.rejects(pending, { name: "AbortError" })
+      assert.equal(browserSignal?.aborted, true)
+      assert.equal(quality.evaluateCalls, 4)
+      assert.equal(destroyed, creates)
+
+      const readsBeforeDefault = apiReads
+      const defaultEvaluator = new AutomaticEvaluator(compact as never, quality as never)
+      assert.equal((await defaultEvaluator.evaluate(request)).model.id, "quality")
+      assert.equal(apiReads, readsBeforeDefault)
+
+      browserModelPresent = false
+      const createsBeforeMissing = creates
+      assert.equal((await automatic.evaluate(request)).model.id, "quality")
+      assert.equal(creates, createsBeforeMissing)
+    } finally {
+      if (original) Object.defineProperty(globalThis, "LanguageModel", original)
+      else Reflect.deleteProperty(globalThis, "LanguageModel")
+    }
+  })
+})
+
 function foregroundWaitCache(cached: boolean): ModelCacheInfo {
   return {
     supported: true,
@@ -12475,6 +12615,53 @@ test("learner feedback stays short and never exposes criteria or scores", () => 
   )
 })
 
+test("quiz feedback uses only confirmed criteria and visible, unambiguous task parts", () => {
+  const met = result("private-met", "met")
+  const missed = result("private-missed", "missed")
+  missed.supportEvidence.hypothesis = "Geschwindigkeit und Richtung sind GEHEIM."
+  missed.feedback = "Vertrauliche Lösung"
+  const open = result("private-open", "uncertain")
+  const failed = { ...evaluation("failed", [met, missed, open]), mode: "criteria" as const }
+  const question = "Beschreibe den Start. Vergleiche Geschwindigkeit und Richtung."
+  const message = feedbackForResult(failed, "de-DE", question)?.message ?? ""
+  assert.equal(message, "1 von 3 Kriterien erfüllt, 1 noch offen.\nBeantworte auch diesen Teil der Aufgabe. „Vergleiche Geschwindigkeit und Richtung.“")
+  assert.doesNotMatch(message, /GEHEIM|Vertraulich|private-/u)
+  const withContext = "Geschwindigkeit und Richtung stehen im Diagramm $x(t)$. Gehe auf Geschwindigkeit und Richtung ein."
+  assert.match(feedbackForResult(failed, "de-DE", withContext)?.message ?? "", /„Gehe auf Geschwindigkeit und Richtung ein\.“/u)
+  assert.doesNotMatch(
+    feedbackForResult(failed, "de-DE", "Beschreibe Geschwindigkeit und Richtung. Vergleiche Geschwindigkeit und Richtung.")?.message ?? "",
+    /„/u,
+  )
+  assert.doesNotMatch(
+    feedbackForResult(failed, "de-DE", question + " <!-- Vertrauliche Lösung -->")?.message ?? "",
+    /„|Vertraulich/u,
+  )
+
+  const contradiction = { ...missed, status: "contradicted" as const }
+  assert.match(
+    feedbackForResult({ ...failed, criteria: [met, contradiction] }, "de-DE", question)?.message ?? "",
+    /Überprüfe deine Aussage.*Vergleiche Geschwindigkeit und Richtung/u,
+  )
+  const uncertain = { ...failed, status: "uncertain" as const, criteria: [met, open] }
+  assert.equal(
+    feedbackForResult(uncertain, "de-DE", question)?.message,
+    "Die Prüfung konnte deine Antwort noch nicht sicher bewerten. 1 von 2 Kriterien erfüllt, 1 noch offen.",
+  )
+})
+
+test("quiz feedback offers operator guidance without inventing an operator finding", () => {
+  const question = "Begründe deine Antwort mit einer Textstelle."
+  const failing = evaluation("failed", [result("private", "missed")])
+  assert.deepEqual(feedbackForResult(failing, "de-DE", question), {
+    code: "incomplete",
+    message: "Stütze deine Schlussfolgerung mit einer passenden Textstelle.",
+  })
+  assert.deepEqual(feedbackForError(new EvaluationInputError("answer-too-short", "", 4, 12), "de-DE", question), {
+    code: "answer-too-short",
+    message: "Die Antwort ist zu kurz. Stütze deine Schlussfolgerung mit einer passenden Textstelle.",
+  })
+})
+
 test("language feedback is ordered, visible on passing answers, and advisory", () => {
   const passed = evaluation("passed", [result("secret", "met")])
   const orthographyCorrection = {
@@ -13486,7 +13673,7 @@ test("LLMQuiz counts a too-short answer as a failed trial", async () => {
   assert.deepEqual(probe.sent, [["false"]])
   assert.equal(
     probe.feedback.at(-1)?.message,
-    "Die Antwort ist deutlich zu kurz, um etwas zu erklären.",
+    "Die Antwort ist deutlich zu kurz, um etwas zu erklären. Erkläre, wie die gefragten Punkte zusammenhängen.",
   )
   probe.stop()
 })

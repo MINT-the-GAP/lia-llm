@@ -477,15 +477,12 @@ eigenen Shadow-DOM-Sidecar; die von LiaScript verwaltete Quiz-Kindliste bleibt d
 
 ### Kurzes Feedback
 
-Mit `feedback=1` zeigt das Makro höchstens eine kurze, priorisierte Rückmeldung. Je nach Ergebnis
-kann das beispielsweise sein:
-
-- „Die Antwort enthält inhaltliche Fehler.“
-- „Die Antwort bearbeitet die gefragten Inhalte noch nicht vollständig.“
-- „Die Antwort ist deutlich zu kurz, um etwas zu erklären.“
-- „Stelle Ursache, Prinzip oder Bedingung und die daraus folgende Wirkung nachvollziehbar in Beziehung.“
-- „Die verlangte Antwortform konnte gerade nicht zuverlässig geprüft werden.“
-- „Die Antwort ist zu umgangssprachlich verfasst.“
+Mit `feedback=1` zeigt das Makro bis zu zwei kurze Hinweise zum erreichten Teilstand und zum
+nächsten Schritt. Eine Teilfrage aus dem Aufgabenwortlaut wird aufgegriffen, wenn sie sich
+einem festgestellten fehlenden oder widersprochenen Kriterium eindeutig zuordnen lässt.
+Andernfalls gibt das Makro einen allgemeinen Arbeitsauftrag, etwa „Stütze deine
+Schlussfolgerung mit einer passenden Textstelle.“ Bei unsicherer Bewertung bezeichnet es
+offene Kriterien als offen. Die Hinweise verwenden die vorhandene Prüfung und Aufgabenformulierung.
 
 Die fachliche Richtig/Falsch-Entscheidung bleibt von einem bloßen Stilhinweis getrennt: Eine
 inhaltlich richtige Antwort wird nicht allein wegen Umgangssprache falsch. Das Makro zeigt keine
@@ -638,13 +635,12 @@ Schwelle liegen. Das stärkere Quality-Modell ist eine optionale Erweiterung:
    nirgends gerendertes Makro lädt dagegen keine Modelle.
 2. Normale Aufrufe ohne Engine-Angabe und ohne erweiterte Quality-Funktion starten mit Compact.
    Bei klar gestützten Antworten und festgestellten Widersprüchen endet die Prüfung direkt.
-   Bei offenen oder schwach gestützten Befunden kann ein vollständig lokal verfügbares
-   Quality-Modell nachprüfen, wenn sich das Urteil dadurch ändern kann. Im
-   Kriterienmodus erhält es dafür nur die offenen Kriterien. Beide Schritte gehören zum selben
-   Klick auf **Prüfen** und liefern LiaScript zusammen ein Ergebnis. Bei widersprüchlichen
-   Modellbefunden kann ein entscheidendes Kriterium unbewertet bleiben. Auf Geräten ohne WebGPU
-   oder vollständigen Quality-Cache bleibt der Compact-Befund maßgeblich. Die automatische
-   Nachprüfung startet keinen neuen Modelldownload.
+   Bei offenen oder schwach gestützten Befunden kann ein lokales Modell nachprüfen,
+   wenn sich das Urteil dadurch ändern kann. Der reguläre Pfad verwendet dafür den lokalen
+   Qwen-Cache oder den Compact-Befund. Die Nachprüfung startet keinen neuen Modelldownload.
+   Im Kriterienmodus erhält das Modell nur die offenen Kriterien. Beide Schritte gehören
+   zum selben Klick auf **Prüfen** und liefern LiaScript zusammen ein Ergebnis. Bei
+   widersprüchlichen Modellbefunden kann ein entscheidendes Kriterium unbewertet bleiben.
 3. `assessmentengine=quality` wählt den Quality-Pfad ausdrücklich. Zur Rückwärtskompatibilität
    wählen Operatorprüfung, Sprachanalyse und ein ausdrücklich aktivierter Thinking-Lauf Quality
    auch ohne Engine-Angabe. Das konkrete Qwen-Modell wird vor einem nötigen Download anhand des
@@ -667,6 +663,14 @@ Schwelle liegen. Das stärkere Quality-Modell ist eine optionale Erweiterung:
    Bereinigung. Bereits an die GPU übergebene Arbeit kann dabei noch kurz auslaufen. Ein bereits
    gestarteter Kompaktlauf kann aufgrund der zugrunde liegenden WASM-Laufzeit ebenfalls technisch zu
    Ende laufen, liefert nach dem Abbruch aber kein verspätetes Quizresultat.
+
+Der vorbereitete Browsermodell-Adapter ist standardmäßig ausgeschaltet. Gezielte Tests
+können ihn beim Erzeugen des Evaluators über `enableBrowserModelForTesting` aktivieren.
+Dann prüft LLMQuiz über die [Prompt API](https://developer.chrome.com/docs/ai/prompt-api),
+ob ein Browsermodell bereits einsatzbereit ist. Bei fehlender Verfügbarkeit, ungültiger
+Ausgabe oder nach acht Sekunden greift der reguläre Prüfpfad. Die Firefox-Einstellung für
+[eigene Modelle im Smart Window](https://support.mozilla.org/en-US/kb/smart-window-byom)
+gilt für den Firefox-Assistenten.
 
 Wurde `assessmentengine=quality` ausdrücklich für atomare Kriterien angefordert, ist ein
 `failed`- oder `uncertain`-Befund des Kompaktmodells bei nicht verfügbarer Quality-Prüfung kein

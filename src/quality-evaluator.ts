@@ -5,6 +5,7 @@ import type {
   ModelRecord,
 } from "@mlc-ai/web-llm"
 
+import type { BrowserQualityPrompt } from "./browser-language-model.ts"
 import * as webLlm from "./generated/webllm.js"
 import qualityWorkerSource from "./generated/webllm-worker-source.js"
 import {
@@ -85,6 +86,7 @@ import type {
   ModelLoadSource,
   ModelProgress,
   NliEvidence,
+  NormalizedEvaluationRequest,
   OperatorRubric,
   NormalizedLanguageAnalysisOptions,
   OrthographyCorrection,
@@ -430,6 +432,41 @@ export function hasAssessmentManipulationAttempt(input: {
     return false
   }
   return ASSESSMENT_OUTPUT_OVERRIDE_PATTERNS.some((pattern) => pattern.test(answer))
+}
+
+function qualityJudgePayload(
+  question: string,
+  answer: string,
+  mode: EvaluationMode,
+  criterion: Criterion,
+  referenceVariants: readonly string[],
+  operator?: OperatorRubric,
+): string {
+  return JSON.stringify({
+    bewertungsmodus:
+      mode === "criteria" ? "einzelkriterium" : "gesamtantwort",
+    frage: question,
+    musterloesung: criterion.text,
+    gleichwertige_musterloesungen: criterion.acceptedVariants,
+    erwartungshorizonte: referenceVariants,
+    bekannte_fehlvorstellungen: criterion.misconceptions,
+    operatorprofil: operator
+      ? {
+          operator_id: operator.id,
+          bezeichnung: operator.label,
+          antwortvertrag: operator.responseContract,
+          kriterien: operator.criteria.map((item) => ({
+            kriterium_id: item.id,
+            bezeichnung: item.label,
+            anforderung: item.requirement,
+            erforderlich: item.required,
+            prioritaet: item.priority,
+          })),
+          anforderungen: operator.requirements,
+        }
+      : null,
+    lernendenantwort: answer,
+  })
 }
 
 function qualityPromptMessages(payload: string, mode: EvaluationMode): Array<{
@@ -2798,6 +2835,72 @@ function criterionResult(
   }
 }
 
+function buildQualityResult(
+  normalized: NormalizedEvaluationRequest,
+  criteria: CriterionResult[],
+  model: EvaluationResult["model"],
+  started: number,
+  languageAnalysis?: LanguageAnalysisResult,
+): EvaluationResult {
+  const assessment = finalizeQualityAssessment(
+    aggregateCriteria(criteria, normalized.passThreshold),
+    criteria,
+    normalized.operator !== undefined,
+  )
+  return {
+    ...assessment,
+    mode: normalized.mode,
+    criteria,
+    selectedReferenceIndex: criteria[0]?.selectedReferenceIndex ?? 0,
+    answer: normalized.answer,
+    operator: normalized.operator,
+    diagnostic: qualityDiagnosticForCriteria(criteria, assessment.passed),
+    languageAnalysis,
+    durationMs: Number((now() - started).toFixed(1)),
+    model,
+    notice:
+      "Lokaler LLM-Selbstcheck: Das Ergebnis unterstützt das Lernen, ersetzt aber keine fachliche Bewertung durch eine Lehrkraft.",
+  }
+}
+
+export async function evaluateBrowserQuality(
+  normalized: NormalizedEvaluationRequest,
+  prompt: BrowserQualityPrompt,
+): Promise<EvaluationResult> {
+  const started = now()
+  const { answer, question, mode, operator } = normalized
+  const criteria: CriterionResult[] = []
+  if (mode === "criteria" && normalized.criteria.length > 1) {
+    for (const batch of qualityCriterionBatches(normalized.criteria)) {
+      const messages = qualityCriteriaBatchPromptMessages(
+        qualityCriteriaBatchPayload(question, answer, batch, operator),
+      )
+      const schema = qualityCriteriaBatchResponseSchema(batch.map((criterion) => criterion.id))
+      const outputs = parseQualityCriteriaBatchOutput(await prompt(messages, schema), batch, operator)
+      batch.forEach((criterion, index) => {
+        criteria.push(criterionResult(criterion, answer, outputs[index]!.output, normalized.uncertaintyMargin))
+      })
+    }
+  } else {
+    const criterion = normalized.criteria[0]!
+    const references = mode === "holistic" ? normalized.references : [criterion.text]
+    const payload = qualityJudgePayload(question, answer, mode, criterion, references, operator)
+    const raw = await prompt(qualityPromptMessages(payload, mode), QUALITY_RESPONSE_SCHEMA)
+    const output = validateSelectedReferenceIndex(
+      validateOperatorJudgeOutput(parseQualityJudgeOutput(raw), operator),
+      references.length,
+    )
+    criteria.push(criterionResult(criterion, answer, output, normalized.uncertaintyMargin, references))
+  }
+  return buildQualityResult(normalized, criteria, {
+    id: "browser-prompt-api",
+    revision: "browser-managed",
+    device: "browser",
+    dtype: "browser",
+    task: "generative-assessment",
+  }, started)
+}
+
 const QUALITY_DIAGNOSTIC_PRIORITY: readonly Exclude<
   QualityFeedbackCode,
   "none"
@@ -4774,31 +4877,7 @@ export class QualityEvaluator {
     if (!engine) throw new Error("Das Qualitätsmodell ist nicht verfügbar.")
 
 
-    const payload = JSON.stringify({
-      bewertungsmodus:
-        mode === "criteria" ? "einzelkriterium" : "gesamtantwort",
-      frage: question,
-      musterloesung: criterion.text,
-      gleichwertige_musterloesungen: criterion.acceptedVariants,
-      erwartungshorizonte: referenceVariants,
-      bekannte_fehlvorstellungen: criterion.misconceptions,
-      operatorprofil: operator
-        ? {
-            operator_id: operator.id,
-            bezeichnung: operator.label,
-            antwortvertrag: operator.responseContract,
-            kriterien: operator.criteria.map((item) => ({
-              kriterium_id: item.id,
-              bezeichnung: item.label,
-              anforderung: item.requirement,
-              erforderlich: item.required,
-              prioritaet: item.priority,
-            })),
-            anforderungen: operator.requirements,
-          }
-        : null,
-      lernendenantwort: answer,
-    })
+    const payload = qualityJudgePayload(question, answer, mode, criterion, referenceVariants, operator)
     const createCompletion = () => engine.chat.completions.create({
       messages: qualityPromptMessages(payload, mode),
       stream: false,
@@ -5897,16 +5976,6 @@ export class QualityEvaluator {
         }
       }
 
-      const aggregated = aggregateCriteria(criteria, normalized.passThreshold)
-      const assessment = finalizeQualityAssessment(
-        aggregated,
-        criteria,
-        normalized.operator !== undefined,
-      )
-      const diagnostic = qualityDiagnosticForCriteria(
-        criteria,
-        assessment.passed,
-      )
       let languageAnalysis: LanguageAnalysisResult | undefined
       if (normalized.languageAnalysis) {
         try {
@@ -5934,26 +6003,13 @@ export class QualityEvaluator {
           )
         }
       }
-      return {
-        ...assessment,
-        mode: normalized.mode,
-        criteria,
-        selectedReferenceIndex: criteria[0]?.selectedReferenceIndex ?? 0,
-        answer: normalized.answer,
-        operator: normalized.operator,
-        diagnostic,
-        languageAnalysis,
-        durationMs: Number((now() - started).toFixed(1)),
-        model: {
-          id: (this.loadedModel ?? this.model).id,
-          revision: (this.loadedModel ?? this.model).revision,
-          device: "webgpu",
-          dtype: "q4f16",
-          task: "generative-assessment",
-        },
-        notice:
-          "Lokaler LLM-Selbstcheck: Das Ergebnis unterstützt das Lernen, ersetzt aber keine fachliche Bewertung durch eine Lehrkraft.",
-      }
+      return buildQualityResult(normalized, criteria, {
+        id: (this.loadedModel ?? this.model).id,
+        revision: (this.loadedModel ?? this.model).revision,
+        device: "webgpu",
+        dtype: "q4f16",
+        task: "generative-assessment",
+      }, started, languageAnalysis)
     })
     try {
       return await evaluation

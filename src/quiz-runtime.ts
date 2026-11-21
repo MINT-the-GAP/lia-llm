@@ -325,7 +325,7 @@ export function runQuiz(
       if (!active || !result) return
       if (result.status === "uncertain") {
         const feedback =
-          api?.feedbackForResult?.(result, "de-DE") ?? null
+          api?.feedbackForResult?.(result, "de-DE", feedbackEnabled ? question : undefined) ?? null
         finishUnassessed(
           feedback?.message ??
             "Die Antwort konnte gerade nicht eindeutig bewertet werden. Versuche die Prüfung erneut."
@@ -351,7 +351,7 @@ export function runQuiz(
         clearSolutionVariant()
       }
       const feedback = feedbackEnabled
-        ? api?.feedbackForResult?.(result, "de-DE") ?? null
+        ? api?.feedbackForResult?.(result, "de-DE", question) ?? null
         : null
       const languageCheck: FeedbackLanguageCheckRequest | undefined =
         feedbackEnabled &&
@@ -385,7 +385,8 @@ export function runQuiz(
                 const languageFeedback =
                   api.feedbackForResult(
                     { ...result, languageAnalysis },
-                    "de-DE"
+                    "de-DE",
+                    question
                   )
                 return {
                   completed: languageAnalysis?.status === "completed",
@@ -406,7 +407,7 @@ export function runQuiz(
     .catch(error => {
       if (!active) return
       clearSolutionVariant()
-      const feedback = api?.feedbackForError?.(error, "de-DE") ?? null
+      const feedback = api?.feedbackForError?.(error, "de-DE", feedbackEnabled ? question : undefined) ?? null
       if (
         error instanceof EvaluationInputError &&
         error.code === "answer-too-short"
